@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.25)
+project(Vee.ViewmodelTweaks)
+
+# Search for libraries in CMake
+list(APPEND CMAKE_MODULE_PATH
+	"${CMAKE_CURRENT_LIST_DIR}/CMake"
+)
+
+# Chairloader functions
+include(CMake/CompilerConfig.cmake)
+include(CMake/ModConfig.cmake)
+
+# vcpkg libraries
+find_package(Boost CONFIG REQUIRED)
+find_package(Detours MODULE REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+
+# Common path
+set(CHAIRLOADER_COMMON_PATH "" CACHE PATH "Path to Chairloader/Common. See Common/README_ModSDK.txt.")
+
+# Project libraries
+add_subdirectory(CommonMod)
+
+# Mods
+add_subdirectory(Src)

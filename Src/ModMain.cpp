@@ -1,0 +1,2523 @@
+// Vee.ViewmodelTweaks - Prey (2017) Chairloader mod
+//
+// Lets the player offset the first-person weapon viewmodel (position + rotation) with global standing /
+// crouch offsets plus per-weapon hip offsets, a proper ironsight "aim lock" on a dedicated key (per-weapon
+// poses), and a weapon FOV override - all live, from an ImGui window (F1 -> "Viewmodel Tweaks") or the
+// console (vm_* cvars).
+//
+// How it works (see README.md for the full reverse-engineering notes):
+//
+//  * Prey still ships Crysis 3's "procedural weapon animation" system. Every frame
+//    CProceduralWeaponAnimationContext::Update() calls CProceduralWeaponAnimation::Update(),
+//    which blends the designer-authored pose offsets, look/strafe sway, recoil, bumps, etc.
+//    into two view-space QuatTs: m_rightOffset (weapon hand) and m_leftOffset (support hand).
+//    The context then rotates those into the aim frame and pushes them *additively* onto the
+//    hand IK joints of the first-person arms through an IAnimationOperatorQueue pose modifier.
+//      - Hip / crouch offsets: we post-hook CProceduralWeaponAnimation::Update() and fold the
+//        user's offset into the QuatT(s) before the context consumes them.
+//      - Aim lock, skeleton side: additive offsets inherit everything the body animation does with
+//        camera pitch and look-sway, which ruins ironsights. So while aiming we post-hook the *context*
+//        update and push an eOp_Override for the weapon-hand IK joint: camera(model space) * userPose *
+//        (weaponBone relative to IK joint)^-1, so hands, weapon bone and effects end up near the pose.
+//        The camera is not known yet at that point (the skeleton is evaluated BEFORE the camera is
+//        built from it), so this uses last frame's exact camera + this frame's mouse delta.
+//      - Aim lock, render side: ArkPlayerCamera::UpdateView builds the camera from the evaluated
+//        skeleton (camera attachment position, view angles, smoothed lean roll) - after that the
+//        camera is final and nothing moves the skeleton any more before rendering. We post-hook it and
+//        write the weapon's attachment transform (CAttachmentBONE::m_AttModelRelative, what
+//        DrawAttachment multiplies with the character matrix) to exactly camera * aimPose, and move the
+//        hand joints (final absolute pose, what the skinning reads) by the same rigid delta. No
+//        prediction, no feedback: the weapon is placed where it has to be, every frame, from exact data.
+//
+//  * The weapon is rendered in a separate "nearest" pass with its own FOV (r_DrawNearFoV).
+//    ArkPlayerZoomManager hard-codes it to 55 degrees on Reset()/SetNearFOVUnlocked() and
+//    rescales it proportionally to the HFOV while zooming. We re-apply the user's FOV every frame
+//    relative to cl_hfov, so zooming (including our own aim camera zoom) keeps working.
+
+#include "ModMain.h"
+#include <Prey/CryRenderer/IRenderer.h>
+#include <Prey/CrySystem/IConsole.h>
+#include <Prey/CryInput/IHardwareMouse.h>
+#include <Prey/CrySystem/HardwareMouse.h>
+#include <Prey/CryEntitySystem/IEntity.h>
+#include <Prey/CryEntitySystem/IEntityClass.h>
+#include <Prey/GameDll/ark/player/ArkPlayer.h>
+#include <Prey/GameDll/ark/player/ArkPlayerCamera.h>
+#include <Prey/GameDll/ark/player/ArkPlayerZoomManager.h>
+#include <Prey/GameDll/ark/player/ArkPlayerInput.h>
+#include <Prey/GameDll/ark/player/ArkPlayerWeaponComponent.h>
+#include <Prey/GameDll/ark/player/ArkPlayerComponent.h>
+#include <Prey/GameDll/ark/player/ArkPlayerHealthComponent.h>
+#include <Prey/GameDll/ark/weapons/arkweapon.h>
+#include <Prey/GameDll/ark/weapons/arkweaponshotgun.h>
+#include <Prey/GameDll/GameCVars.h>
+#include <Prey/GameDll/weaponlookoffset.h>
+#include <Prey/GameDll/weaponstrafeoffset.h>
+#include <Prey/GameDll/weaponrecoiloffset.h>
+#include <Prey/GameDll/weaponbumpoffset.h>
+#include <Prey/CryAction/IViewSystem.h>
+#include <Prey/CryPhysics/physinterface.h>
+#include <pugixml.hpp>
+
+ModMain* gMod = nullptr;
+
+//---------------------------------------------------------------------------------
+// Reverse-engineered game internals (PreyDll.dll, Chairloader-supported build)
+//---------------------------------------------------------------------------------
+namespace PreyInternals
+{
+    // CProceduralWeaponAnimation (GameDll/ProceduralWeaponAnimation.h in Crysis 3 GameSDK).
+    // Not part of the Chairloader SDK headers, so we only describe the members we touch.
+    namespace CProceduralWeaponAnimation
+    {
+        constexpr size_t OFFSET_RIGHT_OFFSET = 0x2D8;       // QuatT m_rightOffset (view space)
+        constexpr size_t OFFSET_LEFT_OFFSET = 0x2F4;        // QuatT m_leftOffset  (view space)
+        constexpr size_t OFFSET_DEBUG_INPUT_ENABLED = 0x320;// bool  m_debugInputEnabled (g_debugWeaponOffset == 2)
+
+        // void CProceduralWeaponAnimation::Update(float deltaTime)
+        inline auto FUpdate = PreyFunction<void(void* _this, float deltaTime)>(0x17D31E0);
+    }
+
+    // CProceduralWeaponAnimationContext (mannequin procedural context owning the object above at +0x40).
+    namespace CProceduralWeaponAnimationContext
+    {
+        constexpr size_t OFFSET_RIGHT_IK_JOINT = 0x018;     // int   m_params.rightBlendIkIdx (weapon hand IK target joint)
+        constexpr size_t OFFSET_LEFT_IK_JOINT = 0x01C;      // int   m_params.leftBlendIkIdx
+        constexpr size_t OFFSET_WEAPON_TARGET_JOINT = 0x020;// int   m_params.weaponTargetIdx
+        constexpr size_t OFFSET_POSE_MODIFIER = 0x028;      // IAnimationOperatorQueue* m_pPoseModifier
+        constexpr size_t OFFSET_SCOPE = 0x038;              // IScope* m_pScope
+        constexpr size_t OFFSET_WEAPON_SWAY = 0x040;        // CProceduralWeaponAnimation m_weaponSway
+        constexpr size_t OFFSET_AIM_DIRECTION = 0x368;      // Vec3  m_aimDirection (model space)
+        constexpr size_t OFFSET_INSTANCE_COUNT = 0x374;     // int   m_instanceCount (active procedural clips)
+
+        // void CProceduralWeaponAnimationContext::Update(float timePassed)
+        // Early-outs when m_instanceCount < 1, i.e. whenever the current mannequin fragment has no
+        // weapon procedural clip (some jump/land fragments) -> no offsets at all get applied.
+        inline auto FUpdate = PreyFunction<void(void* _this, float timePassed)>(0x17D4D50);
+    }
+
+    // Virtual table slots (verified against the game code, they differ from public CRYENGINE).
+    constexpr size_t VT_IScope_GetCharInst = 0x18 / 8;
+    constexpr size_t VT_ICharacterInstance_GetISkeletonPose = 0x38 / 8;
+    constexpr size_t VT_ICharacterInstance_GetIDefaultSkeleton = 0x58 / 8; // [ArkPlayerCamera::GetJointId]
+    constexpr size_t VT_ISkeletonPose_GetAbsJointByID = 0xC0 / 8;    // const QuatT& (int jointId)   [ArkPlayer::GetBoneTransform]
+    constexpr size_t VT_IAnimationOperatorQueue_PushPosition = 0x40 / 8;    // (int joint, int op, const Vec3&)
+    constexpr size_t VT_IAnimationOperatorQueue_PushOrientation = 0x48 / 8; // (int joint, int op, const Quat&)
+    constexpr int OP_OVERRIDE = 0;      // IAnimationOperatorQueue::eOp_Override (model space)
+    constexpr int OP_ADDITIVE = 3;      // eOp_Additive (what the game uses)
+
+    // IDefaultSkeleton [ArkPlayerCamera::GetJointId, CAttachmentBONE::ProjectAttachment]
+    constexpr size_t VT_IDefaultSkeleton_GetJointCount = 0x08 / 8;
+    constexpr size_t VT_IDefaultSkeleton_GetJointParentIDByID = 0x10 / 8;
+    constexpr size_t VT_IDefaultSkeleton_GetJointNameByID = 0x30 / 8;
+    constexpr size_t VT_IDefaultSkeleton_GetJointIDByName = 0x38 / 8;
+
+    // IAttachment (CAttachmentBONE vtable at .rdata 0x181d185c8). The weapon is bound to the
+    // first-person arms as a skeleton attachment (CArkWeapon::AttachToHand -> AddBinding of a
+    // CSKELAttachment), so it is rendered as part of the arms character at
+    //     characterWorldMatrix * m_AttModelRelative(* m_addTransformation)
+    // and NOT from its own entity transform.
+    constexpr size_t VT_IAttachment_GetAttRelativeDefault = 0x60 / 8; // const QuatT& -> this+0xF8
+    constexpr size_t VT_IAttachment_GetAttModelRelative = 0x68 / 8;   // const QuatT& -> this+0x130 [ArkPlayerCamera::GetDesiredPositionAndRotation]
+    constexpr size_t VT_IAttachment_HideAttachment = 0x88 / 8;        // [CArkWeapon::AttachToHand]
+    constexpr size_t OFFSET_CAttachmentBONE_JOINT_ID = 0x15C;         // int m_nJointID [CAttachmentBONE::UpdateAttModelRelative]
+
+    // ArkPlayer::m_zoomManager::m_nearFOVLockedCount is read by the cl_hfov callback at
+    // ArkPlayer + 0x18C0, which pins the zoom manager at ArkPlayer + 0x1898.
+    constexpr size_t ARKPLAYER_ZOOMMANAGER_OFFSET = 0x1898;
+    // ArkPlayerZoomManager::Update fetches the equipped weapon through ArkPlayer + 0x14B8.
+    constexpr size_t ARKPLAYER_WEAPONCOMPONENT_OFFSET = 0x14B8;
+    constexpr float STOCK_WEAPON_FOV = 55.0f;
+
+    constexpr int BONE_WEAPON = (int)ArkPlayerCamera::EArkBoneList::BONE_WEAPON;
+    constexpr int BONE_CAMERA = (int)ArkPlayerCamera::EArkBoneList::BONE_CAMERA;
+}
+
+static_assert(sizeof(QuatT) == 28, "QuatT layout mismatch");
+static_assert(offsetof(ArkPlayerZoomManager, m_nearFOVLockedCount) == 0x28, "ArkPlayerZoomManager layout mismatch");
+static_assert(offsetof(ArkPlayer, m_zoomManager) == PreyInternals::ARKPLAYER_ZOOMMANAGER_OFFSET, "ArkPlayer layout mismatch");
+static_assert(offsetof(ArkPlayer, m_weaponComponent) == PreyInternals::ARKPLAYER_WEAPONCOMPONENT_OFFSET, "ArkPlayer layout mismatch");
+static_assert(offsetof(ArkPlayer, m_camera) == 0x12A0, "ArkPlayer layout mismatch");
+static_assert(offsetof(CArkWeapon, m_pAttachment) == 0x2B0, "CArkWeapon layout mismatch");
+static_assert(offsetof(ArkPlayerCamera, m_rotation) == 0x150, "ArkPlayerCamera layout mismatch");
+static_assert(offsetof(ArkPlayerInput, m_sprintCameraRotationRateScale) == 0x98, "ArkPlayerInput layout mismatch");
+static_assert(offsetof(SViewParams, rotation) == 0x0C, "SViewParams layout mismatch");
+
+template <typename R, typename... Args>
+static inline R VCall(void* pObj, size_t slot, Args... args)
+{
+    using Fn = R(*)(void*, Args...);
+    return reinterpret_cast<Fn>((*reinterpret_cast<void***>(pObj))[slot])(pObj, args...);
+}
+
+template <typename T>
+static inline T& Member(void* pObj, size_t offset)
+{
+    return *reinterpret_cast<T*>(static_cast<char*>(pObj) + offset);
+}
+
+//---------------------------------------------------------------------------------
+// Hooks
+//---------------------------------------------------------------------------------
+static auto s_hookPwaUpdate = PreyInternals::CProceduralWeaponAnimation::FUpdate.MakeHook();
+static auto s_hookPwaContextUpdate = PreyInternals::CProceduralWeaponAnimationContext::FUpdate.MakeHook();
+
+static void CProceduralWeaponAnimationContext_Update_Hook(void* _this, float timePassed)
+{
+    using namespace PreyInternals::CProceduralWeaponAnimationContext;
+    int& instanceCount = Member<int>(_this, OFFSET_INSTANCE_COUNT);
+    const int rawCount = instanceCount;
+    const bool modifierNull = Member<void*>(_this, OFFSET_POSE_MODIFIER) == nullptr;
+
+    // Keep the weapon offset pipeline running while no procedural clip is active, so the
+    // user offset does not pop off during jump/land animations. The pose stacks are simply
+    // empty in that case, so the game contributes nothing extra.
+    bool forced = false;
+    if (gMod && gMod->GetSettings().enabled && instanceCount < 1 && !modifierNull)
+    {
+        instanceCount = 1;
+        forced = true;
+    }
+
+    if (gMod)
+        gMod->OnProceduralContextSeen(_this, rawCount, forced, modifierNull);
+
+    const bool ran = instanceCount >= 1;
+    s_hookPwaContextUpdate.InvokeOrig(_this, timePassed);
+
+    if (forced && instanceCount == 1)
+        instanceCount = 0;
+
+    if (gMod && ran)
+        gMod->OnProceduralContextUpdated(_this);
+}
+
+static void CProceduralWeaponAnimation_Update_Hook(void* _this, float deltaTime)
+{
+    s_hookPwaUpdate.InvokeOrig(_this, deltaTime);
+
+    if (!gMod)
+        return;
+
+    using namespace PreyInternals::CProceduralWeaponAnimation;
+    gMod->GetDiag().pwaUpdatesThisFrame++;
+
+    const ViewmodelSettings& s = gMod->GetSettings();
+    if (!s.enabled)
+        return;
+
+    // Leave the designer debug tool (g_debugWeaponOffset 2) alone.
+    if (Member<bool>(_this, OFFSET_DEBUG_INPUT_ENABLED))
+        return;
+
+    // Only the weapon hand: the support hand follows the weapon through the rig already.
+    QuatT& rightOffset = Member<QuatT>(_this, OFFSET_RIGHT_OFFSET);
+    gMod->ApplyOffset(rightOffset);
+}
+
+// The game's procedural weapon offsets (view space), captured so the aim lock can keep recoil/bumps.
+// NOTE: these are MEMBER functions returning a 28-byte QuatT, so the MSVC x64 convention is
+// (this, hidden return pointer, args...). The SDK headers declare them as free functions returning
+// QuatT, which would put the return pointer first - do not use those declarations for hooking.
+#define VM_OFFSET_COMPUTE_HOOK(NAME, CLASS, ADDR, SLOT)                                              \
+    static auto s_fn##NAME = PreyFunction<QuatT*(CLASS* _this, QuatT* _ret, float frameTime)>(ADDR);   \
+    static auto s_hook##NAME = s_fn##NAME.MakeHook();                                                 \
+    static QuatT* NAME##_Hook(CLASS* _this, QuatT* _ret, float frameTime)                             \
+    {                                                                                                 \
+        QuatT* r = s_hook##NAME.InvokeOrig(_this, _ret, frameTime);                                   \
+        if (gMod && r)                                                                                \
+            gMod->SetGameOffset(SLOT, *r);                                                            \
+        return r;                                                                                     \
+    }
+VM_OFFSET_COMPUTE_HOOK(LookCompute, CLookOffset, 0x1801770, 0)
+VM_OFFSET_COMPUTE_HOOK(StrafeCompute, CStrafeOffset, 0x18039C0, 1)
+VM_OFFSET_COMPUTE_HOOK(RecoilCompute, CRecoilOffset, 0x1803390, 2)
+VM_OFFSET_COMPUTE_HOOK(BumpCompute, CBumpOffset, 0x1801250, 3)
+
+// The player camera. Called by the view system once per frame after the first-person skeleton has been
+// evaluated (the camera position IS the evaluated camera attachment) and before anything is rendered.
+static auto s_hookUpdateView = ArkPlayerCamera::FUpdateView.MakeHook();
+static void ArkPlayerCamera_UpdateView_Hook(ArkPlayerCamera* const _this, SViewParams& _params)
+{
+    s_hookUpdateView.InvokeOrig(_this, _params);
+    if (gMod)
+        gMod->OnCameraUpdated(_this, _params);
+}
+
+// The game interpolates a weapon's camera-speed (and walk-speed) multiplier towards its "zoomed"
+// value based on the zoom manager's HFOV progress. Our aim camera zoom triggers that too, which is
+// where the aggressive ADS sensitivity drop comes from. Substitute the zoomed camera multiplier.
+static auto s_hookHfovMultiplier = ArkPlayerZoomManager::FGetHFOVDependentMultiplier.MakeHook();
+static float ArkPlayerZoomManager_GetHFOVDependentMultiplier_Hook(const ArkPlayerZoomManager* const _this, float currentMultiplier, float zoomedMultiplier)
+{
+    if (gMod)
+    {
+        float replacement = gMod->GetAimSensitivityMultiplier(currentMultiplier, zoomedMultiplier);
+        if (replacement > 0.0f)
+            zoomedMultiplier = replacement;
+    }
+    return s_hookHfovMultiplier.InvokeOrig(_this, currentMultiplier, zoomedMultiplier);
+}
+
+// Shotgun spread: the game interpolates the current dispersion between a minimum and a maximum that come
+// from stats (chipsets scale them the same way). Scaling both ends scales the whole cone.
+static auto s_hookDispMin = CArkWeaponShotgun::FGetDispersionMinimum.MakeHook();
+static auto s_hookDispMax = CArkWeaponShotgun::FGetDispersionMaximum.MakeHook();
+static float CArkWeaponShotgun_GetDispersionMinimum_Hook(CArkWeaponShotgun const* const _this)
+{
+    float v = s_hookDispMin.InvokeOrig(_this);
+    if (gMod)
+        v *= gMod->GetSpreadMultiplier(_this);
+    return v;
+}
+static float CArkWeaponShotgun_GetDispersionMaximum_Hook(CArkWeaponShotgun const* const _this)
+{
+    float v = s_hookDispMax.InvokeOrig(_this);
+    if (gMod)
+        v *= gMod->GetSpreadMultiplier(_this);
+    return v;
+}
+// The shotgun's pellets are laid out in a cone whose angle is the weapon stat "ShotgunSpreadConeDegrees",
+// read through CArkWeapon::GetStatFloat in SpawnPellets (the dispersion above only wobbles the cone's
+// centre). Scale that stat too.
+static auto s_hookGetStatFloat = CArkWeapon::FGetStatFloat.MakeHook();
+static float CArkWeapon_GetStatFloat_Hook(const CArkWeapon* const _this, const CCryName& _statName)
+{
+    float v = s_hookGetStatFloat.InvokeOrig(_this, _statName);
+    if (gMod && _statName.c_str() && strcmp(_statName.c_str(), "ShotgunSpreadConeDegrees") == 0)
+        v *= gMod->GetSpreadMultiplier(_this);
+    return v;
+}
+
+//---------------------------------------------------------------------------------
+// Helpers
+//---------------------------------------------------------------------------------
+static inline float SmoothStep01(float t)
+{
+    t = clamp_tpl(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+//! Moves `value` towards `target` so that a full 0->1 trip takes `time` seconds.
+static inline void MoveTowards(float& value, float target, float time, float dt)
+{
+    if (time <= 0.0001f)
+    {
+        value = target;
+        return;
+    }
+    float step = dt / time;
+    if (value < target)
+        value = min(value + step, target);
+    else if (value > target)
+        value = max(value - step, target);
+}
+
+static bool IsHardwareCursorVisible()
+{
+    if (!gEnv || !gEnv->pHardwareMouse)
+        return false;
+    return static_cast<CHardwareMouse*>(gEnv->pHardwareMouse)->m_iReferenceCounter > 0;
+}
+
+static const char* GetWeaponClassName(ArkPlayer* pPlayer)
+{
+    if (!pPlayer)
+        return "";
+    CArkWeapon* pWeapon = pPlayer->m_weaponComponent.GetEquippedWeapon();
+    if (!pWeapon)
+        return "";
+    IEntity* pEntity = pWeapon->GetEntity();
+    if (!pEntity || !pEntity->GetClass())
+        return "";
+    const char* name = pEntity->GetClass()->GetName();
+    return name ? name : "";
+}
+
+static QuatT BlendQuatT(const QuatT& a, const QuatT& b, float t)
+{
+    QuatT r;
+    r.t = LERP(a.t, b.t, t);
+    r.q = Quat::CreateNlerp(a.q, b.q, t);
+    return r;
+}
+
+float ModMain::Now() const
+{
+    return (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetCurrTime() : 0.0f;
+}
+
+//---------------------------------------------------------------------------------
+// Additive offsets (global standing / crouch + per-weapon hip + legacy aim)
+//---------------------------------------------------------------------------------
+void ModMain::ApplyOffset(QuatT& offset) const
+{
+    const ViewmodelSettings& s = m_settings;
+
+    const float ab = s.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f;
+    float cb = s.crouchEnabled ? SmoothStep01(m_crouchBlend) : 0.0f;
+    if (s.aimIgnoresCrouch)
+        cb *= (1.0f - ab); // the aim pose must line the sights up regardless of stance
+
+    PoseOffset total = s.base;
+    if (cb > 0.0f)
+        total.AddScaled(s.crouch, cb);
+    if (const WeaponSettings* pW = FindCurrentWeapon())
+        total.AddScaled(pW->hip, 1.0f);
+
+    const Quat userRot = total.Rot();
+    const Vec3 userPos = total.Pos();
+
+    // Rotate the weapon in place (around its hand pivot) and translate in view space.
+    offset.t += userPos;
+    offset.q = userRot * offset.q;
+
+    // Wall pull-back: slide the weapon towards the camera along the view axis. While aiming the lock
+    // takes over (see ComputeAimExtra), so fade this copy out with the aim blend.
+    if (s.wallPushEnabled && m_wallPush != 0.0f)
+        offset.t.y -= m_wallPush * (1.0f - ab);
+
+    // Hip-fire convergence: rotate in place so the barrel points at the crosshair's impact point.
+    // Fades out with the aim blend (the ironsight lock is on the camera ray by definition).
+    if (s.convergeEnabled && (m_convergeYaw != 0.0f || m_convergePitch != 0.0f))
+    {
+        const float k = 1.0f - ab;
+        const Quat conv = Quat::CreateRotationXYZ(Ang3(DEG2RAD(m_convergePitch * k), 0.0f, DEG2RAD(m_convergeYaw * k)));
+        offset.q = conv * offset.q;
+    }
+    offset.q.Normalize();
+}
+
+//---------------------------------------------------------------------------------
+// Diagnostics
+//---------------------------------------------------------------------------------
+void ModMain::OnProceduralContextSeen(void* pContext, int instanceCount, bool forced, bool modifierNull)
+{
+    using namespace PreyInternals::CProceduralWeaponAnimationContext;
+    PipelineDiag& d = m_diag;
+    d.ctxUpdatesThisFrame++;
+
+    const float t = Now();
+    if (pContext != d.lastContext)
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "context changed %p -> %p", d.lastContext, pContext);
+        d.Add(t, buf);
+        d.lastContext = pContext;
+    }
+    if ((instanceCount < 1) != (d.lastInstanceCount < 1))
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "instanceCount %d -> %d (%s)", d.lastInstanceCount, instanceCount, forced ? "forced alive" : "not forced");
+        d.Add(t, buf);
+    }
+    d.lastInstanceCount = instanceCount;
+    d.lastForced = forced;
+    if (modifierNull != d.lastModifierNull)
+    {
+        d.Add(t, modifierNull ? "pose modifier is NULL" : "pose modifier present");
+        d.lastModifierNull = modifierNull;
+    }
+    const int ik = Member<int>(pContext, OFFSET_RIGHT_IK_JOINT);
+    if (ik != d.lastRightIk)
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "right IK joint %d -> %d", d.lastRightIk, ik);
+        d.Add(t, buf);
+        d.lastRightIk = ik;
+    }
+}
+
+//---------------------------------------------------------------------------------
+// Ironsight lock
+//---------------------------------------------------------------------------------
+static QuatT ScaleQuatT(const QuatT& q, float k)
+{
+    if (k <= 0.0f) return QuatT(IDENTITY);
+    if (fabsf(k - 1.0f) < 1e-4f) return q;
+    QuatT r;
+    Ang3 a(q.q);
+    r.q = Quat::CreateRotationXYZ(Ang3(a.x * k, a.y * k, a.z * k));
+    r.t = q.t * k;
+    return r;
+}
+
+float ModMain::GetLockBlend() const
+{
+    const ViewmodelSettings& s = m_settings;
+    if (!s.enabled || !s.aimEnabled)
+        return 0.0f;
+    if (m_playerDead || m_reviveGuard > 0.0f)
+        return 0.0f; // death model / model reload: attachments and joints are being recreated
+    return SmoothStep01(m_aimBlend);
+}
+
+QuatT ModMain::ComputeAimExtra() const
+{
+    const ViewmodelSettings& s = m_settings;
+    // Keep (part of) the game's procedural offsets so the locked weapon still kicks and bumps
+    // (the camera itself already carries the game's camera recoil), and optionally couple the
+    // weapon to the head bob: the camera bobs with the animated head, so a weapon that is glued to
+    // the camera looks perfectly still on screen; subtracting a fraction of the camera's own bob makes
+    // it lag behind the head like a real ADS viewmodel. All terms are known exactly this frame.
+    QuatT extra(IDENTITY);
+    const WeaponSettings* pW = FindCurrentWeapon();
+    const float recoilScale = pW ? pW->aimRecoilScale : 1.0f;
+    if (s.aimAnimSway > 0.0f)
+        extra = extra * ScaleQuatT(m_gameOffsets[0], s.aimAnimSway) * ScaleQuatT(m_gameOffsets[1], s.aimAnimSway);
+    if (s.aimAnimRecoil * recoilScale > 0.0f)
+        extra = extra * ScaleQuatT(m_gameOffsets[2], s.aimAnimRecoil * recoilScale) * ScaleQuatT(m_gameOffsets[3], s.aimAnimRecoil * recoilScale);
+    // Head-bob coupling, boosted for a moment after each shot so the fire kick (which reaches the camera
+    // through the body animation) shows up as weapon motion relative to the sights.
+    float coupling = clamp_tpl(s.aimBobAmount, -1.0f, 1.0f);
+    if (pW && m_fireTimer > 0.0f && pW->fireCouplingTime > 0.001f)
+        coupling = max(coupling, pW->fireCoupling * clamp_tpl(m_fireTimer / pW->fireCouplingTime, 0.0f, 1.0f));
+    if (coupling != 0.0f && m_render.bobValid)
+        extra.t -= m_render.bobCam * coupling;
+    // Wall pull-back along the view axis keeps the sights on the crosshair, so it can stay on while aiming.
+    if (s.wallPushEnabled && s.wallPushWhileAiming && m_wallPush != 0.0f)
+        extra.t.y -= m_wallPush;
+    return extra;
+}
+
+//---------------------------------------------------------------------------------
+// Skeleton side (before the animation is evaluated)
+//---------------------------------------------------------------------------------
+void ModMain::OnProceduralContextUpdated(void* pContext)
+{
+    using namespace PreyInternals;
+    using namespace PreyInternals::CProceduralWeaponAnimationContext;
+
+    AimLockState& L = m_lock;
+    const RenderLockState& R = m_render;
+
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    void* pModifier = Member<void*>(pContext, OFFSET_POSE_MODIFIER);
+    void* pScope = Member<void*>(pContext, OFFSET_SCOPE);
+    if (!pPlayer || !pModifier || !pScope || !pPlayer->GetEntity())
+    {
+        L.active = false;
+        L.captured = false;
+        return;
+    }
+
+    L.rightIkJoint = Member<int>(pContext, OFFSET_RIGHT_IK_JOINT);
+    L.leftIkJoint = Member<int>(pContext, OFFSET_LEFT_IK_JOINT);
+    L.weaponJoint = Member<int>(pContext, OFFSET_WEAPON_TARGET_JOINT);
+
+    void* pCharInst = VCall<void*>(pScope, VT_IScope_GetCharInst);
+    ICharacterInstance* pPlayerChar = pPlayer->GetEntity()->GetCharacter(0);
+    L.charMatches = pCharInst && pCharInst == static_cast<void*>(pPlayerChar);
+    if (!pCharInst || L.rightIkJoint < 0)
+    {
+        L.active = false;
+        L.captured = false;
+        return;
+    }
+
+    // Skeleton readings are the *previous* frame's final pose (model space).
+    void* pSkelPose = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose);
+    if (!pSkelPose)
+        return;
+    L.ikAbs = *VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, L.rightIkJoint);
+    // "Weapon" here means the weapon attachment (what gets rendered and what the render side places),
+    // read from the game's values of the previous frame (before the render side moved the hands).
+    if (R.attOffsetValid)
+        L.weaponAbs = R.weaponBoneGame * R.attOffset;
+    else
+        L.weaponAbs = pPlayer->GetBoneTransform(BONE_WEAPON);
+    L.ikErr = (L.ikAbs.t - L.lastTarget.t).GetLength();
+
+    const float ab = L.charMatches ? GetLockBlend() : 0.0f;
+
+    IEntity* pEnt = pPlayer->GetEntity();
+    Quat entRot = pEnt->GetWorldRotation();
+    entRot.Normalize();
+    const Quat freshRot = pPlayer->m_camera.m_rotation; // this frame's view rotation (updated in PrePhysicsUpdate)
+
+    // Best available camera for this frame: last frame's exact camera (position in model space is
+    // frame-independent; a frame of head motion is a millimetre) with this frame's mouse look applied.
+    // Nothing here is filtered or integrated; the render-side step below fixes whatever is left.
+    QuatT camAbs;
+    if (R.camValid)
+    {
+        Quat delta = freshRot * (!R.freshRotAtCam);
+        delta.Normalize();
+        Quat camRotWorld = delta * R.camWorldRot;
+        camRotWorld.Normalize();
+        camAbs.q = (!entRot) * camRotWorld;
+        camAbs.q.Normalize();
+        camAbs.t = R.camModelPos;
+    }
+    else
+    {
+        const QuatT camBone = pPlayer->GetBoneTransform(BONE_CAMERA);
+        camAbs.q = (!entRot) * freshRot;
+        camAbs.q.Normalize();
+        camAbs.t = camBone.t;
+    }
+
+    PushAimLock(pModifier, camAbs, L.ikAbs, L.weaponAbs, ab);
+}
+
+void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikAbs, const QuatT& weaponBone, float ab)
+{
+    using namespace PreyInternals;
+    AimLockState& L = m_lock;
+
+    L.camAbs = camAbs;
+
+    if (ab <= 0.0f || !pModifier)
+    {
+        L.active = false;
+        L.captured = false;
+        return;
+    }
+
+    if (!L.captured || L.weaponClass != m_currentWeaponClass)
+    {
+        if (!L.active)
+            L.hipRel = camAbs.GetInverted() * ikAbs; // where the hand was when aiming started
+        L.weaponRel = ikAbs.GetInverted() * weaponBone; // hand -> weapon bone, assumed rigid
+        L.weaponClass = m_currentWeaponClass;
+        L.captured = true;
+    }
+    L.active = true;
+
+    const WeaponSettings& w = GetCurrentWeapon();
+    const QuatT desiredRelCam = ComputeAimExtra() * w.aim.AsQuatT();
+
+    const QuatT aimWeaponAbs = camAbs * desiredRelCam;                  // where the weapon bone should be
+    const QuatT aimIkAbs = aimWeaponAbs * L.weaponRel.GetInverted();    // -> where the hand IK target must be
+    const QuatT hipAbs = camAbs * L.hipRel;                             // hip pose, following the camera
+    QuatT target = BlendQuatT(hipAbs, aimIkAbs, ab);
+    target.q.Normalize();
+
+    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, L.rightIkJoint, OP_OVERRIDE, &target.t);
+    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, L.rightIkJoint, OP_OVERRIDE, &target.q);
+    L.lastTarget = target;
+}
+
+//---------------------------------------------------------------------------------
+// Render side (after the camera is final)
+//---------------------------------------------------------------------------------
+void ModMain::UpdateSkeletonCache(void* pCharInst, void* pAttachment)
+{
+    using namespace PreyInternals;
+    RenderLockState& R = m_render;
+
+    void* pSkel = VCall<void*>(pCharInst, VT_ICharacterInstance_GetIDefaultSkeleton);
+    if (!pSkel)
+        return;
+    const int count = (int)VCall<unsigned>(pSkel, VT_IDefaultSkeleton_GetJointCount);
+    const int attachJoint = Member<int>(pAttachment, OFFSET_CAttachmentBONE_JOINT_ID);
+    if (pSkel == R.skeleton && count == R.jointCount && attachJoint == R.attachJoint)
+        return;
+
+    R.skeleton = pSkel;
+    R.jointCount = count;
+    R.attachJoint = attachJoint;
+    R.rightSubtree.clear();
+    R.leftSubtree.clear();
+    R.rightHand = R.leftHand = -1;
+    R.attachJointName.clear();
+    R.rightHandName.clear();
+    R.leftHandName.clear();
+    if (count <= 0 || count > 4096)
+        return;
+
+    auto jointName = [&](int id) -> const char* {
+        if (id < 0 || id >= count) return "";
+        const char* n = VCall<const char*>(pSkel, VT_IDefaultSkeleton_GetJointNameByID, id);
+        return n ? n : "";
+    };
+    auto parentOf = [&](int id) -> int {
+        if (id < 0 || id >= count) return -1;
+        return VCall<int>(pSkel, VT_IDefaultSkeleton_GetJointParentIDByID, id);
+    };
+    // The weapon hangs off a "prop" joint that is a child of the hand joint. Move the whole hand.
+    auto handOf = [&](int propJoint) -> int {
+        if (propJoint < 0 || propJoint >= count) return -1;
+        const char* n = jointName(propJoint);
+        if (strstr(n, "Prop") || strstr(n, "prop") || strstr(n, "weapon"))
+        {
+            const int p = parentOf(propJoint);
+            return p >= 0 ? p : propJoint;
+        }
+        return propJoint;
+    };
+
+    R.attachJointName = jointName(attachJoint);
+    R.rightHand = handOf(attachJoint);
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    const int leftProp = pPlayer ? pPlayer->m_camera.GetJointId((int)ArkPlayerCamera::EArkBoneList::BONE_WEAPON2) : -1;
+    R.leftHand = handOf(leftProp);
+    R.rightHandName = jointName(R.rightHand);
+    R.leftHandName = jointName(R.leftHand);
+
+    // Subtrees (CryEngine guarantees parent index < child index).
+    std::vector<char> inRight(count, 0), inLeft(count, 0);
+    for (int i = 0; i < count; i++)
+    {
+        const int p = parentOf(i);
+        inRight[i] = (i == R.rightHand) || (p >= 0 && inRight[p]);
+        inLeft[i] = (i == R.leftHand) || (p >= 0 && inLeft[p]);
+        if (inRight[i]) R.rightSubtree.push_back(i);
+        if (inLeft[i] && !inRight[i]) R.leftSubtree.push_back(i);
+    }
+}
+
+void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
+{
+    using namespace PreyInternals;
+    RenderLockState& R = m_render;
+    const ViewmodelSettings& s = m_settings;
+
+    if (R.frameOfLastCall != m_frameIndex)
+    {
+        R.callsLastFrame = R.callsThisFrame;
+        R.callsThisFrame = 0;
+        R.frameOfLastCall = m_frameIndex;
+    }
+    R.callsThisFrame++;
+
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer || pCamera != &pPlayer->m_camera || !pPlayer->GetEntity())
+        return;
+    IEntity* pEnt = pPlayer->GetEntity();
+
+    // --- Exact camera of this frame, in model (entity) space -------------------------------------
+    // With camera-space rendering (ENTITY_SLOT_RENDER_NEAREST on the arms) UpdateView returns the
+    // position relative to the entity; CView adds the entity position afterwards. Detect the other case.
+    Quat entRot = pEnt->GetWorldRotation();
+    entRot.Normalize();
+    Vec3 camPosRel = params.position;
+    R.positionWasWorld = camPosRel.GetLengthSquared() > 20.0f * 20.0f;
+    if (R.positionWasWorld)
+        camPosRel -= pEnt->GetWorldPos();
+    Quat camRotWorld = params.rotation;
+    camRotWorld.Normalize();
+
+    QuatT camModel;
+    camModel.q = (!entRot) * camRotWorld;
+    camModel.q.Normalize();
+    camModel.t = (!entRot) * camPosRel;
+    R.camModel = camModel;
+
+    R.camWorldRot = camRotWorld;
+    R.camModelPos = camModel.t;
+    R.freshRotAtCam = pPlayer->m_camera.m_rotation;
+    R.camValid = true;
+
+    const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.016f;
+
+    // Head bob = camera motion minus its slow component (posture, crouch, lean, eye height).
+    {
+        if (!R.bobValid || (camModel.t - R.camLowPass).GetLengthSquared() > 1.0f)
+        {
+            R.camLowPass = camModel.t;
+            R.bobValid = true;
+        }
+        const float tau = max(s.aimBobTau, 0.02f);
+        const float k = 1.0f - expf(-dt / tau);
+        R.camLowPass += (camModel.t - R.camLowPass) * k;
+        Vec3 bob = camModel.t - R.camLowPass;
+        const float maxBob = 0.05f;
+        if (bob.GetLength() > maxBob)
+            bob = bob.GetNormalized() * maxBob;
+        R.bobCam = (!camModel.q) * bob;
+    }
+
+    // Shot detection: the camera recoil timer is re-armed by every shot, and the procedural recoil
+    // offset jumps. Either one starts the post-shot coupling boost.
+    {
+        const float camRecoil = pPlayer->m_camera.m_recoilTimeRemaining;
+        const float recoilMag = m_gameOffsets[2].t.GetLength();
+        const bool shot = (camRecoil > m_prevCamRecoilTime + 1e-4f) || (recoilMag > m_prevRecoilMag + 0.002f && recoilMag > 0.003f);
+        m_prevCamRecoilTime = camRecoil;
+        m_prevRecoilMag = recoilMag;
+        if (shot)
+        {
+            m_shotsSeen++;
+            const WeaponSettings* pW = FindCurrentWeapon();
+            m_fireTimer = max(m_fireTimer, pW ? pW->fireCouplingTime : 0.3f);
+        }
+        else if (m_fireTimer > 0.0f)
+            m_fireTimer = max(0.0f, m_fireTimer - dt);
+    }
+
+    // --- Weapon attachment ------------------------------------------------------------------------
+    if (m_playerDead || m_reviveGuard > 0.0f)
+    {
+        R.attachValid = false;
+        return;
+    }
+    CArkWeapon* pWeapon = pPlayer->m_weaponComponent.GetEquippedWeapon();
+    // Only a weapon the player actually owns has a live attachment on the arms.
+    if (pWeapon && pWeapon->GetOwnerId() != pEnt->GetId())
+        pWeapon = nullptr;
+    void* pAttachment = pWeapon ? static_cast<void*>(pWeapon->m_pAttachment) : nullptr;
+    ICharacterInstance* pCharInst = pEnt->GetCharacter(0);
+    if (!pAttachment || !pCharInst)
+    {
+        R.attachValid = false;
+        return;
+    }
+    UpdateSkeletonCache(pCharInst, pAttachment);
+
+    QuatT* pModelRel = const_cast<QuatT*>(VCall<const QuatT*>(pAttachment, VT_IAttachment_GetAttModelRelative));
+    if (!pModelRel)
+    {
+        R.attachValid = false;
+        return;
+    }
+    R.attachValid = true;
+    const QuatT gameModel = *pModelRel;
+    R.weaponModelGame = gameModel;
+    R.weaponRelCam = camModel.GetInverted() * gameModel;
+    // Final (unmodified) weapon bone of this frame and its constant offset to the attachment, so the
+    // skeleton-side push next frame targets the very same thing we place here.
+    R.weaponBoneGame = pPlayer->GetBoneTransform(BONE_WEAPON);
+    R.attOffset = R.weaponBoneGame.GetInverted() * gameModel;
+    R.attOffsetValid = true;
+
+    const float ab = (m_lock.charMatches || !m_lock.active) ? GetLockBlend() : 0.0f;
+    if (ab <= 0.0f)
+    {
+        // Not aiming: this is the exact hip pose of the weapon relative to the camera.
+        R.hipRelCam = R.weaponRelCam;
+        R.hipValid = true;
+        R.residualPos = 0.0f;
+        R.residualRot = 0.0f;
+    }
+
+    // --- Desired transform ------------------------------------------------------------------------
+    QuatT desiredModel = gameModel;
+    bool changed = false;
+    if (ab > 0.0f && s.aimRenderLock)
+    {
+        const WeaponSettings& w = GetCurrentWeapon();
+        const QuatT aimRelCam = ComputeAimExtra() * w.aim.AsQuatT();
+        QuatT desiredRelCam = BlendQuatT(R.weaponRelCam, aimRelCam, ab);
+        desiredRelCam.q.Normalize();
+        desiredModel = camModel * desiredRelCam;
+        changed = true;
+    }
+    if (s.testOffsetUp != 0.0f)
+    {
+        desiredModel.t += (camModel.q * Vec3(0.0f, 0.0f, s.testOffsetUp));
+        changed = true;
+    }
+    if (!changed)
+        return;
+    desiredModel.q.Normalize();
+    R.desiredModel = desiredModel;
+
+    // Rigid delta that takes the game's weapon transform to ours (model space).
+    QuatT D = desiredModel * gameModel.GetInverted();
+    D.q.Normalize();
+    R.residualPos = D.t.GetLength();
+    {
+        Quat dq = desiredModel.q * (!gameModel.q);
+        dq.Normalize();
+        R.residualRot = 2.0f * acosf(clamp_tpl(fabsf(dq.w), 0.0f, 1.0f));
+    }
+    if (ab > 0.0f && s.aimRenderLock)
+    {
+        R.residualPosAcc = max(R.residualPosAcc, R.residualPos);
+        R.residualTimer += dt;
+        if (R.residualTimer > 1.0f)
+        {
+            R.residualPosMax1s = R.residualPosAcc;
+            R.residualPosAcc = 0.0f;
+            R.residualTimer = 0.0f;
+        }
+    }
+
+    *pModelRel = desiredModel;
+
+    // --- Hands: move the final hand poses by the same rigid delta so they stay on the grip. ----------
+    const bool wantHands = (ab > 0.0f && s.aimRenderLock) ? (s.aimHandsFollow != 0) : (s.testHands != 0);
+    if (!wantHands)
+        return;
+    void* pSkelPose = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose);
+    if (!pSkelPose)
+        return;
+    auto jointRef = [&](int id) -> QuatT* {
+        return const_cast<QuatT*>(VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, id));
+    };
+    for (int j : R.rightSubtree)
+        if (QuatT* p = jointRef(j))
+            *p = D * (*p);
+
+    R.leftOnWeapon = false;
+    if (R.leftHand >= 0 && (s.aimLeftHandFollow || ab <= 0.0f))
+    {
+        if (QuatT* pl = jointRef(R.leftHand))
+        {
+            R.leftHandDist = (pl->t - gameModel.t).GetLength();
+            R.leftOnWeapon = R.leftHandDist < 0.35f;
+        }
+        if (R.leftOnWeapon)
+            for (int j : R.leftSubtree)
+                if (QuatT* p = jointRef(j))
+                    *p = D * (*p);
+    }
+}
+
+void ModMain::UpdateConvergence(float dt)
+{
+    const ViewmodelSettings& s = m_settings;
+
+    const bool wantConverge = s.convergeEnabled != 0;
+    const bool wantWall = s.wallPushEnabled != 0;
+    const bool wantBlock = s.aimWallBlockEnabled != 0 && s.aimEnabled != 0;
+    if (!s.enabled || (!wantConverge && !wantWall && !wantBlock) || !gEnv || !gEnv->pPhysicalWorld || !gEnv->pSystem)
+    {
+        m_convergeTargetYaw = m_convergeTargetPitch = 0.0f;
+        m_convergeYaw = m_convergePitch = 0.0f;
+        m_wallPush = m_wallPushTarget = 0.0f;
+        m_convergeHit = false;
+        m_aimBlockedByWall = false;
+        return;
+    }
+
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer)
+        return;
+    IPhysicalEntity* pSkip = pPlayer->GetEntity() ? pPlayer->GetEntity()->GetPhysics() : nullptr;
+
+    // Previous frame's rendered camera is plenty accurate for a smoothed convergence target.
+    const Matrix34 cam = gEnv->pSystem->GetViewCamera().GetMatrix();
+    const Vec3 camPos = cam.GetTranslation();
+    const Vec3 dir = cam.GetColumn1().GetNormalized(); // CryEngine forward = +Y
+
+    const float maxDist = clamp_tpl(s.convergeMaxDist, 1.0f, 200.0f);
+    ray_hit hit;
+    const int n = gEnv->pPhysicalWorld->RayWorldIntersection(camPos, dir * maxDist, ent_all,
+        rwi_stop_at_pierceable | rwi_colltype_any(geom_colltype_ray | geom_colltype0 | geom_colltype_player), &hit, 1, pSkip);
+    m_convergeHit = (n > 0);
+    m_convergeDist = m_convergeHit ? hit.dist : maxDist;
+
+    // --- Convergence: point the barrel at the impact point --------------------------------------
+    float yaw = 0.0f, pitch = 0.0f;
+    if (wantConverge)
+    {
+        // Weapon offset from the camera in view space (exact, measured at render time while not aiming).
+        const Vec3 w = m_render.hipRelCam.t;
+        const float d = max(m_convergeDist - w.y, 0.15f); // distance from roughly the weapon to the target
+        yaw = RAD2DEG(atan2f(w.x, d));   // weapon right of the eye -> turn left (+yaw)
+        pitch = RAD2DEG(atan2f(-w.z, d)); // weapon below the eye -> tilt up (+pitch)
+        const float maxA = clamp_tpl(s.convergeMaxAngle, 0.0f, 45.0f);
+        yaw = clamp_tpl(yaw, -maxA, maxA) * clamp_tpl(s.convergeStrength, 0.0f, 1.0f);
+        pitch = clamp_tpl(pitch, -maxA, maxA) * clamp_tpl(s.convergeStrength, 0.0f, 1.0f);
+    }
+    m_convergeTargetYaw = yaw;
+    m_convergeTargetPitch = pitch;
+    {
+        const float tau = max(s.convergeSmoothTime, 0.0f);
+        const float k = (tau > 0.0005f) ? (1.0f - expf(-dt / tau)) : 1.0f;
+        m_convergeYaw += (yaw - m_convergeYaw) * k;
+        m_convergePitch += (pitch - m_convergePitch) * k;
+    }
+
+    // --- Wall pull-back: move the weapon towards the camera when something is close ------------
+    float push = 0.0f;
+    if (wantWall && m_convergeHit)
+    {
+        const WeaponSettings* pW = FindCurrentWeapon();
+        const float amount = pW ? pW->wallPush : WeaponSettings().wallPush;
+        const float startD = max(s.wallPushStartDist, 0.05f);
+        const float fullD = clamp_tpl(s.wallPushFullDist, 0.0f, startD - 0.01f);
+        // 0 at startD, 1 at fullD (and closer), eased so it does not kick in abruptly.
+        const float t = SmoothStep01((startD - m_convergeDist) / (startD - fullD));
+        push = clamp_tpl(amount, 0.0f, 0.5f) * t;
+    }
+    m_wallPushTarget = push;
+    {
+        const float tau = max(s.wallPushSmoothTime, 0.0f);
+        const float k = (tau > 0.0005f) ? (1.0f - expf(-dt / tau)) : 1.0f;
+        m_wallPush += (push - m_wallPush) * k;
+    }
+
+    // --- Aim block: no ironsights while the weapon would be poking into the wall -----------------
+    // Reach estimate = how far the weapon sits in front of the eye + its wall pull-back (longer
+    // weapons have more), times the user's tolerance. Small hysteresis so it cannot flicker.
+    if (wantBlock)
+    {
+        const WeaponSettings* pW = FindCurrentWeapon();
+        const float reach = max(m_render.hipRelCam.t.y, 0.15f) + (pW ? pW->wallPush : WeaponSettings().wallPush);
+        m_aimBlockDist = reach * clamp_tpl(s.aimWallBlockScale, 0.1f, 5.0f);
+        if (!m_convergeHit)
+            m_aimBlockedByWall = false;
+        else if (m_aimBlockedByWall)
+            m_aimBlockedByWall = m_convergeDist < m_aimBlockDist * 1.1f;
+        else
+            m_aimBlockedByWall = m_convergeDist < m_aimBlockDist;
+    }
+    else
+    {
+        m_aimBlockedByWall = false;
+    }
+}
+
+float ModMain::GetAimSensitivityMultiplier(float currentMultiplier, float zoomedMultiplier)
+{
+    // Only while our own aim zoom is active, and only for the camera-speed call (the same function
+    // also blends the walk-speed multiplier; we tell the two apart by the weapon's zoomed camera stat).
+    if (m_cameraZoomHandle == 0 || m_settings.aimSensMode == 0)
+        return 0.0f;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    CArkWeapon* pWeapon = pPlayer ? pPlayer->m_weaponComponent.GetEquippedWeapon() : nullptr;
+    if (!pWeapon)
+        return 0.0f;
+    if (fabsf(pWeapon->GetZoomedCameraSpeedStat() - zoomedMultiplier) > 1e-6f)
+        return 0.0f; // walk speed call
+    m_sensHookCalls++;
+    const float scale = (m_settings.aimSensMode == 1) ? clamp_tpl(m_settings.aimCameraZoomFactor, 0.2f, 1.5f)
+                                                       : clamp_tpl(m_settings.aimSensScale, 0.05f, 3.0f);
+    return currentMultiplier * scale;
+}
+
+float ModMain::GetSpreadMultiplier(const CArkItem* pWeapon)
+{
+    if (!m_settings.enabled || !pWeapon)
+        return 1.0f;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer || !pPlayer->GetEntity() || pWeapon->GetOwnerId() != pPlayer->GetEntity()->GetId())
+        return 1.0f; // not the player's weapon
+    m_spreadHookCalls++;
+    // Per-weapon factors (the pistol and the shotgun share the game's "shotgun" weapon class).
+    IEntity* pEnt = pWeapon->GetEntity();
+    if (!pEnt || !pEnt->GetClass())
+        return 1.0f;
+    const WeaponSettings* pW = FindWeapon(pEnt->GetClass()->GetName());
+    if (!pW)
+        return 1.0f;
+    const float ab = m_settings.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f;
+    const float hip = clamp_tpl(pW->hipSpreadMult, 0.0f, 5.0f);
+    const float ads = clamp_tpl(pW->aimSpreadMult, 0.0f, 5.0f);
+    return LERP(hip, ads, ab);
+}
+
+//---------------------------------------------------------------------------------
+// State
+//---------------------------------------------------------------------------------
+void ModMain::UpdateBlendStates(float dt)
+{
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+
+    bool crouching = false;
+    bool aiming = false;
+
+    if (pPlayer)
+    {
+        // Dead (ragdoll / death model) or just revived (model reloaded, attachments recreated):
+        // keep our hands off the skeleton and the weapon attachment for a moment.
+        const bool dead = pPlayer->m_playerComponent.GetHealthComponent().IsDead();
+        if (m_playerDead && !dead)
+            m_reviveGuard = 0.75f;
+        m_playerDead = dead;
+        if (m_reviveGuard > 0.0f)
+            m_reviveGuard -= dt;
+        if (dead)
+            m_aimKeyHeld = m_settings.aimToggle ? false : m_aimKeyHeld;
+
+        const EStance stance = pPlayer->m_stance;
+        crouching = (stance == EStance::STANCE_SNEAK || stance == EStance::STANCE_CRAWL);
+
+        m_currentWeaponClass = GetWeaponClassName(pPlayer);
+
+        // Aim key held/toggled, weapon allows aiming, and the player is actually controlling the
+        // character (no cursor on screen: menus, inventory, our own settings window...).
+        const WeaponSettings* pW = FindCurrentWeapon();
+        const bool weaponAllows = !m_currentWeaponClass.empty() && (!pW || pW->aimAllowed);
+        aiming = m_settings.aimEnabled && m_aimKeyHeld && weaponAllows && !m_mouseCaptured && !IsHardwareCursorVisible()
+                 && !(m_settings.aimWallBlockEnabled && m_aimBlockedByWall) && !dead && m_reviveGuard <= 0.0f;
+    }
+    else
+    {
+        m_aimKeyHeld = false;
+        m_currentWeaponClass.clear();
+    }
+
+    if (!aiming && m_settings.aimToggle && (IsHardwareCursorVisible() || !pPlayer))
+        m_aimKeyHeld = false; // drop a stale toggle when a menu opens
+
+    m_isCrouching = crouching;
+    m_isAiming = aiming;
+
+    UpdateCameraZoom(aiming);
+
+    MoveTowards(m_crouchBlend, crouching ? 1.0f : 0.0f, m_settings.crouchTime, dt);
+    MoveTowards(m_aimBlend, aiming ? 1.0f : 0.0f, m_settings.aimTime, dt);
+}
+
+void ModMain::UpdateCameraZoom(bool aiming)
+{
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer)
+    {
+        m_cameraZoomHandle = 0; // the zoom manager is gone with the player
+        return;
+    }
+
+    ArkPlayerZoomManager& zoom = pPlayer->m_zoomManager;
+    const bool want = aiming && m_settings.aimCameraZoom != 0;
+    SCVars* pCVars = *g_pGameCVars;
+    const float baseHfov = (pCVars && pCVars->cl_hfov > 1.0f) ? pCVars->cl_hfov : 90.0f;
+    const float factor = clamp_tpl(m_settings.aimCameraZoomFactor, 0.2f, 1.5f);
+    const float hfov = baseHfov * factor;
+
+    if (want && m_cameraZoomHandle == 0)
+    {
+        m_cameraZoomHandle = zoom.SetDesiredHFOV(hfov, m_settings.aimTime, false, EArkZoomPriority::high);
+        m_cameraZoomHfov = hfov;
+    }
+    else if (want && fabsf(hfov - m_cameraZoomHfov) > 0.01f)
+    {
+        zoom.UpdateDesiredHFOV(m_cameraZoomHandle, hfov, 0.05f, false);
+        m_cameraZoomHfov = hfov;
+    }
+    else if (!want && m_cameraZoomHandle != 0)
+    {
+        zoom.ClearDesiredHFOV(m_cameraZoomHandle, m_settings.aimTime, false);
+        m_cameraZoomHandle = 0;
+    }
+}
+
+//---------------------------------------------------------------------------------
+// Built-in per-weapon defaults (tuned on the stock weapons; the user's weapons.xml overrides them)
+//---------------------------------------------------------------------------------
+namespace
+{
+    struct BuiltInWeapon
+    {
+        const char* cls;
+        bool aimAllowed;
+        float wallPush;
+        float fireCoupling, fireCouplingTime, aimRecoilScale;
+        float aimSpread, hipSpread;
+        PoseOffset hip;
+        PoseOffset aim;
+    };
+    PoseOffset P(float x, float y, float z, float pitch = 0.0f, float yaw = 0.0f, float roll = 0.0f)
+    {
+        PoseOffset p;
+        p.posX = x; p.posY = y; p.posZ = z; p.pitch = pitch; p.yaw = yaw; p.roll = roll;
+        return p;
+    }
+    const BuiltInWeapon* BuiltInTable(size_t& count)
+    {
+        // Aim pose = weapon attachment relative to the camera (m / deg), x = 0 means centered on the crosshair.
+        static const BuiltInWeapon table[] = {
+            //  class                          aim    wall   fireC fireT recoil aimSp hipSp  hip offset                                   aim pose
+            { "ArkWeaponPistol",               true,  0.066f, 1.0f, 0.40f, 3.0f, 0.5f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1327f, 0.04f) },
+            { "ArkWeaponShotgun",              true,  0.134f, 1.0f, 0.75f, 1.0f, 0.5f, 1.0f, P(0, 0, -0.0323f, 3.23f),                    P(0.0f, 0.0575f, -0.0956f, 0.73f) },
+            { "ArkWeaponGooGun",               true,  0.157f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1707f) },
+            { "ArkWeaponStunGun",              true,  0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1487f) },
+            { "ArkWeaponToyGun",               true,  0.129f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, -0.014f, -0.0403f, 4.84f, 5.44f),       P(0.0f, 0.0564f, -0.0954f) },
+            { "ArkWeaponInstalaser",           true,  0.216f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, -0.0362f, 5.13f, 2.58f),             P(0.165f, -0.2295f, 0.0511f, 0.0f, 0.01f) },
+            { "ArkWeaponWrench",               false, 0.026f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(-0.0177f, 0.0242f, 0.0398f, 4.83f, 0.0f, -5.99f), P(0, 0.25f, -0.06f) },
+            { "ArkWeaponEMPGrenade",           false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponLureGrenade",          false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponRecyclerGrenade",      false, 0.000f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponNullwaveTransmitter",  false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponExplosiveGrenade",     false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+        };
+        count = sizeof(table) / sizeof(table[0]);
+        return table;
+    }
+}
+
+const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
+{
+    static std::map<std::string, WeaponSettings> s_cache;
+    if (!weaponClass || !*weaponClass)
+        return nullptr;
+    auto it = s_cache.find(weaponClass);
+    if (it != s_cache.end())
+        return &it->second;
+    size_t n = 0;
+    const BuiltInWeapon* t = BuiltInTable(n);
+    for (size_t i = 0; i < n; i++)
+    {
+        if (strcmp(t[i].cls, weaponClass) != 0)
+            continue;
+        WeaponSettings w;
+        w.aimAllowed = t[i].aimAllowed;
+        w.wallPush = t[i].wallPush;
+        w.fireCoupling = t[i].fireCoupling;
+        w.fireCouplingTime = t[i].fireCouplingTime;
+        w.aimRecoilScale = t[i].aimRecoilScale;
+        w.aimSpreadMult = t[i].aimSpread;
+        w.hipSpreadMult = t[i].hipSpread;
+        w.hip = t[i].hip;
+        w.aim = t[i].aim;
+        w.valid = false; // built-in: not written to the XML until the user changes it
+        return &s_cache.emplace(weaponClass, w).first->second;
+    }
+    return nullptr;
+}
+
+const WeaponSettings* ModMain::FindWeapon(const char* weaponClass) const
+{
+    if (!weaponClass || !*weaponClass)
+        return nullptr;
+    auto it = m_weapons.find(weaponClass);
+    if (it != m_weapons.end())
+        return &it->second;
+    return WeaponSettings::BuiltIn(weaponClass);
+}
+
+const WeaponSettings* ModMain::FindCurrentWeapon() const
+{
+    return FindWeapon(m_currentWeaponClass.c_str());
+}
+
+WeaponSettings& ModMain::GetCurrentWeapon()
+{
+    const std::string& key = m_currentWeaponClass.empty() ? std::string("_none") : m_currentWeaponClass;
+    auto it = m_weapons.find(key);
+    if (it == m_weapons.end())
+    {
+        WeaponSettings w;
+        if (const WeaponSettings* pBuiltIn = WeaponSettings::BuiltIn(key.c_str()))
+            w = *pBuiltIn;
+        else
+            w.aim = WeaponSettings::DefaultAim();
+        w.valid = false;
+        it = m_weapons.emplace(key, w).first;
+    }
+    return it->second;
+}
+
+PoseOffset& ModMain::GetActivePose(const char** outName)
+{
+    if (m_isAiming && m_settings.aimEnabled)
+    {
+        if (outName) *outName = "aim pose (this weapon)";
+        return GetCurrentWeapon().aim;
+    }
+    if (m_settings.nudgeTarget == 1 && !m_currentWeaponClass.empty())
+    {
+        if (outName) *outName = "hip offset (this weapon)";
+        return GetCurrentWeapon().hip;
+    }
+    if (m_isCrouching && m_settings.crouchEnabled)
+    {
+        if (outName) *outName = "crouch offset (global)";
+        return m_settings.crouch;
+    }
+    if (outName) *outName = "standing offset (global)";
+    return m_settings.base;
+}
+
+void ModMain::UpdateNudge(float dt)
+{
+    if (!m_settings.nudgeKeys || m_mouseCaptured || IsHardwareCursorVisible())
+        return;
+
+    bool any = false;
+    for (float v : m_nudgeAxis)
+        any |= (v != 0.0f);
+    if (!any)
+        return;
+
+    PoseOffset& pose = GetActivePose(nullptr);
+    const float mul = m_nudgeSlow ? 0.2f : 1.0f;
+    for (int i = 0; i < 3; i++)
+        pose.Axis(i) += m_nudgeAxis[i] * m_settings.nudgePosSpeed * mul * dt;
+    for (int i = 3; i < 6; i++)
+        pose.Axis(i) += m_nudgeAxis[i] * m_settings.nudgeRotSpeed * mul * dt;
+
+    const bool editingWeapon = m_isAiming || (!m_isAiming && m_settings.nudgeTarget == 1);
+    if (editingWeapon && !m_currentWeaponClass.empty())
+    {
+        GetCurrentWeapon().valid = true;
+        m_weaponsDirty = true;
+    }
+}
+
+//---------------------------------------------------------------------------------
+// Input
+//---------------------------------------------------------------------------------
+bool ModMain::HandleNudgeKey(EKeyId key, bool pressed)
+{
+    const float v = pressed ? 1.0f : 0.0f;
+    auto axis = [&](int posAxis, int rotAxis, float dir) {
+        // Clear both candidates so a mode switch mid-press cannot leave an axis stuck.
+        m_nudgeAxis[posAxis] = 0.0f;
+        m_nudgeAxis[rotAxis] = 0.0f;
+        m_nudgeAxis[m_nudgeRotMode ? rotAxis : posAxis] = dir * v;
+        return true;
+    };
+
+    if (m_settings.nudgeLayout == 0)
+    {
+        switch (key)
+        {
+        case eKI_NP_0: m_nudgeRotMode = pressed; return true;
+        case eKI_NP_Period: m_nudgeSlow = pressed; return true;
+        case eKI_NP_4: return axis(0, 4, -1.0f); // left  / yaw -
+        case eKI_NP_6: return axis(0, 4, +1.0f); // right / yaw +
+        case eKI_NP_8: return axis(2, 3, +1.0f); // up    / pitch +
+        case eKI_NP_2: return axis(2, 3, -1.0f); // down  / pitch -
+        case eKI_NP_7: return axis(1, 5, +1.0f); // fwd   / roll +
+        case eKI_NP_1: return axis(1, 5, -1.0f); // back  / roll -
+        default: return false;
+        }
+    }
+    else
+    {
+        switch (key)
+        {
+        case eKI_H: m_nudgeRotMode = pressed; return true;
+        case eKI_N: m_nudgeSlow = pressed; return true;
+        case eKI_J: return axis(0, 4, -1.0f); // left  / yaw -
+        case eKI_L: return axis(0, 4, +1.0f); // right / yaw +
+        case eKI_I: return axis(2, 3, +1.0f); // up    / pitch +
+        case eKI_K: return axis(2, 3, -1.0f); // down  / pitch -
+        case eKI_U: return axis(1, 5, +1.0f); // fwd   / roll +
+        case eKI_O: return axis(1, 5, -1.0f); // back  / roll -
+        default: return false;
+        }
+    }
+}
+
+bool ModMain::OnInputEvent(const SInputEvent& event)
+{
+    // Only buttons/keys, not axes.
+    if (event.deviceType != eIDT_Keyboard && event.deviceType != eIDT_Mouse && event.deviceType != eIDT_Gamepad)
+        return false;
+    if (event.state != eIS_Pressed && event.state != eIS_Released)
+        return false;
+
+    const bool pressed = (event.state == eIS_Pressed);
+
+    if (m_waitingForAimKey)
+    {
+        if (pressed)
+        {
+            if (event.keyId != eKI_Escape)
+                m_settings.aimKey = (int)event.keyId;
+            m_waitingForAimKey = false;
+            m_aimKeyHeld = false;
+            return true;
+        }
+        return false;
+    }
+
+    // Nudge keys (only while enabled). They are swallowed so the game does not react to them.
+    if (m_settings.nudgeKeys && event.deviceType == eIDT_Keyboard && !m_mouseCaptured && !IsHardwareCursorVisible())
+    {
+        if (HandleNudgeKey(event.keyId, pressed))
+            return true;
+    }
+
+    if (!m_settings.aimEnabled || (int)event.keyId != m_settings.aimKey)
+        return false;
+
+    if (m_settings.aimToggle)
+    {
+        if (pressed && !m_mouseCaptured && !IsHardwareCursorVisible())
+            m_aimKeyHeld = !m_aimKeyHeld;
+    }
+    else
+    {
+        m_aimKeyHeld = pressed;
+    }
+
+    return m_settings.aimConsumeKey != 0;
+}
+
+const char* ModMain::GetKeyName(int keyId) const
+{
+    if (gCL && gCL->cl)
+    {
+        const auto& names = gCL->cl->GetKeyNames();
+        auto it = names.left.find((EKeyId)keyId);
+        if (it != names.left.end())
+            return it->second.c_str();
+    }
+    static char buf[32];
+    snprintf(buf, sizeof(buf), "key 0x%X", keyId);
+    return buf;
+}
+
+//---------------------------------------------------------------------------------
+// Weapon FOV
+//---------------------------------------------------------------------------------
+void ModMain::EnforceWeaponFov()
+{
+    if (!gEnv || !gEnv->pRenderer)
+        return;
+
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer)
+        return;
+
+    const ArkPlayerZoomManager& zoom = pPlayer->m_zoomManager;
+
+    // When the game "locks" the near FOV it wants the weapon rendered with the world FOV
+    // (cl_fov). Respect that.
+    if (zoom.m_nearFOVLockedCount != 0)
+        return;
+
+    if (!m_settings.fovEnabled)
+    {
+        // Put the stock value back once when the override gets disabled.
+        if (m_lastAppliedFov >= 0.0f)
+        {
+            float stock = PreyInternals::STOCK_WEAPON_FOV;
+            gEnv->pRenderer->EF_Query(EFQ_SetDrawNearFov, stock);
+            m_lastAppliedFov = -1.0f;
+        }
+        return;
+    }
+
+    // The game scales the near FOV proportionally to the current horizontal FOV while zooming
+    // (ArkPlayerZoomManager::Update): 55 degrees at cl_hfov, then near *= new/old on every HFOV
+    // change. Mirror that relative to cl_hfov. (Do NOT derive the reference from the zoom stack:
+    // it is normally empty, and our own aim-zoom entry would become the "base".)
+    SCVars* pCVars = *g_pGameCVars;
+    const float baseHfov = (pCVars && pCVars->cl_hfov > 1.0f) ? pCVars->cl_hfov : zoom.m_currentHFOV;
+
+    float userFov = m_settings.fov;
+    if (m_settings.aimEnabled && m_settings.aimFovEnabled)
+        userFov = LERP(m_settings.fov, m_settings.aimFov, SmoothStep01(m_aimBlend));
+
+    const float scale = (baseHfov > 1.0f) ? (zoom.m_currentHFOV / baseHfov) : 1.0f;
+    float desired = clamp_tpl(userFov, 5.0f, 170.0f) * scale;
+
+    float current = 0.0f;
+    gEnv->pRenderer->EF_Query(EFQ_GetDrawNearFov, current);
+
+    if (fabsf(current - desired) > 0.001f)
+    {
+        gEnv->pRenderer->EF_Query(EFQ_SetDrawNearFov, desired);
+        m_lastAppliedFov = desired;
+    }
+}
+
+void ModMain::UpdateCameraInputOverrides()
+{
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer || !gEnv || !gEnv->pConsole)
+        return;
+    const ViewmodelSettings& s = m_settings;
+
+    // World FOV: the game's own options slider writes cl_hfov; we just keep it where the user wants.
+    if (s.worldFovEnabled)
+    {
+        if (ICVar* pVar = gEnv->pConsole->GetCVar("cl_hfov"))
+        {
+            const float want = clamp_tpl(s.worldFov, 50.0f, 140.0f);
+            if (fabsf(pVar->GetFVal() - want) > 0.01f)
+                pVar->Set(want);
+        }
+    }
+
+    // Sprint look-sensitivity scale (ArkPlayerInput::GetRotation multiplies the look delta by
+    // m_sprintCameraRotationRateScale while the movement FSM says "sprinting"). Loaded from the
+    // player's Lua params, so re-apply every frame.
+    float& sprintScale = pPlayer->m_input.m_sprintCameraRotationRateScale;
+    if (m_gameSprintSensScale < 0.0f)
+        m_gameSprintSensScale = sprintScale;
+    if (s.sprintSensEnabled)
+    {
+        sprintScale = clamp_tpl(s.sprintSensScale, 0.1f, 3.0f);
+        m_sprintSensApplied = true;
+    }
+    else if (m_sprintSensApplied)
+    {
+        sprintScale = m_gameSprintSensScale; // switched off: put the game's value back
+        m_sprintSensApplied = false;
+    }
+}
+
+void ModMain::UpdateReticle()
+{
+    // The reticle cvars' change handling writes into the player's reticle state; with no player
+    // (main menu, loading) that is a null dereference inside the game. Only touch them in a level.
+    if (!gEnv || !gEnv->pConsole || !ArkPlayer::GetInstancePtr())
+    {
+        m_reticlePlayerSeen = false;
+        m_reticleStyleBeforeHide = -1;
+        return;
+    }
+    const ViewmodelSettings& s = m_settings;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    // A level was (re)loaded: the game re-applies its profile, so our style has to be applied once more.
+    const bool reapply = !m_reticlePlayerSeen;
+    m_reticlePlayerSeen = true;
+
+    // The reticle doubles as the mouse cursor on in-world screens (the HUD gets "reticlePosition" events
+    // from the examination mode and draws the very same reticle sprite there). hud_reticleSetting 0 hides
+    // that sprite as well, so while a screen is being used we put the reticle back and hide it again after.
+    static_assert(offsetof(ArkExaminationMode, m_reticlePos) == 0x60, "ArkExaminationMode layout");
+    static_assert(offsetof(ArkExaminationMode, m_examinationState) == 0x98, "ArkExaminationMode layout");
+    const ArkExaminationMode& exam = pPlayer->m_examinationMode;
+    const bool usingScreen = exam.m_examinationState == ArkExaminationMode::EArkExaminationState::active
+        && exam.m_examinationType == ArkExaminationMode::EArkExaminationType::worldUI;
+
+    // --- Position (g_reticleYPercentage) ---
+    if (s.reticleMode != 0)
+    {
+        if (ICVar* pVar = gEnv->pConsole->GetCVar("g_reticleYPercentage"))
+        {
+            const float want = (s.reticleMode == 1) ? 0.5f : clamp_tpl(s.reticleY, 0.0f, 1.0f);
+            if (fabsf(pVar->GetFVal() - want) > 0.0001f)
+                pVar->Set(want);
+        }
+    }
+
+    // --- Style / visibility (hud_reticleSetting: 0 none, 1 default, 2 dot) ---
+    ICVar* pStyle = gEnv->pConsole->GetCVar("hud_reticleSetting");
+    if (!pStyle)
+        return;
+    // Right after a (re)load the cvar still holds the game's own option value (the profile was just
+    // applied): remember it, so "Hidden" and "hide while aiming" know what to bring back for screens.
+    if (reapply && pStyle->GetIVal() > 0 && pStyle->GetIVal() != m_reticleStyleApplied)
+        m_reticleGameStyle = pStyle->GetIVal();
+    const bool hide = s.aimHideReticle && s.aimEnabled && SmoothStep01(m_aimBlend) > 0.5f;
+    int want = -1; // -1 = leave alone
+    switch (s.reticleStyle)
+    {
+    case 1: want = 1; break;
+    case 2: want = 2; break;
+    case 3: want = 0; break;
+    default: break;
+    }
+    if (hide)
+    {
+        if (m_reticleStyleBeforeHide < 0)
+            m_reticleStyleBeforeHide = (want >= 0) ? want : pStyle->GetIVal(); // remember what to go back to
+        want = 0;
+    }
+    else if (m_reticleStyleBeforeHide >= 0)
+    {
+        if (want < 0)
+            want = m_reticleStyleBeforeHide; // style is "leave alone": put back what the game had
+        m_reticleStyleBeforeHide = -1;
+    }
+    if (want == 0 && usingScreen)
+    {
+        // Cursor needed: show the reticle the game itself would show (or the default one if the game's
+        // own option is "off" too - otherwise there would be no cursor at all).
+        const int base = (s.reticleStyle == 1 || s.reticleStyle == 2) ? s.reticleStyle : m_reticleGameStyle;
+        want = (base > 0) ? base : 1;
+    }
+    // Apply only when OUR desired value changes (or a level was loaded) - never every frame, so the
+    // game's own handling of the option is never fought.
+    if (want >= 0 && (want != m_reticleStyleApplied || reapply))
+    {
+        if (pStyle->GetIVal() != want)
+            pStyle->Set(want);
+        m_reticleStyleApplied = want;
+    }
+    else if (want < 0)
+        m_reticleStyleApplied = -1;
+}
+
+//---------------------------------------------------------------------------------
+// Per-weapon persistence
+//---------------------------------------------------------------------------------
+fs::path ModMain::GetWeaponsPath() const
+{
+    fs::path dir;
+    if (gCL && gCL->conf)
+        dir = gCL->conf->getConfigPath("Vee.ViewmodelTweaks").parent_path();
+    if (dir.empty() && gCL && gCL->cl)
+        dir = gCL->cl->GetModsPath() / "config";
+    return dir / "Vee.ViewmodelTweaks.weapons.xml";
+}
+
+static void ReadPose(pugi::xml_node n, const char* prefix, PoseOffset& p, const PoseOffset& def)
+{
+    auto attr = [&](const char* suffix, float d) {
+        std::string name = std::string(prefix) + suffix;
+        return n.attribute(name.c_str()).as_float(d);
+    };
+    p.posX = attr("x", def.posX); p.posY = attr("y", def.posY); p.posZ = attr("z", def.posZ);
+    p.pitch = attr("pitch", def.pitch); p.yaw = attr("yaw", def.yaw); p.roll = attr("roll", def.roll);
+}
+
+static void WritePose(pugi::xml_node n, const char* prefix, const PoseOffset& p)
+{
+    auto attr = [&](const char* suffix, float v) {
+        std::string name = std::string(prefix) + suffix;
+        n.append_attribute(name.c_str()) = v;
+    };
+    attr("x", p.posX); attr("y", p.posY); attr("z", p.posZ);
+    attr("pitch", p.pitch); attr("yaw", p.yaw); attr("roll", p.roll);
+}
+
+void ModMain::LoadWeapons()
+{
+    m_weapons.clear();
+    pugi::xml_document doc;
+    const fs::path path = GetWeaponsPath();
+    if (!doc.load_file(path.c_str()))
+        return;
+    for (pugi::xml_node n : doc.child("Weapons").children("Weapon"))
+    {
+        const char* cls = n.attribute("class").as_string("");
+        if (!*cls)
+            continue;
+        WeaponSettings w;
+        w.aimAllowed = n.attribute("aim_allowed").as_bool(true);
+        w.wallPush = n.attribute("wall_push").as_float(WeaponSettings().wallPush);
+        w.fireCoupling = n.attribute("fire_coupling").as_float(WeaponSettings().fireCoupling);
+        w.fireCouplingTime = n.attribute("fire_coupling_time").as_float(WeaponSettings().fireCouplingTime);
+        w.aimRecoilScale = n.attribute("aim_recoil_scale").as_float(WeaponSettings().aimRecoilScale);
+        w.aimSpreadMult = n.attribute("aim_spread_mult").as_float(WeaponSettings().aimSpreadMult);
+        w.hipSpreadMult = n.attribute("hip_spread_mult").as_float(WeaponSettings().hipSpreadMult);
+        ReadPose(n, "hip_", w.hip, PoseOffset());
+        ReadPose(n, "aim_", w.aim, WeaponSettings::DefaultAim());
+        // Backwards compatibility with 1.3.0 files (aim pose stored as x/y/z/pitch/yaw/roll)
+        if (n.attribute("x") && !n.attribute("aim_x"))
+            ReadPose(n, "", w.aim, WeaponSettings::DefaultAim());
+        w.valid = true;
+        m_weapons[cls] = w;
+    }
+    CryLog("ViewmodelTweaks: loaded {} weapon entries from {}", m_weapons.size(), path.u8string());
+}
+
+void ModMain::SaveWeapons()
+{
+    pugi::xml_document doc;
+    pugi::xml_node root = doc.append_child("Weapons");
+    root.append_attribute("comment") = "Per-weapon settings. hip_*: additive offset while not aiming. aim_*: weapon relative to camera while aiming. wall_push: pull-back (m) against walls. Meters (x right, y forward, z up), degrees.";
+    for (auto& kv : m_weapons)
+    {
+        if (!kv.second.valid)
+            continue;
+        pugi::xml_node n = root.append_child("Weapon");
+        n.append_attribute("class") = kv.first.c_str();
+        n.append_attribute("aim_allowed") = kv.second.aimAllowed;
+        n.append_attribute("wall_push") = kv.second.wallPush;
+        n.append_attribute("fire_coupling") = kv.second.fireCoupling;
+        n.append_attribute("fire_coupling_time") = kv.second.fireCouplingTime;
+        n.append_attribute("aim_recoil_scale") = kv.second.aimRecoilScale;
+        n.append_attribute("aim_spread_mult") = kv.second.aimSpreadMult;
+        n.append_attribute("hip_spread_mult") = kv.second.hipSpreadMult;
+        WritePose(n, "hip_", kv.second.hip);
+        WritePose(n, "aim_", kv.second.aim);
+    }
+    const fs::path path = GetWeaponsPath();
+    if (!doc.save_file(path.c_str()))
+        CryError("ViewmodelTweaks: failed to save {}", path.u8string());
+    m_weaponsDirty = false;
+}
+
+//---------------------------------------------------------------------------------
+// Mod Initialization
+//---------------------------------------------------------------------------------
+void ModMain::FillModInfo(ModDllInfoEx& info)
+{
+    info.modName = "Vee.ViewmodelTweaks";
+    info.logTag = "ViewmodelTweaks";
+    info.supportsHotReload = true;
+}
+
+void ModMain::InitHooks()
+{
+    s_hookPwaUpdate.SetHookFunc(&CProceduralWeaponAnimation_Update_Hook);
+    s_hookPwaContextUpdate.SetHookFunc(&CProceduralWeaponAnimationContext_Update_Hook);
+    s_hookLookCompute.SetHookFunc(&LookCompute_Hook);
+    s_hookStrafeCompute.SetHookFunc(&StrafeCompute_Hook);
+    s_hookRecoilCompute.SetHookFunc(&RecoilCompute_Hook);
+    s_hookBumpCompute.SetHookFunc(&BumpCompute_Hook);
+    s_hookHfovMultiplier.SetHookFunc(&ArkPlayerZoomManager_GetHFOVDependentMultiplier_Hook);
+    s_hookUpdateView.SetHookFunc(&ArkPlayerCamera_UpdateView_Hook);
+    s_hookDispMin.SetHookFunc(&CArkWeaponShotgun_GetDispersionMinimum_Hook);
+    s_hookDispMax.SetHookFunc(&CArkWeaponShotgun_GetDispersionMaximum_Hook);
+    s_hookGetStatFloat.SetHookFunc(&CArkWeapon_GetStatFloat_Hook);
+}
+
+static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
+{
+    // Names: vm_<prefix>pos_x ... e.g. vm_pos_x, vm_crouch_pos_x, vm_aim_pos_x.
+    // The console keeps the name/help pointers, so they must outlive this call.
+    static std::deque<std::string> s_strings;
+    auto name = [&](const char* suffix) -> const char* {
+        s_strings.push_back(std::string("vm_") + prefix + suffix);
+        return s_strings.back().c_str();
+    };
+    auto help = [&](const char* text) -> const char* {
+        s_strings.push_back(std::string("Viewmodel Tweaks (") + what + "): " + text);
+        return s_strings.back().c_str();
+    };
+    REGISTER_CVAR2(name("pos_x"), &p.posX, p.posX, VF_DUMPTOCHAIR, help("right(+)/left(-) offset in meters"));
+    REGISTER_CVAR2(name("pos_y"), &p.posY, p.posY, VF_DUMPTOCHAIR, help("forward(+)/back(-) offset in meters"));
+    REGISTER_CVAR2(name("pos_z"), &p.posZ, p.posZ, VF_DUMPTOCHAIR, help("up(+)/down(-) offset in meters"));
+    REGISTER_CVAR2(name("rot_pitch"), &p.pitch, p.pitch, VF_DUMPTOCHAIR, help("pitch offset in degrees (tilt up/down)"));
+    REGISTER_CVAR2(name("rot_yaw"), &p.yaw, p.yaw, VF_DUMPTOCHAIR, help("yaw offset in degrees (turn left/right)"));
+    REGISTER_CVAR2(name("rot_roll"), &p.roll, p.roll, VF_DUMPTOCHAIR, help("roll offset in degrees"));
+}
+
+void ModMain::RegisterCVars()
+{
+    ViewmodelSettings& s = m_settings;
+    REGISTER_CVAR2("vm_enabled", &s.enabled, s.enabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: enable position/rotation offsets (0/1)");
+    RegisterPoseCVars(s.base, "", "global standing");
+
+    REGISTER_CVAR2("vm_crouch_enabled", &s.crouchEnabled, s.crouchEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: blend in the crouch pose while sneaking (0/1)");
+    RegisterPoseCVars(s.crouch, "crouch_", "global crouch, added to standing");
+    REGISTER_CVAR2("vm_crouch_time", &s.crouchTime, s.crouchTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: stand<->crouch pose transition time in seconds");
+
+    REGISTER_CVAR2("vm_aim_enabled", &s.aimEnabled, s.aimEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: enable the aim key / aim pose (0/1)");
+    REGISTER_CVAR2("vm_aim_key", &s.aimKey, s.aimKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: EKeyId of the aim key (257 = right mouse button)");
+    REGISTER_CVAR2("vm_aim_toggle", &s.aimToggle, s.aimToggle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: 0 = hold to aim, 1 = toggle");
+    REGISTER_CVAR2("vm_aim_consume_key", &s.aimConsumeKey, s.aimConsumeKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: swallow the aim key so the game's own binding on it is ignored (0/1)");
+    REGISTER_CVAR2("vm_aim_render_lock", &s.aimRenderLock, s.aimRenderLock, VF_DUMPTOCHAIR, "Viewmodel Tweaks: place the weapon exactly at render time, after the camera is final (0/1)");
+    REGISTER_CVAR2("vm_aim_hands_follow", &s.aimHandsFollow, s.aimHandsFollow, VF_DUMPTOCHAIR, "Viewmodel Tweaks: move the hand joints with the render-time placement (0/1)");
+    REGISTER_CVAR2("vm_aim_left_hand_follow", &s.aimLeftHandFollow, s.aimLeftHandFollow, VF_DUMPTOCHAIR, "Viewmodel Tweaks: also move the support hand when it is on the weapon (0/1)");
+    REGISTER_CVAR2("vm_aim_anim_recoil", &s.aimAnimRecoil, s.aimAnimRecoil, VF_DUMPTOCHAIR, "Viewmodel Tweaks: multiplier on the game's recoil/bump weapon motion while locked (0..3)");
+    REGISTER_CVAR2("vm_aim_bob_tau", &s.aimBobTau, s.aimBobTau, VF_DUMPTOCHAIR, "Viewmodel Tweaks: head-bob separation time constant in seconds");
+    REGISTER_CVAR2("vm_aim_bob", &s.aimBobAmount, s.aimBobAmount, VF_DUMPTOCHAIR, "Viewmodel Tweaks: head-bob coupling while locked (0 = still sights, 1 = weapon lags the head fully, negative = leads)");
+    REGISTER_CVAR2("vm_aim_anim_sway", &s.aimAnimSway, s.aimAnimSway, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how much of the game's look/strafe sway to keep while locked (0..1)");
+    REGISTER_CVAR2("vm_aim_sens_mode", &s.aimSensMode, s.aimSensMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ADS look sensitivity. 0 = game default (weapon's zoomed multiplier), 1 = match the camera zoom factor, 2 = custom (vm_aim_sens_scale)");
+    REGISTER_CVAR2("vm_aim_sens_scale", &s.aimSensScale, s.aimSensScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: custom ADS look sensitivity multiplier (mode 2)");
+    REGISTER_CVAR2("vm_aim_time", &s.aimTime, s.aimTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: hip<->aim transition time in seconds");
+    REGISTER_CVAR2("vm_aim_ignores_crouch", &s.aimIgnoresCrouch, s.aimIgnoresCrouch, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fade the crouch pose out while aiming (0/1)");
+    REGISTER_CVAR2("vm_aim_fov_enabled", &s.aimFovEnabled, s.aimFovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: use a separate weapon FOV while aiming (0/1)");
+    REGISTER_CVAR2("vm_aim_fov", &s.aimFov, s.aimFov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: weapon FOV while aiming, in degrees");
+    REGISTER_CVAR2("vm_aim_camera_zoom", &s.aimCameraZoom, s.aimCameraZoom, VF_DUMPTOCHAIR, "Viewmodel Tweaks: zoom the camera while aiming (0/1)");
+    REGISTER_CVAR2("vm_aim_camera_zoom_factor", &s.aimCameraZoomFactor, s.aimCameraZoomFactor, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera HFOV multiplier while aiming (1 = none)");
+
+    REGISTER_CVAR2("vm_nudge_keys", &s.nudgeKeys, s.nudgeKeys, VF_DUMPTOCHAIR, "Viewmodel Tweaks: nudge keys edit the active pose (0/1)");
+    REGISTER_CVAR2("vm_nudge_layout", &s.nudgeLayout, s.nudgeLayout, VF_DUMPTOCHAIR, "Viewmodel Tweaks: nudge key layout. 0 = numpad (4/6 8/2 7/1, NP0 rotate, NP. slow), 1 = IJKL (J/L I/K U/O, H rotate, N slow)");
+    REGISTER_CVAR2("vm_nudge_target", &s.nudgeTarget, s.nudgeTarget, VF_DUMPTOCHAIR, "Viewmodel Tweaks: what the nudge keys edit while not aiming. 0 = global standing/crouch offset (by stance), 1 = this weapon's hip offset");
+    REGISTER_CVAR2("vm_nudge_pos_speed", &s.nudgePosSpeed, s.nudgePosSpeed, VF_DUMPTOCHAIR, "Viewmodel Tweaks: nudge speed in m/s");
+    REGISTER_CVAR2("vm_nudge_rot_speed", &s.nudgeRotSpeed, s.nudgeRotSpeed, VF_DUMPTOCHAIR, "Viewmodel Tweaks: nudge speed in deg/s");
+
+    REGISTER_CVAR2("vm_converge", &s.convergeEnabled, s.convergeEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: hip-fire weapon convergence on the crosshair's impact point (0/1)");
+    REGISTER_CVAR2("vm_converge_strength", &s.convergeStrength, s.convergeStrength, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence strength (0..1)");
+    REGISTER_CVAR2("vm_converge_max_angle", &s.convergeMaxAngle, s.convergeMaxAngle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence max angle in degrees");
+    REGISTER_CVAR2("vm_converge_smooth", &s.convergeSmoothTime, s.convergeSmoothTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence smoothing time constant in seconds");
+    REGISTER_CVAR2("vm_converge_max_dist", &s.convergeMaxDist, s.convergeMaxDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence raycast distance in meters (no hit = parallel)");
+    REGISTER_CVAR2("vm_aim_wall_block", &s.aimWallBlockEnabled, s.aimWallBlockEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: prevent aiming while the weapon would poke into a wall (0/1)");
+    REGISTER_CVAR2("vm_aim_wall_block_scale", &s.aimWallBlockScale, s.aimWallBlockScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: tolerance multiplier on the aim-block distance");
+    REGISTER_CVAR2("vm_wall_push", &s.wallPushEnabled, s.wallPushEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: pull the weapon back towards the camera near walls (0/1); amount is per weapon");
+    REGISTER_CVAR2("vm_wall_push_start", &s.wallPushStartDist, s.wallPushStartDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: distance (m) at which the wall pull-back starts");
+    REGISTER_CVAR2("vm_wall_push_full", &s.wallPushFullDist, s.wallPushFullDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: distance (m) at which the full per-weapon pull-back is reached");
+    REGISTER_CVAR2("vm_wall_push_smooth", &s.wallPushSmoothTime, s.wallPushSmoothTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: wall pull-back smoothing time constant in seconds");
+    REGISTER_CVAR2("vm_wall_push_aiming", &s.wallPushWhileAiming, s.wallPushWhileAiming, VF_DUMPTOCHAIR, "Viewmodel Tweaks: keep the wall pull-back while aiming (0/1)");
+    REGISTER_CVAR2("vm_reticle_mode", &s.reticleMode, s.reticleMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle position. 0 = game default, 1 = centered, 2 = custom (vm_reticle_y)");
+    REGISTER_CVAR2("vm_reticle_y", &s.reticleY, s.reticleY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: custom g_reticleYPercentage (0 = top, 1 = bottom)");
+    REGISTER_CVAR2("vm_reticle_style", &s.reticleStyle, s.reticleStyle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle style (hud_reticleSetting). 0 = game default, 1 = default reticle, 2 = simple dot, 3 = hidden");
+    REGISTER_CVAR2("vm_aim_hide_reticle", &s.aimHideReticle, s.aimHideReticle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: hide the reticle while aiming down sights (0/1)");
+
+    REGISTER_CVAR2("vm_world_fov_enabled", &s.worldFovEnabled, s.worldFovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the game's horizontal FOV, cl_hfov (0/1)");
+    REGISTER_CVAR2("vm_world_fov", &s.worldFov, s.worldFov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: horizontal FOV in degrees");
+    REGISTER_CVAR2("vm_sprint_sens_enabled", &s.sprintSensEnabled, s.sprintSensEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the look-sensitivity scale while sprinting (0/1)");
+    REGISTER_CVAR2("vm_sprint_sens_scale", &s.sprintSensScale, s.sprintSensScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: look-sensitivity multiplier while sprinting (1 = same as walking)");
+    REGISTER_CVAR2("vm_fov_enabled", &s.fovEnabled, s.fovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: enable weapon FOV override (0/1)");
+    REGISTER_CVAR2("vm_fov", &s.fov, s.fov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: weapon FOV in degrees (game default 55)");
+    REGISTER_CVAR2("vm_gui_mouse", &s.guiMouse, s.guiMouse, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show cursor and block look input while the settings window is open (0/1)");
+    REGISTER_CVAR2("vm_show_window", &s.showWindow, s.showWindow, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show the settings window in the Chairloader GUI (0/1)");
+    REGISTER_CVAR2("vm_show_advanced", &s.showAdvanced, s.showAdvanced, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show diagnostics, self-tests and experimental features in the window (0/1)");
+}
+
+void ModMain::InitSystem(const ModInitInfo& initInfo, ModDllInfo& dllInfo)
+{
+    BaseClass::InitSystem(initInfo, dllInfo);
+    RegisterCVars();
+    m_offsetHookActive = s_hookPwaUpdate.IsHooked() && s_hookPwaContextUpdate.IsHooked();
+    m_cameraHookActive = s_hookUpdateView.IsHooked();
+    CryLog("ViewmodelTweaks: initialized (weapon offset hooks {}, camera hook {})", m_offsetHookActive ? "installed" : "NOT installed",
+        m_cameraHookActive ? "installed" : "NOT installed");
+}
+
+void ModMain::InitGame(bool isHotReloading)
+{
+    BaseClass::InitGame(isHotReloading);
+    if (gEnv && gEnv->pInput && !m_inputListenerRegistered)
+    {
+        gEnv->pInput->AddEventListener(this);
+        m_inputListenerRegistered = true;
+    }
+    LoadWeapons();
+}
+
+//---------------------------------------------------------------------------------
+// Mod Shutdown
+//---------------------------------------------------------------------------------
+void ModMain::ShutdownGame(bool isHotUnloading)
+{
+    if (m_weaponsDirty)
+        SaveWeapons();
+    if (gEnv && gEnv->pInput && m_inputListenerRegistered)
+    {
+        gEnv->pInput->RemoveEventListener(this);
+        m_inputListenerRegistered = false;
+    }
+    m_aimKeyHeld = false;
+    m_aimBlend = 0.0f;
+    UpdateReticle(); // un-hide if we hid it
+    UpdateCameraZoom(false);
+    UpdateMouseCapture(false);
+    BaseClass::ShutdownGame(isHotUnloading);
+}
+
+void ModMain::ShutdownSystem(bool isHotUnloading)
+{
+    // Restore the stock weapon FOV so unloading leaves the game as we found it.
+    if (gEnv && gEnv->pRenderer && m_lastAppliedFov >= 0.0f)
+    {
+        float stock = PreyInternals::STOCK_WEAPON_FOV;
+        gEnv->pRenderer->EF_Query(EFQ_SetDrawNearFov, stock);
+    }
+    BaseClass::ShutdownSystem(isHotUnloading);
+}
+
+//---------------------------------------------------------------------------------
+// Main Update Loop
+//---------------------------------------------------------------------------------
+void ModMain::MainUpdate(unsigned updateFlags)
+{
+    m_frameIndex++;
+    const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.0f;
+    UpdateBlendStates(dt);
+    UpdateNudge(dt);
+    UpdateConvergence(dt);
+
+    if (m_weaponsDirty)
+    {
+        m_weaponsSaveTimer += dt;
+        if (m_weaponsSaveTimer > 2.0f)
+        {
+            SaveWeapons();
+            m_weaponsSaveTimer = 0.0f;
+        }
+    }
+
+    UpdateReticle();
+    UpdateCameraInputOverrides();
+
+    bool want = m_settings.guiMouse != 0 && m_settings.showWindow != 0 && gCL && gCL->gui && gCL->gui->IsEnabled();
+    // Player gone (level unload / main menu) -> the input-mode handle is stale, release everything.
+    if (m_mouseCaptured && !ArkPlayer::GetInstancePtr())
+        want = false;
+    UpdateMouseCapture(want);
+}
+
+void ModMain::UpdateMouseCapture(bool wantCapture)
+{
+    if (wantCapture == m_mouseCaptured)
+        return;
+
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+
+    if (wantCapture)
+    {
+        // Only meaningful while in a level; in the main menu the cursor is already visible.
+        if (!pPlayer)
+            return;
+
+        if (gEnv && gEnv->pHardwareMouse)
+            gEnv->pHardwareMouse->IncrementCounter();
+
+        // Switch to "menu" input mode so mouse movement drives the cursor instead of the camera.
+        m_inputModeHandle = pPlayer->m_input.EnableInputMode(ArkPlayerInput::Mode::menu);
+        m_mouseCaptured = true;
+    }
+    else
+    {
+        if (gEnv && gEnv->pHardwareMouse)
+            gEnv->pHardwareMouse->DecrementCounter();
+
+        if (pPlayer && m_inputModeHandle >= 0)
+            pPlayer->m_input.DisableInputMode(m_inputModeHandle);
+
+        m_inputModeHandle = -1;
+        m_mouseCaptured = false;
+    }
+}
+
+void ModMain::LateUpdate(unsigned updateFlags)
+{
+    // Runs after the game's ArkPlayerZoomManager::Update for this frame.
+    EnforceWeaponFov();
+
+    // Pipeline diagnostics: did the weapon offset code run this frame?
+    PipelineDiag& d = m_diag;
+    if (!m_currentWeaponClass.empty() && m_settings.enabled)
+    {
+        if (d.pwaUpdatesThisFrame == 0)
+        {
+            d.missingFrames++;
+            if (Now() - d.lastMissingLog > 1.0f)
+            {
+                char buf[160];
+                snprintf(buf, sizeof(buf), "no weapon-offset update this frame (ctx updates: %d, instanceCount %d, modifier %s)",
+                    d.ctxUpdatesThisFrame, d.lastInstanceCount, d.lastModifierNull ? "NULL" : "ok");
+                d.Add(Now(), buf);
+                d.lastMissingLog = Now();
+            }
+        }
+        else
+        {
+            if (d.missingFrames > 0)
+            {
+                char buf[96];
+                snprintf(buf, sizeof(buf), "weapon-offset updates resumed after %d frame(s)", d.missingFrames);
+                d.Add(Now(), buf);
+            }
+            d.missingFrames = 0;
+        }
+    }
+    d.pwaUpdatesLastFrame = d.pwaUpdatesThisFrame;
+    d.ctxUpdatesLastFrame = d.ctxUpdatesThisFrame;
+    d.pwaUpdatesThisFrame = 0;
+    d.ctxUpdatesThisFrame = 0;
+}
+
+//---------------------------------------------------------------------------------
+// GUI
+//---------------------------------------------------------------------------------
+void ModMain::Draw()
+{
+    if (ImGui::BeginMainMenuBar())
+    {
+        if (ImGui::BeginMenu("Viewmodel Tweaks"))
+        {
+            bool show = m_settings.showWindow != 0;
+            if (ImGui::MenuItem("Settings window", nullptr, &show))
+                m_settings.showWindow = show ? 1 : 0;
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+    if (m_settings.showWindow)
+        DrawWindow();
+}
+
+static bool SliderCm(const char* label, float& meters, float rangeCm, const char* tooltip)
+{
+    float cm = meters * 100.0f;
+    bool changed = ImGui::SliderFloat(label, &cm, -rangeCm, rangeCm, "%.2f cm");
+    if (ImGui::IsItemHovered() && tooltip)
+        ImGui::SetTooltip("%s", tooltip);
+    if (changed)
+        meters = cm / 100.0f;
+    return changed;
+}
+
+static bool SliderDeg(const char* label, float& deg, float range, const char* tooltip)
+{
+    bool changed = ImGui::SliderFloat(label, &deg, -range, range, "%.2f deg");
+    if (ImGui::IsItemHovered() && tooltip)
+        ImGui::SetTooltip("%s", tooltip);
+    return changed;
+}
+
+static bool CheckboxInt(const char* label, int& value, const char* tooltip = nullptr)
+{
+    bool b = value != 0;
+    bool changed = ImGui::Checkbox(label, &b);
+    if (changed)
+        value = b ? 1 : 0;
+    if (tooltip && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", tooltip);
+    return changed;
+}
+
+static void TextQuatT(const char* label, const QuatT& q)
+{
+    Ang3 a(q.q);
+    ImGui::Text("%s: pos (%.3f, %.3f, %.3f) m  rot (p %.1f, r %.1f, y %.1f) deg", label,
+        q.t.x, q.t.y, q.t.z, RAD2DEG(a.x), RAD2DEG(a.y), RAD2DEG(a.z));
+}
+
+static void DrawReticleControls(ViewmodelSettings& s, const char* id)
+{
+    ImGui::PushID(id);
+    ImGui::Text("Reticle position");
+    ImGui::SameLine();
+    ImGui::RadioButton("Game default", &s.reticleMode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Centered", &s.reticleMode, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Custom", &s.reticleMode, 2);
+    if (s.reticleMode == 2)
+        ImGui::SliderFloat("Vertical position", &s.reticleY, 0.2f, 0.8f, "%.3f of screen height");
+    ImGui::Text("Reticle style   ");
+    ImGui::SameLine();
+    ImGui::RadioButton("Game default##style", &s.reticleStyle, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Weapon reticle", &s.reticleStyle, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Simple dot", &s.reticleStyle, 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Hidden", &s.reticleStyle, 3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("hud_reticleSetting: the game's own reticle options. While you use an in-world screen the reticle\ncomes back as the cursor and is hidden again afterwards.");
+    CheckboxInt("Hide reticle while aiming", s.aimHideReticle, "Switches the reticle off once the weapon is more than halfway up to the sights, and back when you lower it.");
+    ImGui::PopID();
+}
+
+bool ModMain::DrawPoseSliders(PoseOffset& pose, const char* id, float posRangeCm, float rotRangeDeg)
+{
+    bool ch = false;
+    ImGui::PushID(id);
+    ImGui::Text("Position (view space)");
+    ch |= SliderCm("Right / Left", pose.posX, posRangeCm, "Positive moves the weapon to the right.");
+    ch |= SliderCm("Forward / Back", pose.posY, posRangeCm, "Positive moves the weapon away from the camera.");
+    ch |= SliderCm("Up / Down", pose.posZ, posRangeCm, "Positive moves the weapon up.");
+    ImGui::Spacing();
+    ImGui::Text("Rotation");
+    ch |= SliderDeg("Pitch", pose.pitch, rotRangeDeg, "Positive tilts the muzzle up.");
+    ch |= SliderDeg("Yaw", pose.yaw, rotRangeDeg, "Positive turns the muzzle to the left.");
+    ch |= SliderDeg("Roll", pose.roll, rotRangeDeg, "Rolls the weapon around its forward axis.");
+    if (ImGui::Button("Reset"))
+    {
+        pose.Reset();
+        ch = true;
+    }
+    ImGui::PopID();
+    return ch;
+}
+
+void ModMain::DrawWindow()
+{
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(500, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Viewmodel Tweaks", &open))
+    {
+        ViewmodelSettings& s = m_settings;
+
+        ImGui::TextDisabled("New here? Start with Quick Settings. Aim with %s. Per-weapon poses live in the Weapon tab. Ctrl+click a slider to type a value.", GetKeyName(s.aimKey));
+        CheckboxInt("Enable position / rotation offsets", s.enabled);
+        ImGui::SameLine();
+        ImGui::TextDisabled("| %s%s | %s", m_isCrouching ? "crouching" : "standing", m_isAiming ? " | aiming" : "",
+            m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
+        if (!m_offsetHookActive || !m_cameraHookActive)
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Warning: some game hooks could not be installed (%s%s). This game build is not the one Chairloader supports; the mod is partly disabled.",
+                m_offsetHookActive ? "" : "weapon offsets ", m_cameraHookActive ? "" : "camera/ironsights");
+
+        ImGui::Separator();
+
+        if (ImGui::BeginTabBar("vm_tabs"))
+        {
+            //------------------------------------------------------------------ Quick Settings
+            if (ImGui::BeginTabItem("Quick Settings"))
+            {
+                ImGui::TextWrapped("The essentials. Everything else (per-weapon poses, crouch offsets, nudge keys, fine tuning) is in the other tabs.");
+                ImGui::Spacing();
+
+                CheckboxInt("Enable weapon offsets", s.enabled, "Master switch for all position / rotation offsets, convergence and wall pull-back.");
+                ImGui::Indent();
+                CheckboxInt("Override weapon FOV", s.fovEnabled, "Vertical FOV used to render the weapon and arms. Game default is 55. Higher = smaller weapon.");
+                ImGui::BeginDisabled(!s.fovEnabled);
+                ImGui::SliderFloat("Weapon FOV##q", &s.fov, 20.0f, 120.0f, "%.1f deg");
+                ImGui::EndDisabled();
+                ImGui::Unindent();
+                ImGui::Spacing();
+
+                CheckboxInt("Override field of view", s.worldFovEnabled, "The game's horizontal FOV (cl_hfov), same as the options menu slider but kept where you set it.");
+                ImGui::BeginDisabled(!s.worldFovEnabled);
+                ImGui::SliderFloat("Field of view##q", &s.worldFov, 60.0f, 130.0f, "%.1f deg (horizontal)");
+                ImGui::EndDisabled();
+                if (!s.worldFovEnabled && gEnv && gEnv->pConsole)
+                    if (ICVar* pVar = gEnv->pConsole->GetCVar("cl_hfov"))
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("use current"))
+                            s.worldFov = pVar->GetFVal();
+                    }
+                CheckboxInt("Sensitivity sprint scale", s.sprintSensEnabled,
+                    "The game turns the look sensitivity down while sprinting. 1.0 = same as walking.");
+                ImGui::BeginDisabled(!s.sprintSensEnabled);
+                ImGui::SliderFloat("Sprint sensitivity##q", &s.sprintSensScale, 0.1f, 2.0f, "x%.2f");
+                ImGui::EndDisabled();
+                if (m_gameSprintSensScale >= 0.0f)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(game: x%.2f)", m_gameSprintSensScale);
+                }
+                ImGui::Spacing();
+
+                CheckboxInt("Enable ironsights", s.aimEnabled, "Hold (or toggle) the aim key to bring the weapon up to the sights. Poses are per weapon (Weapon tab).");
+                ImGui::BeginDisabled(!s.aimEnabled);
+                ImGui::Indent();
+                ImGui::Text("Aim key: %s", GetKeyName(s.aimKey));
+                ImGui::SameLine();
+                if (m_waitingForAimKey)
+                    ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "press a key or mouse button... (Esc cancels)");
+                else if (ImGui::Button("Bind##q"))
+                    m_waitingForAimKey = true;
+                ImGui::SameLine();
+                if (ImGui::Button("RMB##q"))
+                    s.aimKey = (int)eKI_Mouse2;
+                CheckboxInt("Toggle instead of hold##q", s.aimToggle);
+                CheckboxInt("Block the game's own action on this key##q", s.aimConsumeKey,
+                    "Swallows the key so whatever the game has bound to it (e.g. RMB) does nothing while this mod is enabled.");
+                CheckboxInt("Separate weapon FOV while aiming##q", s.aimFovEnabled, "Blends the weapon FOV towards this value while aiming. Lower = bigger weapon.");
+                ImGui::BeginDisabled(!s.aimFovEnabled);
+                ImGui::SliderFloat("Ironsights FOV##q", &s.aimFov, 20.0f, 120.0f, "%.1f deg");
+                ImGui::EndDisabled();
+                CheckboxInt("Zoom camera while aiming##q", s.aimCameraZoom, "Lowers the world FOV while aiming, like ADS in modern shooters.");
+                ImGui::BeginDisabled(!s.aimCameraZoom);
+                ImGui::SliderFloat("Camera zoom##q", &s.aimCameraZoomFactor, 0.2f, 1.5f, "x%.2f FOV");
+                ImGui::EndDisabled();
+                const char* sensModesQ[] = { "Game default (weapon's zoomed multiplier)", "Match camera zoom factor", "Custom multiplier" };
+                ImGui::Combo("ADS look sensitivity##q", &s.aimSensMode, sensModesQ, 3);
+                ImGui::BeginDisabled(s.aimSensMode != 2);
+                ImGui::SliderFloat("Sensitivity while aiming##q", &s.aimSensScale, 0.05f, 3.0f, "x%.2f");
+                ImGui::EndDisabled();
+                ImGui::Unindent();
+                ImGui::EndDisabled();
+                ImGui::Spacing();
+
+                CheckboxInt("Enable weapon convergence", s.convergeEnabled,
+                    "Hip fire: rotates the weapon so the barrel points at what the crosshair is over. Tuning in the Global tab.");
+                CheckboxInt("Enable wall pull-back", s.wallPushEnabled,
+                    "Slides the weapon back towards the camera near walls. Distances in the Global tab, amount per weapon in the Weapon tab.");
+                ImGui::Spacing();
+                DrawReticleControls(s, "qret");
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ Global
+            if (ImGui::BeginTabItem("Global"))
+            {
+                ImGui::BeginDisabled(!s.enabled);
+                ImGui::TextWrapped("Offsets applied to ALL weapons. Per-weapon offsets (next tab) are added on top.");
+                if (ImGui::CollapsingHeader("Standing offset", ImGuiTreeNodeFlags_DefaultOpen))
+                    DrawPoseSliders(s.base, "base", 30.0f, 45.0f);
+                if (ImGui::CollapsingHeader("Crouch offset", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    CheckboxInt("Enable crouch offset", s.crouchEnabled, "Blends this extra offset in while sneaking (crouched).");
+                    ImGui::BeginDisabled(!s.crouchEnabled);
+                    ImGui::SliderFloat("Transition time", &s.crouchTime, 0.0f, 1.5f, "%.2f s");
+                    ImGui::ProgressBar(SmoothStep01(m_crouchBlend), ImVec2(-1, 0), m_isCrouching ? "crouched" : "standing");
+                    DrawPoseSliders(s.crouch, "crouch", 30.0f, 45.0f);
+                    ImGui::EndDisabled();
+                }
+                if (ImGui::CollapsingHeader("Weapon convergence (hip fire)"))
+                {
+                    CheckboxInt("Point the weapon at the crosshair's impact point", s.convergeEnabled,
+                        "Raycasts along the view every frame and rotates the weapon in place so the barrel\nconverges on what the crosshair is over. Noticeable at close range, invisible far away.\nFades out while aiming down sights.");
+                    ImGui::BeginDisabled(!s.convergeEnabled);
+                    ImGui::SliderFloat("Strength", &s.convergeStrength, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("Max angle", &s.convergeMaxAngle, 0.0f, 30.0f, "%.1f deg");
+                    ImGui::SliderFloat("Smoothing", &s.convergeSmoothTime, 0.0f, 0.5f, "%.2f s");
+                    ImGui::SliderFloat("Max distance", &s.convergeMaxDist, 2.0f, 100.0f, "%.0f m");
+                    ImGui::TextDisabled("Hit: %s at %.2f m | yaw %.2f (target %.2f) pitch %.2f (target %.2f) deg | weapon offset from eye (%.1f, %.1f, %.1f) cm",
+                        m_convergeHit ? "yes" : "no", m_convergeDist, m_convergeYaw, m_convergeTargetYaw, m_convergePitch, m_convergeTargetPitch,
+                        m_render.hipRelCam.t.x * 100, m_render.hipRelCam.t.y * 100, m_render.hipRelCam.t.z * 100);
+                    ImGui::EndDisabled();
+                    ImGui::Spacing();
+                    CheckboxInt("Prevent aiming while colliding with a wall", s.aimWallBlockEnabled,
+                        "No ironsights while the crosshair's impact point is closer than the weapon's reach\n"
+                        "(its distance from the eye + its wall pull-back, so longer weapons block sooner). Uses the same view raycast.");
+                    ImGui::BeginDisabled(!s.aimWallBlockEnabled);
+                    ImGui::SliderFloat("Tolerance", &s.aimWallBlockScale, 0.25f, 4.0f, "x%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Multiplier on the blocking distance. Higher = aiming is blocked further away from the wall.");
+                    ImGui::TextDisabled("Blocks when the wall is closer than %.2f m | wall at %.2f m | %s", m_aimBlockDist, m_convergeDist,
+                        m_aimBlockedByWall ? "BLOCKED" : "free");
+                    ImGui::EndDisabled();
+                }
+                if (ImGui::CollapsingHeader("Wall pull-back"))
+                {
+                    CheckboxInt("Pull the weapon back near walls", s.wallPushEnabled,
+                        "Uses the same view raycast: the closer the crosshair's impact point, the further the weapon slides\n"
+                        "back towards the camera, as if you were keeping it from hitting the wall.\n"
+                        "How far each weapon moves is set per weapon (Weapon tab): a little for the pistol, more for the shotgun / GLOO gun.");
+                    ImGui::BeginDisabled(!s.wallPushEnabled);
+                    ImGui::SliderFloat("Starts at", &s.wallPushStartDist, 0.3f, 3.0f, "%.2f m");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Distance from the camera to the wall where the pull-back begins.");
+                    ImGui::SliderFloat("Full at", &s.wallPushFullDist, 0.0f, 2.0f, "%.2f m");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Distance where the weapon has moved back by its full per-weapon amount. Must be less than 'Starts at'.");
+                    ImGui::SliderFloat("Smoothing##wall", &s.wallPushSmoothTime, 0.0f, 0.5f, "%.2f s");
+                    CheckboxInt("Also while aiming", s.wallPushWhileAiming,
+                        "The pull-back is along the view axis, so the sights stay on the crosshair; the weapon just gets a bit closer/bigger.");
+                    {
+                        const WeaponSettings* pW = FindCurrentWeapon();
+                        ImGui::TextDisabled("Now: %.1f cm back (target %.1f cm) | this weapon's max: %.1f cm | wall at %.2f m",
+                            m_wallPush * 100, m_wallPushTarget * 100, (pW ? pW->wallPush : WeaponSettings().wallPush) * 100, m_convergeDist);
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndDisabled();
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ Weapon
+            if (ImGui::BeginTabItem("Weapon"))
+            {
+                ImGui::BeginDisabled(!s.enabled);
+                if (m_currentWeaponClass.empty())
+                {
+                    ImGui::TextWrapped("Equip a weapon to edit its offsets.");
+                }
+                else
+                {
+                    WeaponSettings& w = GetCurrentWeapon();
+                    ImGui::Text("Current weapon: %s%s", m_currentWeaponClass.c_str(), w.valid ? "  (customized)" : "  (built-in defaults)");
+                    if (w.valid)
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset to built-in"))
+                        {
+                            if (const WeaponSettings* pB = WeaponSettings::BuiltIn(m_currentWeaponClass.c_str()))
+                                w = *pB;
+                            else
+                                w = WeaponSettings();
+                            m_weaponsDirty = true;
+                        }
+                    }
+                    bool ch = false;
+                    bool allow = w.aimAllowed;
+                    if (ImGui::Checkbox("Allow aiming with this weapon", &allow))
+                    {
+                        w.aimAllowed = allow;
+                        ch = true;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Turn off for wrench, grenades, etc. The aim key then does nothing while this weapon is equipped.");
+                    ch |= SliderCm("Wall pull-back", w.wallPush, 30.0f, "How far this weapon slides back towards the camera when the crosshair is right against a wall\n(Global tab > Wall pull-back sets the distances). Longer weapons want more: pistol ~4 cm, shotgun / GLOO gun ~12 cm.");
+                    if (w.wallPush < 0.0f) { w.wallPush = 0.0f; }
+
+                    if (ImGui::CollapsingHeader("Hip offset (not aiming)", ImGuiTreeNodeFlags_DefaultOpen))
+                    {
+                        ImGui::TextWrapped("Added on top of the global standing/crouch offsets while this weapon is equipped.");
+                        ch |= DrawPoseSliders(w.hip, "whip", 30.0f, 45.0f);
+                    }
+                    if (ImGui::CollapsingHeader("Aim pose (ironsights)", ImGuiTreeNodeFlags_DefaultOpen))
+                    {
+                        ImGui::BeginDisabled(!w.aimAllowed);
+                        ImGui::TextWrapped("Weapon bone relative to the camera while aiming. Centered = Right/Left 0 and no rotation; "
+                                           "tune Forward and Up/Down until the sights sit on the crosshair, then small rotations.");
+                        ImGui::PushID("waim");
+                        ch |= SliderCm("Right / Left", w.aim.posX, 20.0f, "0 = centered on the crosshair.");
+                        ch |= SliderCm("Forward", w.aim.posY, 60.0f, "Distance of the weapon bone from the camera.");
+                        ch |= SliderCm("Up / Down", w.aim.posZ, 20.0f, "Raise until the sights meet the crosshair.");
+                        ch |= SliderDeg("Pitch", w.aim.pitch, 90.0f, "If the weapon bone's forward axis is not the barrel, fix it here.");
+                        ch |= SliderDeg("Yaw", w.aim.yaw, 90.0f, nullptr);
+                        ch |= SliderDeg("Roll", w.aim.roll, 90.0f, nullptr);
+                        if (ImGui::Button("Start from current hip pose"))
+                        {
+                            w.aim.FromQuatT(m_render.hipRelCam);
+                            ch = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Copies the weapon's current (hip) camera-relative transform into the aim pose\n(measured exactly at render time). Do this while NOT aiming, then Center and raise it.");
+                        ImGui::SameLine();
+                        if (ImGui::Button("Center (x=0, no rotation)"))
+                        {
+                            w.aim.posX = 0.0f; w.aim.pitch = w.aim.yaw = w.aim.roll = 0.0f;
+                            ch = true;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset##aim"))
+                        {
+                            w.aim = WeaponSettings::DefaultAim();
+                            ch = true;
+                        }
+                        ImGui::Spacing();
+                        ImGui::Text("Firing feel while aiming");
+                        ch |= ImGui::SliderFloat("Coupling after a shot", &w.fireCoupling, 0.0f, 1.0f, "%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Head-bob coupling used right after each shot (decays to the Aim tab's value). Lets the fire kick move the\nweapon relative to the sights instead of the weapon being glued to the camera.");
+                        ch |= ImGui::SliderFloat("... for", &w.fireCouplingTime, 0.05f, 1.0f, "%.2f s");
+                        ch |= ImGui::SliderFloat("Recoil motion multiplier", &w.aimRecoilScale, 0.0f, 3.0f, "x%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Per-weapon multiplier on the game's procedural recoil offset while aiming (times the Aim tab's global one).");
+                        ImGui::Spacing();
+                        ImGui::Text("Bullet spread (pistol / shotgun only)");
+                        ch |= ImGui::SliderFloat("Spread while aiming##w", &w.aimSpreadMult, 0.0f, 2.0f, "x%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Multiplier on the spread cone while aiming. Pistol: the random bullet cone. Shotgun: the pellet cone and its wobble.\n0 = every shot exactly on the crosshair.");
+                        ch |= ImGui::SliderFloat("Spread while not aiming##w", &w.hipSpreadMult, 0.0f, 3.0f, "x%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Above 1 makes hip fire less accurate than the stock game, to reward aiming.");
+                        ImGui::PopID();
+                        ImGui::EndDisabled();
+                    }
+                    if (ch)
+                    {
+                        w.valid = true;
+                        m_weaponsDirty = true;
+                    }
+
+                    if (ImGui::TreeNode("All weapons"))
+                    {
+                        for (auto& kv : m_weapons)
+                        {
+                            if (!kv.second.valid)
+                                continue;
+                            ImGui::Text("%s  aim %s  hip(%.1f,%.1f,%.1f cm)  aim(%.1f,%.1f,%.1f cm)", kv.first.c_str(),
+                                kv.second.aimAllowed ? "on " : "off",
+                                kv.second.hip.posX * 100, kv.second.hip.posY * 100, kv.second.hip.posZ * 100,
+                                kv.second.aim.posX * 100, kv.second.aim.posY * 100, kv.second.aim.posZ * 100);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ Aim
+            if (ImGui::BeginTabItem("Aim"))
+            {
+                ImGui::BeginDisabled(!s.enabled);
+                CheckboxInt("Enable aiming", s.aimEnabled,
+                    "Hold (or toggle) the aim key to bring the weapon up to the sights,\noptionally zooming the camera like ADS in modern shooters.");
+                ImGui::BeginDisabled(!s.aimEnabled);
+
+                ImGui::Text("Aim key: %s", GetKeyName(s.aimKey));
+                ImGui::SameLine();
+                if (m_waitingForAimKey)
+                    ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "press a key or mouse button... (Esc cancels)");
+                else if (ImGui::Button("Bind"))
+                    m_waitingForAimKey = true;
+                ImGui::SameLine();
+                if (ImGui::Button("RMB"))
+                    s.aimKey = (int)eKI_Mouse2;
+                CheckboxInt("Toggle instead of hold", s.aimToggle);
+                ImGui::SameLine();
+                CheckboxInt("Block the game's own action on this key", s.aimConsumeKey,
+                    "Swallows the key so whatever the game has bound to it (e.g. RMB) does nothing while this mod is enabled.");
+
+                ImGui::SliderFloat("Transition time", &s.aimTime, 0.0f, 1.0f, "%.2f s");
+                ImGui::ProgressBar(SmoothStep01(m_aimBlend), ImVec2(-1, 0), m_isAiming ? "aiming" : "hip");
+                CheckboxInt("Ignore crouch offset while aiming", s.aimIgnoresCrouch,
+                    "Fades the crouch offset out as the aim pose blends in, so the sights line up in any stance.");
+
+                ImGui::Spacing();
+                CheckboxInt("Zoom camera while aiming", s.aimCameraZoom, "Lowers the world FOV while aiming (the weapon gets bigger with it, like real ADS).");
+                ImGui::BeginDisabled(!s.aimCameraZoom);
+                ImGui::SliderFloat("Camera zoom", &s.aimCameraZoomFactor, 0.2f, 1.5f, "x%.2f FOV");
+                ImGui::EndDisabled();
+                CheckboxInt("Separate weapon FOV while aiming", s.aimFovEnabled,
+                    "Blends the weapon FOV towards this value while aiming (on top of the camera zoom). Lower = bigger weapon.");
+                ImGui::BeginDisabled(!s.aimFovEnabled);
+                ImGui::SliderFloat("Aim weapon FOV", &s.aimFov, 20.0f, 120.0f, "%.1f deg");
+                ImGui::EndDisabled();
+
+                ImGui::Separator();
+                ImGui::Text("Ironsight motion");
+                {
+                    if (s.showAdvanced)
+                    {
+                        CheckboxInt("Exact render-time placement", s.aimRenderLock,
+                            "After the game has built this frame's camera (from the evaluated skeleton) the weapon's attachment\n"
+                            "transform is set to exactly camera * aim pose before rendering. No prediction, no correction loop:\n"
+                            "lean, landing, crouching, bob cannot move the sights off the crosshair.\n"
+                            "Off = skeleton-only lock (the target has to be predicted a frame ahead; small errors show).");
+                        ImGui::BeginDisabled(!s.aimRenderLock);
+                        ImGui::Indent();
+                        CheckboxInt("Move hands with the weapon", s.aimHandsFollow,
+                            "Moves the final hand poses (weapon hand and, when it is on the weapon, the support hand) by the same\n"
+                            "delta so they stay on the grip. The delta is normally a few millimetres.");
+                        ImGui::SameLine();
+                        CheckboxInt("incl. support hand", s.aimLeftHandFollow);
+                        ImGui::Unindent();
+                        ImGui::EndDisabled();
+                    }
+
+                    ImGui::SliderFloat("Head-bob coupling", &s.aimBobAmount, -0.5f, 1.0f, "%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("0 = the weapon is glued to the camera (perfectly still sights).\n"
+                                          "Positive = the weapon lags behind the head bob by this fraction (0.05-0.15 feels natural),\n"
+                                          "negative = it leads. Derived from the camera's own motion this frame, so it never jitters.");
+                    ImGui::SliderFloat("Bob separation", &s.aimBobTau, 0.05f, 1.0f, "%.2f s");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Camera motion faster than this counts as bob; slower motion (crouching, leaning, eye height) does not.");
+                    ImGui::SliderFloat("Recoil / bump motion", &s.aimAnimRecoil, 0.0f, 3.0f, "x%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Multiplier on the game's procedural recoil kick and landing bump while locked (times the per-weapon multiplier in the Weapon tab).");
+                    ImGui::SliderFloat("Keep look / strafe sway", &s.aimAnimSway, 0.0f, 1.0f, "%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Re-applies the game's look/strafe sway on top of the lock. Any amount moves the sights off the crosshair while turning.");
+
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Bullet spread multipliers are per weapon (Weapon tab).");
+                    if (s.showAdvanced)
+                        ImGui::TextDisabled("spread hook calls: %d | shots seen: %d | fire coupling: %.2f s", m_spreadHookCalls, m_shotsSeen, m_fireTimer);
+                    ImGui::Separator();
+                    const char* sensModes[] = { "Game default (weapon's zoomed multiplier)", "Match camera zoom factor", "Custom multiplier" };
+                    ImGui::Combo("ADS look sensitivity", &s.aimSensMode, sensModes, 3);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("The game treats the aim camera zoom like its own weapon zoom and blends the look speed towards the\nweapon's zoomed camera-speed stat, which is very aggressive. Override what it blends towards instead.");
+                    if (s.aimSensMode == 2)
+                        ImGui::SliderFloat("Sensitivity while aiming", &s.aimSensScale, 0.05f, 3.0f, "x%.2f");
+                }
+
+                if (s.showAdvanced && ImGui::TreeNode("Lock debug"))
+                {
+                    const RenderLockState& R = m_render;
+                    if (!m_cameraHookActive)
+                        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Camera hook NOT installed - render-time placement unavailable.");
+                    ImGui::Text("Camera updates last frame: %d (expect 1) | position was %s", R.callsLastFrame, R.positionWasWorld ? "WORLD (converted)" : "entity-relative");
+                    ImGui::Text("Weapon attachment: %s | joint %d '%s' | weapon hand '%s' (%d joints) | support hand '%s' (%d joints, %s, %.1f cm from weapon)",
+                        R.attachValid ? "found" : "none", R.attachJoint, R.attachJointName.c_str(),
+                        R.rightHandName.c_str(), (int)R.rightSubtree.size(), R.leftHandName.c_str(), (int)R.leftSubtree.size(),
+                        R.leftOnWeapon ? "on weapon" : "free", R.leftHandDist * 100);
+                    TextQuatT("Camera (model, exact)", R.camModel);
+                    TextQuatT("Weapon rel. camera (game)", R.weaponRelCam);
+                    TextQuatT("Hip weapon rel. camera", R.hipRelCam);
+                    ImGui::Text("Render-time residual (how far the skeleton-side push was off): %.2f cm, %.2f deg | max 1s: %.2f cm  <- cosmetic only, the weapon is placed exactly regardless",
+                        R.residualPos * 100, RAD2DEG(R.residualRot), R.residualPosMax1s * 100);
+                    ImGui::Text("Head bob (cam space): (%.2f, %.2f, %.2f) cm", R.bobCam.x * 100, R.bobCam.y * 100, R.bobCam.z * 100);
+                    ImGui::Separator();
+                    ImGui::Text("Skeleton side: active %s | captured %s | skeleton matches player %s | joints: right IK %d, left IK %d, weapon target %d",
+                        m_lock.active ? "yes" : "no", m_lock.captured ? "yes" : "no", m_lock.charMatches ? "yes" : "NO",
+                        m_lock.rightIkJoint, m_lock.leftIkJoint, m_lock.weaponJoint);
+                    TextQuatT("Predicted camera (model)", m_lock.camAbs);
+                    TextQuatT("Right IK joint", m_lock.ikAbs);
+                    TextQuatT("Weapon bone", m_lock.weaponAbs);
+                    TextQuatT("Last override", m_lock.lastTarget);
+                    ImGui::Text("IK joint vs pushed target: %.2f cm  <- 0 means the override is honoured | sensitivity hook calls: %d", m_lock.ikErr * 100, m_sensHookCalls);
+                    TextQuatT("Game recoil", m_gameOffsets[2]);
+                    TextQuatT("Game bump", m_gameOffsets[3]);
+                    ImGui::Separator();
+                    ImGui::TextWrapped("Self-test (works while not aiming too): raise the weapon at render time. If the weapon moves, the attachment write works; "
+                                       "if the hands move with it, the joint write works.");
+                    ImGui::SliderFloat("Test: raise weapon", &s.testOffsetUp, 0.0f, 0.2f, "%.2f m");
+                    ImGui::SameLine();
+                    CheckboxInt("hands too", s.testHands);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset##test"))
+                        s.testOffsetUp = 0.0f;
+                    ImGui::TreePop();
+                }
+                if (s.showAdvanced && ImGui::TreeNode("Input debug"))
+                {
+                    ImGui::Text("Aim key held/toggled: %s", m_aimKeyHeld ? "yes" : "no");
+                    ImGui::Text("Aiming: %s", m_isAiming ? "yes" : "no");
+                    ImGui::Text("Camera zoom handle: %d", m_cameraZoomHandle);
+                    ImGui::Text("Input listener: %s", m_inputListenerRegistered ? "registered" : "NOT registered");
+                    ImGui::TreePop();
+                }
+                ImGui::EndDisabled();
+                ImGui::EndDisabled();
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ FOV
+            if (ImGui::BeginTabItem("FOV"))
+            {
+                CheckboxInt("Override weapon FOV", s.fovEnabled);
+                ImGui::BeginDisabled(!s.fovEnabled);
+                ImGui::SliderFloat("Weapon FOV", &s.fov, 20.0f, 120.0f, "%.1f deg");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Vertical FOV used to render the weapon and arms.\nGame default is 55. Higher = smaller weapon.");
+                ImGui::SameLine();
+                if (ImGui::Button("55##fov"))
+                    s.fov = PreyInternals::STOCK_WEAPON_FOV;
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("The game's own zoom (and the aim camera zoom) still scales this proportionally.");
+                ImGui::Separator();
+                DrawReticleControls(s, "fret");
+                if (gEnv && gEnv->pConsole)
+                {
+                    ICVar* pY = gEnv->pConsole->GetCVar("g_reticleYPercentage");
+                    ICVar* pS = gEnv->pConsole->GetCVar("hud_reticleSetting");
+                    ImGui::TextDisabled("g_reticleYPercentage %.3f | hud_reticleSetting %d", pY ? pY->GetFVal() : -1.0f, pS ? pS->GetIVal() : -1);
+                }
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ Nudge keys
+            if (ImGui::BeginTabItem("Nudge keys"))
+            {
+                CheckboxInt("Enable nudge keys", s.nudgeKeys,
+                    "Adjust the currently active pose without opening this window. The keys are blocked from the game while enabled.");
+                const char* layouts[] = { "Numpad", "IJKL" };
+                ImGui::Combo("Layout", &s.nudgeLayout, layouts, 2);
+                const char* targets[] = { "Global standing / crouch (by stance)", "This weapon's hip offset" };
+                ImGui::Combo("Not aiming edits", &s.nudgeTarget, targets, 2);
+                const char* activeName = "";
+                GetActivePose(&activeName);
+                ImGui::Text("Active pose right now: %s", activeName);
+                if (s.nudgeLayout == 0)
+                    ImGui::TextWrapped(
+                        "Numpad 4 / 6 : left / right\n"
+                        "Numpad 8 / 2 : up / down\n"
+                        "Numpad 7 / 1 : forward / back\n"
+                        "Hold Numpad 0 : the same keys rotate instead (4/6 yaw, 8/2 pitch, 7/1 roll)\n"
+                        "Hold Numpad . : slow (x0.2)");
+                else
+                    ImGui::TextWrapped(
+                        "J / L : left / right\n"
+                        "I / K : up / down\n"
+                        "U / O : forward / back\n"
+                        "Hold H : the same keys rotate instead (J/L yaw, I/K pitch, U/O roll)\n"
+                        "Hold N : slow (x0.2)");
+                ImGui::TextWrapped("While aiming (use Toggle aim) the keys edit the aim pose of the current weapon.");
+                ImGui::SliderFloat("Position speed", &s.nudgePosSpeed, 0.005f, 0.3f, "%.3f m/s");
+                ImGui::SliderFloat("Rotation speed", &s.nudgeRotSpeed, 1.0f, 90.0f, "%.0f deg/s");
+                ImGui::EndTabItem();
+            }
+
+            //------------------------------------------------------------------ Options
+            if (ImGui::BeginTabItem("Options"))
+            {
+                CheckboxInt("Capture mouse while this window is open", s.guiMouse,
+                    "Shows the cursor and stops the camera from turning while you drag sliders.\nThe game keeps running. Close this window or press F1 to give the mouse back.");
+                CheckboxInt("Show advanced and experimental features", s.showAdvanced,
+                    "Diagnostics, self-tests and the experimental Death tab. Not needed for normal use.");
+                if (ImGui::Button("Save weapon settings now"))
+                    SaveWeapons();
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", GetWeaponsPath().u8string().c_str());
+                ImGui::TextWrapped("Console cvars: vm_pos_*, vm_rot_*, vm_crouch_*, vm_aim_*, vm_fov, vm_enabled, vm_nudge_*.");
+                ImGui::TextDisabled("Global settings are saved by Chairloader; weapon settings a couple of seconds after a change.");
+
+                if (s.showAdvanced && ImGui::CollapsingHeader("Pipeline diagnostics"))
+                {
+                    const PipelineDiag& d = m_diag;
+                    ImGui::Text("Last frame: %d context update(s), %d weapon-offset update(s), instanceCount %d%s, modifier %s",
+                        d.ctxUpdatesLastFrame, d.pwaUpdatesLastFrame, d.lastInstanceCount, d.lastForced ? " (forced alive)" : "",
+                        d.lastModifierNull ? "NULL" : "ok");
+                    ImGui::TextWrapped("Reproduce the problem (e.g. land from a jump with the pistol), then read the events below. Newest last.");
+                    if (ImGui::Button("Clear events"))
+                        m_diag.events.clear();
+                    ImGui::BeginChild("diagevents", ImVec2(0, 160), true);
+                    for (const auto& e : d.events)
+                        ImGui::Text("[%8.2f] %s", e.time, e.text.c_str());
+                    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+                        ImGui::SetScrollHereY(1.0f);
+                    ImGui::EndChild();
+                }
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+
+    if (!open)
+        m_settings.showWindow = 0;
+}
+
+//---------------------------------------------------------------------------------
+// Exported Functions
+//---------------------------------------------------------------------------------
+extern "C" DLL_EXPORT IChairloaderMod* ClMod_Initialize()
+{
+    CRY_ASSERT(!gMod);
+    gMod = new ModMain();
+    return gMod;
+}
+
+extern "C" DLL_EXPORT void ClMod_Shutdown()
+{
+    CRY_ASSERT(gMod);
+    delete gMod;
+    gMod = nullptr;
+}
+
+// Validate that declarations haven't changed
+static_assert(std::is_same_v<decltype(ClMod_Initialize), IChairloaderMod::ProcInitialize>);
+static_assert(std::is_same_v<decltype(ClMod_Shutdown), IChairloaderMod::ProcShutdown>);

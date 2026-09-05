@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<Mod
+	modName="Vee.ViewmodelTweaks"
+	displayName="Viewmodel Tweaks &amp; Ironsights"
+	version="3.1.0"
+	dllName="Vee.ViewmodelTweaks.dll"
+	hasXML="false"
+	hasLevelXML="false"
+	author="Vee">
+</Mod>
