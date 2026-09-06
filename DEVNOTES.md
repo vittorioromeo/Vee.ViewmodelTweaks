@@ -102,6 +102,18 @@ For the FOV: the weapon is rendered in the "nearest" pass with its own FOV store
 game's "near FOV locked" state (used when the weapon must share the world FOV).
 
 
+## Fire animation while locked
+
+* The skeleton-side push drives the right IK joint through the game's own `IAnimationOperatorQueue`. With
+  `eOp_Override` the fire *animation* (the pistol's kick is animated, the shotgun's is mostly the procedural
+  `CWeaponRecoilOffset`) is wiped out. The push is therefore `eOp_Additive` (3, what the game uses for its
+  offsets: position added, orientation pre-multiplied in model space): `final = animated (+) add`. Knowing
+  `add` of the previous frame gives the animated hand of the previous frame; its deviation from a slow
+  reference (frozen while a shot plays) is the kick, fed into the aim pose (weapon-local, per-weapon
+  `aim_kick_scale`, gated to the shot window). The one frame of animation velocity the additive lets through
+  is corrected exactly by the render-side placement.
+* `CArkWeapon::FireWeapon` (`+0x16659B0`) is the shot event for every weapon.
+
 ## Reticle and the in-world screen cursor
 
 * `hud_reticleSetting` (SCVars+0x930; 0 off, 1 default, 2 dot) is exactly what the options menu writes

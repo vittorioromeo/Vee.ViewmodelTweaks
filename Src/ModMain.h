@@ -9,6 +9,7 @@
 class ArkPlayerCamera;
 class CArkItem;
 struct SViewParams;
+class CArkWeapon;
 
 //! A position (meters, view space: X right, Y forward, Z up) + rotation (degrees) offset.
 struct PoseOffset
@@ -126,6 +127,7 @@ struct WeaponSettings
     float fireCoupling = 0.35f;     //!< Head-bob coupling right after a shot (lets the fire kick show while aiming).
     float fireCouplingTime = 0.30f; //!< Seconds the fire coupling decays over.
     float aimRecoilScale = 1.0f;    //!< Multiplier on the game's procedural recoil/bump offsets while aiming.
+    float aimKickScale = 0.3f;      //!< Multiplier on the fire *animation's* weapon kick while aiming (the hand animation, not the procedural offset).
     float aimSpreadMult = 1.0f;     //!< Per-weapon spread multiplier while aiming (times the global one).
     float hipSpreadMult = 1.0f;     //!< Per-weapon spread multiplier while not aiming (times the global one).
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
@@ -160,6 +162,17 @@ struct AimLockState
     int leftIkJoint = -1;
     int weaponJoint = -1;
     float ikErr = 0.0f;             //!< |IK joint (prev frame) - target pushed prev frame| (m)
+
+    // Animation pass-through. The IK joint is driven additively: final = animated (+) add. Knowing what we
+    // added last frame gives the animated (pre-modifier) hand of last frame, and its deviation from a slow
+    // reference is the fire animation's kick, which the lock would otherwise swallow.
+    bool addValid = false;
+    QuatT lastAdd = QuatT(IDENTITY);        //!< additive pushed last frame (model space: t added, q pre-multiplied)
+    QuatT animIk = QuatT(IDENTITY);         //!< reconstructed animated IK joint of last frame (model space)
+    bool animRestValid = false;
+    QuatT animRestRelCam = QuatT(IDENTITY); //!< slow reference of the animated hand relative to the camera
+    QuatT kick = QuatT(IDENTITY);           //!< this frame's kick (hand-local), already scaled and gated
+    float kickPos = 0.0f, kickRot = 0.0f;   //!< debug: magnitude of the raw deviation
 };
 
 //! Runtime state of the render-time placement (runs after ArkPlayerCamera::UpdateView, when the
@@ -184,6 +197,8 @@ struct RenderLockState
     std::string attachJointName;
     QuatT weaponModelGame = QuatT(IDENTITY);  //!< attachment transform as the game computed it (model space)
     QuatT weaponBoneGame = QuatT(IDENTITY);   //!< weapon bone (final pose, before our hand edits) this frame
+    QuatT ikGame = QuatT(IDENTITY);           //!< right IK joint (final pose, before our hand edits) this frame
+    bool ikGameValid = false;
     QuatT attOffset = QuatT(IDENTITY);        //!< weapon bone -> attachment (constant, from the game's values)
     bool attOffsetValid = false;
     QuatT weaponRelCam = QuatT(IDENTITY);     //!< ... relative to the exact camera
@@ -286,6 +301,7 @@ public:
 
     //! Called right after ArkPlayerCamera::UpdateView computed this frame's camera (render side).
     void OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params);
+    void OnWeaponFired(CArkWeapon* pWeapon);
 
     //! Procedural weapon offsets captured from the game this frame (view space).
     void SetGameOffset(int which, const QuatT& q) { m_gameOffsets[which] = q; }
@@ -363,6 +379,7 @@ private:
     float m_prevCamRecoilTime = 0.0f;
     float m_prevRecoilMag = 0.0f;
     int m_shotsSeen = 0;
+    bool m_shotPending = false;         //!< CArkWeapon::FireWeapon ran for the player's weapon since the last camera update
     int m_spreadHookCalls = 0;
 
     float m_lastAppliedFov = -1.0f;

@@ -289,6 +289,16 @@ static float CArkWeapon_GetStatFloat_Hook(const CArkWeapon* const _this, const C
     return v;
 }
 
+// Every shot of every weapon goes through CArkWeapon::FireWeapon - the reliable shot event (the pistol's
+// procedural recoil is too small for the offset-jump heuristic below).
+static auto s_hookFireWeapon = CArkWeapon::FFireWeapon.MakeHook();
+static void CArkWeapon_FireWeapon_Hook(CArkWeapon* const _this)
+{
+    s_hookFireWeapon.InvokeOrig(_this);
+    if (gMod)
+        gMod->OnWeaponFired(_this);
+}
+
 //---------------------------------------------------------------------------------
 // Helpers
 //---------------------------------------------------------------------------------
@@ -498,6 +508,8 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     {
         L.active = false;
         L.captured = false;
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
         return;
     }
 
@@ -512,6 +524,8 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     {
         L.active = false;
         L.captured = false;
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
         return;
     }
 
@@ -529,6 +543,54 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     L.ikErr = (L.ikAbs.t - L.lastTarget.t).GetLength();
 
     const float ab = L.charMatches ? GetLockBlend() : 0.0f;
+
+    // --- Fire animation pass-through -------------------------------------------------------------
+    // The animated (pre-modifier) hand of last frame = last frame's final hand minus what we added to it.
+    {
+        const QuatT finalIk = R.ikGameValid ? R.ikGame : L.ikAbs;
+        QuatT anim = finalIk;
+        if (L.addValid)
+        {
+            anim.t -= L.lastAdd.t;
+            anim.q = (!L.lastAdd.q) * anim.q;
+            anim.q.Normalize();
+        }
+        L.animIk = anim;
+        // Relative to the camera of that frame, so head motion does not count as hand motion.
+        const QuatT animRelCam = L.camAbs.GetInverted() * anim;
+        const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.016f;
+        if (!L.animRestValid || (animRelCam.t - L.animRestRelCam.t).GetLengthSquared() > 0.5f * 0.5f || !R.camValid)
+        {
+            L.animRestRelCam = animRelCam;
+            L.animRestValid = R.camValid;
+        }
+        else if (m_fireTimer <= 0.0f)
+        {
+            // Slow reference; frozen while a shot plays out so the kick is measured against the pose before it.
+            const float k = 1.0f - expf(-dt / 0.35f);
+            L.animRestRelCam = BlendQuatT(L.animRestRelCam, animRelCam, k);
+            L.animRestRelCam.q.Normalize();
+        }
+        QuatT dev = L.animRestRelCam.GetInverted() * animRelCam; // hand-local deviation
+        dev.q.Normalize();
+        L.kickPos = dev.t.GetLength();
+        L.kickRot = 2.0f * acosf(clamp_tpl(fabsf(dev.q.w), 0.0f, 1.0f));
+        const WeaponSettings* pW = FindCurrentWeapon();
+        const float T = (pW && pW->fireCouplingTime > 0.05f) ? pW->fireCouplingTime : 0.3f;
+        // Gate: only around shots (idle breathing / walk bob must not leak into the sights).
+        const float gate = (m_fireTimer > 0.0f) ? SmoothStep01(m_fireTimer / (0.3f * T)) : 0.0f;
+        const float scale = (pW ? pW->aimKickScale : 1.0f) * gate;
+        if (scale > 0.0f && ab > 0.0f && L.animRestValid && L.captured && L.kickPos < 0.25f && L.kickRot < DEG2RAD(45.0f))
+        {
+            // dev is the hand's motion in the hand's own axes. The weapon rides rigidly on the hand
+            // (weapon = hand * weaponRel), so the same motion in the weapon's axes is weaponRel^-1 * dev * weaponRel.
+            QuatT kickW = L.weaponRel.GetInverted() * dev * L.weaponRel;
+            kickW.q.Normalize();
+            L.kick = ScaleQuatT(kickW, scale);
+        }
+        else
+            L.kick = QuatT(IDENTITY);
+    }
 
     IEntity* pEnt = pPlayer->GetEntity();
     Quat entRot = pEnt->GetWorldRotation();
@@ -571,6 +633,8 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
     {
         L.active = false;
         L.captured = false;
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
         return;
     }
 
@@ -581,11 +645,12 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
         L.weaponRel = ikAbs.GetInverted() * weaponBone; // hand -> weapon bone, assumed rigid
         L.weaponClass = m_currentWeaponClass;
         L.captured = true;
+        L.animRestValid = false;
     }
     L.active = true;
 
     const WeaponSettings& w = GetCurrentWeapon();
-    const QuatT desiredRelCam = ComputeAimExtra() * w.aim.AsQuatT();
+    const QuatT desiredRelCam = ComputeAimExtra() * w.aim.AsQuatT() * L.kick;
 
     const QuatT aimWeaponAbs = camAbs * desiredRelCam;                  // where the weapon bone should be
     const QuatT aimIkAbs = aimWeaponAbs * L.weaponRel.GetInverted();    // -> where the hand IK target must be
@@ -593,8 +658,17 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
     QuatT target = BlendQuatT(hipAbs, aimIkAbs, ab);
     target.q.Normalize();
 
-    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, L.rightIkJoint, OP_OVERRIDE, &target.t);
-    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, L.rightIkJoint, OP_OVERRIDE, &target.q);
+    // Additive, not override: the fire animation keeps moving the hand (the deviation is measured above
+    // and fed back into the aim pose). The add is relative to last frame's animated hand; the frame of
+    // animation velocity that leaves is fixed exactly on the render side.
+    QuatT add;
+    add.t = target.t - L.animIk.t;
+    add.q = target.q * (!L.animIk.q);
+    add.q.Normalize();
+    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, L.rightIkJoint, OP_ADDITIVE, &add.t);
+    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, L.rightIkJoint, OP_ADDITIVE, &add.q);
+    L.lastAdd = add;
+    L.addValid = true;
     L.lastTarget = target;
 }
 
@@ -667,6 +741,16 @@ void ModMain::UpdateSkeletonCache(void* pCharInst, void* pAttachment)
     }
 }
 
+void ModMain::OnWeaponFired(CArkWeapon* pWeapon)
+{
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer || !pPlayer->GetEntity() || !pWeapon)
+        return;
+    if (pWeapon->GetOwnerId() != pPlayer->GetEntity()->GetId())
+        return;
+    m_shotPending = true;
+}
+
 void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
 {
     using namespace PreyInternals;
@@ -733,7 +817,8 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     {
         const float camRecoil = pPlayer->m_camera.m_recoilTimeRemaining;
         const float recoilMag = m_gameOffsets[2].t.GetLength();
-        const bool shot = (camRecoil > m_prevCamRecoilTime + 1e-4f) || (recoilMag > m_prevRecoilMag + 0.002f && recoilMag > 0.003f);
+        const bool shot = m_shotPending || (camRecoil > m_prevCamRecoilTime + 1e-4f) || (recoilMag > m_prevRecoilMag + 0.002f && recoilMag > 0.003f);
+        m_shotPending = false;
         m_prevCamRecoilTime = camRecoil;
         m_prevRecoilMag = recoilMag;
         if (shot)
@@ -780,6 +865,16 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     R.weaponBoneGame = pPlayer->GetBoneTransform(BONE_WEAPON);
     R.attOffset = R.weaponBoneGame.GetInverted() * gameModel;
     R.attOffsetValid = true;
+    R.ikGameValid = false;
+    if (m_lock.rightIkJoint >= 0)
+    {
+        if (void* pSkelPose0 = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose))
+            if (const QuatT* pIk = VCall<const QuatT*>(pSkelPose0, VT_ISkeletonPose_GetAbsJointByID, m_lock.rightIkJoint))
+            {
+                R.ikGame = *pIk;
+                R.ikGameValid = true;
+            }
+    }
 
     const float ab = (m_lock.charMatches || !m_lock.active) ? GetLockBlend() : 0.0f;
     if (ab <= 0.0f)
@@ -797,7 +892,7 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     if (ab > 0.0f && s.aimRenderLock)
     {
         const WeaponSettings& w = GetCurrentWeapon();
-        const QuatT aimRelCam = ComputeAimExtra() * w.aim.AsQuatT();
+        const QuatT aimRelCam = ComputeAimExtra() * w.aim.AsQuatT() * m_lock.kick;
         QuatT desiredRelCam = BlendQuatT(R.weaponRelCam, aimRelCam, ab);
         desiredRelCam.q.Normalize();
         desiredModel = camModel * desiredRelCam;
@@ -1096,7 +1191,7 @@ namespace
         const char* cls;
         bool aimAllowed;
         float wallPush;
-        float fireCoupling, fireCouplingTime, aimRecoilScale;
+        float fireCoupling, fireCouplingTime, aimRecoilScale, aimKickScale;
         float aimSpread, hipSpread;
         PoseOffset hip;
         PoseOffset aim;
@@ -1111,19 +1206,19 @@ namespace
     {
         // Aim pose = weapon attachment relative to the camera (m / deg), x = 0 means centered on the crosshair.
         static const BuiltInWeapon table[] = {
-            //  class                          aim    wall   fireC fireT recoil aimSp hipSp  hip offset                                   aim pose
-            { "ArkWeaponPistol",               true,  0.066f, 1.0f, 0.40f, 3.0f, 0.5f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1327f, 0.04f) },
-            { "ArkWeaponShotgun",              true,  0.134f, 1.0f, 0.75f, 1.0f, 0.5f, 1.0f, P(0, 0, -0.0323f, 3.23f),                    P(0.0f, 0.0575f, -0.0956f, 0.73f) },
-            { "ArkWeaponGooGun",               true,  0.157f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1707f) },
-            { "ArkWeaponStunGun",              true,  0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1487f) },
-            { "ArkWeaponToyGun",               true,  0.129f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, -0.014f, -0.0403f, 4.84f, 5.44f),       P(0.0f, 0.0564f, -0.0954f) },
-            { "ArkWeaponInstalaser",           true,  0.216f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, -0.0362f, 5.13f, 2.58f),             P(0.165f, -0.2295f, 0.0511f, 0.0f, 0.01f) },
-            { "ArkWeaponWrench",               false, 0.026f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(-0.0177f, 0.0242f, 0.0398f, 4.83f, 0.0f, -5.99f), P(0, 0.25f, -0.06f) },
-            { "ArkWeaponEMPGrenade",           false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponLureGrenade",          false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponRecyclerGrenade",      false, 0.000f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponNullwaveTransmitter",  false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponExplosiveGrenade",     false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            //  class                          aim    wall   fireC fireT recoil kick  aimSp hipSp  hip offset                                   aim pose
+            { "ArkWeaponPistol",               true,  0.066f, 1.0f, 0.40f, 3.0f, 0.30f, 0.45f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1327f, 0.04f) },
+            { "ArkWeaponShotgun",              true,  0.134f, 1.0f, 0.75f, 1.0f, 0.15f, 0.45f, 1.0f, P(0, 0, -0.0323f, 3.23f),                    P(0.0f, 0.0575f, -0.0956f, 0.73f) },
+            { "ArkWeaponGooGun",               true,  0.157f, 0.35f, 0.30f, 1.0f, 0.20f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1707f) },
+            { "ArkWeaponStunGun",              true,  0.060f, 0.35f, 0.30f, 1.0f, 0.25f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1487f) },
+            { "ArkWeaponToyGun",               true,  0.129f, 0.35f, 0.30f, 1.0f, 0.30f, 1.0f, 1.0f, P(0, -0.014f, -0.0403f, 4.84f, 5.44f),       P(0.0f, 0.0564f, -0.0954f) },
+            { "ArkWeaponInstalaser",           true,  0.216f, 0.35f, 0.30f, 1.0f, 0.35f, 1.0f, 1.0f, P(0, 0, -0.0362f, 5.13f, 2.58f),             P(0.165f, -0.2295f, 0.0511f, 0.0f, 0.01f) },
+            { "ArkWeaponWrench",               false, 0.026f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(-0.0177f, 0.0242f, 0.0398f, 4.83f, 0.0f, -5.99f), P(0, 0.25f, -0.06f) },
+            { "ArkWeaponEMPGrenade",           false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponLureGrenade",          false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponRecyclerGrenade",      false, 0.000f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponNullwaveTransmitter",  false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            { "ArkWeaponExplosiveGrenade",     false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
         };
         count = sizeof(table) / sizeof(table[0]);
         return table;
@@ -1150,6 +1245,7 @@ const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
         w.fireCoupling = t[i].fireCoupling;
         w.fireCouplingTime = t[i].fireCouplingTime;
         w.aimRecoilScale = t[i].aimRecoilScale;
+        w.aimKickScale = t[i].aimKickScale;
         w.aimSpreadMult = t[i].aimSpread;
         w.hipSpreadMult = t[i].hipSpread;
         w.hip = t[i].hip;
@@ -1571,6 +1667,7 @@ void ModMain::LoadWeapons()
         w.fireCoupling = n.attribute("fire_coupling").as_float(WeaponSettings().fireCoupling);
         w.fireCouplingTime = n.attribute("fire_coupling_time").as_float(WeaponSettings().fireCouplingTime);
         w.aimRecoilScale = n.attribute("aim_recoil_scale").as_float(WeaponSettings().aimRecoilScale);
+        w.aimKickScale = n.attribute("aim_kick_scale").as_float(WeaponSettings().aimKickScale);
         w.aimSpreadMult = n.attribute("aim_spread_mult").as_float(WeaponSettings().aimSpreadMult);
         w.hipSpreadMult = n.attribute("hip_spread_mult").as_float(WeaponSettings().hipSpreadMult);
         ReadPose(n, "hip_", w.hip, PoseOffset());
@@ -1600,6 +1697,7 @@ void ModMain::SaveWeapons()
         n.append_attribute("fire_coupling") = kv.second.fireCoupling;
         n.append_attribute("fire_coupling_time") = kv.second.fireCouplingTime;
         n.append_attribute("aim_recoil_scale") = kv.second.aimRecoilScale;
+        n.append_attribute("aim_kick_scale") = kv.second.aimKickScale;
         n.append_attribute("aim_spread_mult") = kv.second.aimSpreadMult;
         n.append_attribute("hip_spread_mult") = kv.second.hipSpreadMult;
         WritePose(n, "hip_", kv.second.hip);
@@ -1634,6 +1732,7 @@ void ModMain::InitHooks()
     s_hookDispMin.SetHookFunc(&CArkWeaponShotgun_GetDispersionMinimum_Hook);
     s_hookDispMax.SetHookFunc(&CArkWeaponShotgun_GetDispersionMaximum_Hook);
     s_hookGetStatFloat.SetHookFunc(&CArkWeapon_GetStatFloat_Hook);
+    s_hookFireWeapon.SetHookFunc(&CArkWeapon_FireWeapon_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -2230,7 +2329,10 @@ void ModMain::DrawWindow()
                         ch |= ImGui::SliderFloat("... for", &w.fireCouplingTime, 0.05f, 1.0f, "%.2f s");
                         ch |= ImGui::SliderFloat("Recoil motion multiplier", &w.aimRecoilScale, 0.0f, 3.0f, "x%.2f");
                         if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Per-weapon multiplier on the game's procedural recoil offset while aiming (times the Aim tab's global one).");
+                            ImGui::SetTooltip("Per-weapon multiplier on the game's procedural recoil offset while aiming (times the Aim tab's global one).\nThe shotgun's kick is mostly this.");
+                        ch |= ImGui::SliderFloat("Fire animation kick", &w.aimKickScale, 0.0f, 3.0f, "x%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("How much of the fire animation's hand motion shows while aiming (the pistol's kick is animated, not procedural).\nMeasured against the pose just before the shot and active for the coupling time above. 0 = still sights.");
                         ImGui::Spacing();
                         ImGui::Text("Bullet spread (pistol / shotgun only)");
                         ch |= ImGui::SliderFloat("Spread while aiming##w", &w.aimSpreadMult, 0.0f, 2.0f, "x%.2f");
@@ -2377,7 +2479,8 @@ void ModMain::DrawWindow()
                     TextQuatT("Right IK joint", m_lock.ikAbs);
                     TextQuatT("Weapon bone", m_lock.weaponAbs);
                     TextQuatT("Last override", m_lock.lastTarget);
-                    ImGui::Text("IK joint vs pushed target: %.2f cm  <- 0 means the override is honoured | sensitivity hook calls: %d", m_lock.ikErr * 100, m_sensHookCalls);
+                    ImGui::Text("IK joint vs pushed target: %.2f cm (one frame of animation velocity is expected) | sensitivity hook calls: %d", m_lock.ikErr * 100, m_sensHookCalls);
+                    ImGui::Text("Fire animation deviation: %.2f cm, %.1f deg | kick applied: %.2f cm", m_lock.kickPos * 100, RAD2DEG(m_lock.kickRot), m_lock.kick.t.GetLength() * 100);
                     TextQuatT("Game recoil", m_gameOffsets[2]);
                     TextQuatT("Game bump", m_gameOffsets[3]);
                     ImGui::Separator();

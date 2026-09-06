@@ -8,9 +8,9 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
 * **Ironsights.** Hold (or toggle) the aim key and the weapon comes up to the sights, exactly aligned with the
   crosshair, with a camera zoom, its own weapon FOV and a configurable look-sensitivity while aiming. Tuned
   poses for every stock weapon are built in; each one can be adjusted with sliders or nudge keys.
-* **Weapon feel.** Head-bob coupling (still sights or a little lag), recoil kick while aiming, a per-shot
-  coupling boost so shots visibly kick the sights, and bullet-spread multipliers for aiming vs hip fire on
-  the pistol and shotgun (the only weapons with spread).
+* **Weapon feel.** Head-bob coupling (still sights or a little lag), the game's procedural recoil and the
+  fire animation's own kick while aiming (both per weapon), a per-shot coupling boost, and bullet-spread
+  multipliers for aiming vs hip fire on the pistol and shotgun (the only weapons with spread).
 * **Viewmodel.** Global standing and crouch offsets, per-weapon hip offsets, weapon FOV (the stock 55 is
   fixed in vanilla), world FOV, sprint look-sensitivity.
 * **Hip fire helpers.** Weapon convergence (the barrel points at what the crosshair is over), wall pull-back
