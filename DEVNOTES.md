@@ -102,6 +102,17 @@ For the FOV: the weapon is rendered in the "nearest" pass with its own FOV store
 game's "near FOV locked" state (used when the weapon must share the world FOV).
 
 
+## Feel layer (sprint pose, aim sway, view drag)
+
+* Pure per-frame state (`UpdateFeel`, from `MainUpdate`) with two outputs: additive view-space offsets for the
+  hip path (`ApplyOffset`, faded out by the aim blend) and a weapon-local post-multiplied transform for the aim
+  path (`ComputeAimLocal`, applied as `extra * aimPose * local * kick` on both the skeleton and the render side).
+* Sprint: `ArkPlayerMovementFSM::IsSprinting()` (`+0x1570580`); speed from `pe_status_living::vel`.
+* View drag: turn rate from `ArkPlayerCamera::m_rotation` (yaw = Ang3.z, pitch = Ang3.x), a damped spring
+  (sub-stepped at 8 ms) towards the rate; the offset is proportional to the spring state, clamped.
+* Aim sway rotates the weapon about its own pivot (post-multiplied), so the sights leave the crosshair while the
+  shot still follows the camera - which is what makes it matter with the reticle hidden.
+
 ## Fire animation while locked
 
 * The skeleton-side push drives the right IK joint through the game's own `IAnimationOperatorQueue`. With
@@ -123,6 +134,18 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
   moves `m_reticlePos` (+0x60) and sends `reticlePosition` to the HUD, so a hidden reticle means no cursor.
   The mod therefore un-hides the reticle while `ArkPlayer::m_examinationMode.m_examinationState != inactive`
   with `m_examinationType == worldUI`, and only ever writes the cvar when its own target value changes.
+
+## Robustness
+
+* Everything read from the game (camera, entity rotation, attachment, bones, procedural offsets) is checked
+  for finiteness and near-unit quaternions at the boundary; everything written back (offset, operator push,
+  attachment, hand joints) is checked again. Accumulated state (low-passes, springs, blends, the additive chain,
+  the kick reference) is reset when a bad number shows up, and persisted settings are sanitized on load.
+  `Ang3(Quat)` in CryMath uses an unclamped `asin`, so all Euler conversions go through a clamped copy.
+* The additive hand push is only subtracted from the final pose when the skeleton actually applied it (the
+  animation update can be skipped while the hook still runs); otherwise the chain would grow without bound.
+* Mod cvars are unregistered in `ShutdownSystem`: the console keeps raw pointers to the names and storage,
+  which vanish with the DLL, and touches them again at engine shutdown (crash on exit otherwise).
 
 ## Two ABI traps that cost a crash each
 

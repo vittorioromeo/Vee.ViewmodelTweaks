@@ -32,11 +32,40 @@ struct PoseOffset
         posX += o.posX * k; posY += o.posY * k; posZ += o.posZ * k;
         pitch += o.pitch * k; yaw += o.yaw * k; roll += o.roll * k;
     }
-    void FromQuatT(const QuatT& q)
+    //! From a transform; a bad quaternion (not a number, not near unit length) leaves the pose unchanged.
+    void FromQuatT(const QuatT& qt)
     {
-        Ang3 a(q.q);
-        posX = q.t.x; posY = q.t.y; posZ = q.t.z;
+        const float n2 = qt.q.w * qt.q.w + qt.q.v.x * qt.q.v.x + qt.q.v.y * qt.q.v.y + qt.q.v.z * qt.q.v.z;
+        if (!(n2 > 0.25f && n2 < 4.0f) || !(fabsf(qt.t.x) < 10.0f && fabsf(qt.t.y) < 10.0f && fabsf(qt.t.z) < 10.0f))
+            return;
+        const Quat q = qt.q.GetNormalized();
+        // Same convention as Ang3(Quat) (XYZ), with the asin argument clamped so float error cannot make a NaN.
+        const float sy = clamp_tpl(-(q.v.x * q.v.z - q.w * q.v.y) * 2.0f, -1.0f, 1.0f);
+        Ang3 a;
+        a.y = asinf(sy);
+        if (fabsf(fabsf(a.y) - gf_PI * 0.5f) < 0.01f)
+        {
+            a.x = 0.0f;
+            a.z = atan2f(-2.0f * (q.v.x * q.v.y - q.w * q.v.z), 1.0f - (q.v.x * q.v.x + q.v.z * q.v.z) * 2.0f);
+        }
+        else
+        {
+            a.x = atan2f((q.v.y * q.v.z + q.w * q.v.x) * 2.0f, 1.0f - (q.v.x * q.v.x + q.v.y * q.v.y) * 2.0f);
+            a.z = atan2f((q.v.x * q.v.y + q.w * q.v.z) * 2.0f, 1.0f - (q.v.z * q.v.z + q.v.y * q.v.y) * 2.0f);
+        }
+        posX = qt.t.x; posY = qt.t.y; posZ = qt.t.z;
         pitch = RAD2DEG(a.x); roll = RAD2DEG(a.y); yaw = RAD2DEG(a.z);
+    }
+    //! Replaces every non-finite field with the given fallback. Returns true if anything was fixed.
+    bool Sanitize(const PoseOffset& fallback)
+    {
+        bool fixed = false;
+        for (int i = 0; i < 6; i++)
+        {
+            float& v = Axis(i);
+            if (!(fabsf(v) < 1e30f)) { v = const_cast<PoseOffset&>(fallback).Axis(i); fixed = true; }
+        }
+        return fixed;
     }
 };
 
@@ -46,6 +75,8 @@ struct PoseOffset
 struct ViewmodelSettings
 {
     int enabled = 1;            //!< Master switch for position/rotation offsets.
+    int bypass = 0;             //!< Vanilla viewmodel: switches off every viewmodel feature (offsets, ironsights, feel, weapon FOV,
+                                //!< convergence, wall pull-back, spread) but keeps the reticle, world FOV and sprint sensitivity.
 
     PoseOffset base;            //!< Global standing offset, applied to all weapons.
 
@@ -105,6 +136,46 @@ struct ViewmodelSettings
     int   sprintSensEnabled = 0;//!< Override the look-sensitivity scale the game applies while sprinting.
     float sprintSensScale = 1.0f; //!< 1 = same sensitivity as walking.
 
+    // --- Feel: sprint pose --------------------------------------------------------------------
+    int   sprintPoseEnabled = 1;    //!< Lower / tilt the weapon while sprinting.
+    PoseOffset sprint;              //!< Sprint offset (added to standing / crouch, all weapons). Set in ctor below.
+    float sprintBlendIn = 0.29f;    //!< seconds to reach the sprint pose
+    float sprintBlendOut = 0.20f;   //!< seconds to return from it
+    int   sprintBlocksAim = 1;      //!< No aiming down sights while sprinting (the aim resumes when you stop).
+    int   sprintSwayEnabled = 1;    //!< Extra procedural sway while sprinting (on top of the game's own).
+    float sprintSwayPos = 0.012f;   //!< meters (side to side; the vertical part is 60 % of it, twice the rate)
+    float sprintSwayRot = 1.5f;     //!< degrees of roll (pitch is 40 % of it)
+    float sprintSwayFreq = 2.3f;    //!< Hz (one full side-to-side cycle = two steps)
+
+    // --- Feel: sway and settle while aiming ------------------------------------------------------
+    int   aimSwayEnabled = 1;       //!< Slow figure-eight sway of the sights while aiming.
+    float aimSwayPos = 0.0005f;     //!< meters at rest
+    float aimSwayRot = 0.05f;       //!< degrees at rest (this is what moves the sights off the crosshair)
+    float aimSwayFreq = 0.14f;      //!< Hz of the slow axis
+    float aimSwayInitial = 1.5f;    //!< amplitude multiplier at the moment the sights come up ...
+    float aimSwaySettleTime = 0.1f; //!< ... decaying to 1 with this time constant (seconds)
+    float aimSwayMoveMult = 2.0f;   //!< extra amplitude at walking speed (added: 1 + mult * speed/walk)
+    float aimSwaySprintPenalty = 2.0f; //!< extra amplitude right after sprinting ...
+    float aimSwaySprintRecover = 1.25f; //!< ... decaying with this time constant (seconds)
+    int   steadyEnabled = 0;        //!< Hold a key to steady the sights.
+    int   steadyKey = 41;           //!< EKeyId (0 = none); 41 = left Alt
+    float steadyReduce = 0.85f;     //!< sway reduction while steady (0..1)
+    float steadyDuration = 4.0f;    //!< seconds you can hold your breath
+    float steadyRecover = 3.0f;     //!< seconds to recover a full breath
+    int   steadyConsumeKey = 0;
+
+    // --- Feel: view drag (GoldenEye style) --------------------------------------------------------
+    int   dragEnabled = 1;          //!< The weapon follows the camera with a spring: turning drags it along / behind.
+    int   dragLead = 0;             //!< 1 = the weapon leads into the turn (GoldenEye), 0 = it lags behind.
+    float dragPos = 0.007f;         //!< meters of offset per rad/s of turn rate
+    float dragRot = 1.5f;           //!< degrees of rotation per rad/s of turn rate
+    float dragStiffness = 9.0f;     //!< spring stiffness (how quickly it reacts and returns)
+    float dragDamping = 0.85f;      //!< damping ratio (1 = no overshoot, lower = a little wobble)
+    float dragMaxPos = 0.035f;      //!< meters
+    float dragMaxRot = 5.0f;        //!< degrees
+    float dragAimScale = 0.05f;     //!< how much of it survives while aiming (0..1)
+    float dragPitchScale = 0.7f;    //!< pitch (look up/down) relative to yaw
+
     int   fovEnabled = 1;       //!< Master switch for the weapon (near-scene) FOV override.
     float fov = 55.0f;          //!< Weapon FOV in degrees. Stock game uses 55.
 
@@ -115,6 +186,41 @@ struct ViewmodelSettings
     // Not persisted: render-time placement self-test (moves the weapon/hands by this much, always).
     float testOffsetUp = 0.0f;  //!< meters
     int   testHands = 1;
+
+    ViewmodelSettings()
+    {
+        sprint.posX = 0.02f; sprint.posY = -0.05f; sprint.posZ = -0.0671f;
+        sprint.pitch = -6.76f; sprint.yaw = 9.57f; sprint.roll = 10.0f;
+    }
+};
+
+//! Per-frame state of the procedural "feel" layer (sprint pose, aim sway, view drag).
+struct FeelState
+{
+    bool sprinting = false;
+    float sprintBlend = 0.0f;       //!< 0..1
+    float timeSinceSprint = 1e9f;   //!< seconds since sprinting stopped
+    float sprintPhase = 0.0f;       //!< radians
+    float speed = 0.0f;             //!< horizontal speed (m/s)
+    float speedNorm = 0.0f;         //!< speed / walking speed, clamped 0..1.5
+
+    float aimTime = 0.0f;           //!< seconds since the sights started coming up (0 while not aiming)
+    float swayPhase = 0.0f;         //!< radians
+    float swayAmplitude = 0.0f;     //!< debug: current multiplier on the rest amplitude
+    bool steadyHeld = false;
+    float steadyLeft = 0.0f;        //!< seconds of breath left (init from settings)
+    bool steadyActive = false;
+
+    // View drag: spring state, x = yaw axis, y = pitch axis (units: rad/s of "felt" turn rate)
+    float dragX = 0.0f, dragY = 0.0f, dragVX = 0.0f, dragVY = 0.0f;
+    float lastYaw = 0.0f, lastPitch = 0.0f; bool lastLookValid = false;
+    float yawRate = 0.0f, pitchRate = 0.0f; //!< debug (rad/s)
+
+    // Outputs of this frame (view space: x right, y forward, z up; degrees)
+    PoseOffset sprintOut;           //!< sprint pose + sprint sway, already scaled by the sprint blend
+    PoseOffset dragHipOut;          //!< view drag while not aiming
+    PoseOffset dragAimOut;          //!< view drag while aiming (scaled)
+    PoseOffset swayOut;             //!< aim sway (unscaled by the aim blend; the blend happens in the pipeline)
 };
 
 //! Per-weapon settings (keyed by entity class name, stored in Vee.ViewmodelTweaks.weapons.xml).
@@ -169,10 +275,13 @@ struct AimLockState
     bool addValid = false;
     QuatT lastAdd = QuatT(IDENTITY);        //!< additive pushed last frame (model space: t added, q pre-multiplied)
     QuatT animIk = QuatT(IDENTITY);         //!< reconstructed animated IK joint of last frame (model space)
+    QuatT animRelCam = QuatT(IDENTITY);     //!< the same, relative to that frame's camera (live hip reference for the blend)
+    bool animRelCamValid = false;
     bool animRestValid = false;
     QuatT animRestRelCam = QuatT(IDENTITY); //!< slow reference of the animated hand relative to the camera
     QuatT kick = QuatT(IDENTITY);           //!< this frame's kick (hand-local), already scaled and gated
     float kickPos = 0.0f, kickRot = 0.0f;   //!< debug: magnitude of the raw deviation
+    int pushesNotApplied = 0;               //!< debug: frames where the skeleton did not apply our additive
 };
 
 //! Runtime state of the render-time placement (runs after ArkPlayerCamera::UpdateView, when the
@@ -302,9 +411,15 @@ public:
     //! Called right after ArkPlayerCamera::UpdateView computed this frame's camera (render side).
     void OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params);
     void OnWeaponFired(CArkWeapon* pWeapon);
+    void UpdateFeel(float dt, ArkPlayer* pPlayer);      //!< sprint pose / aim sway / view drag state (MainUpdate)
+    void SanitizeFeel();                                 //!< resets the feel state if any number went bad
+    void SanitizeSettings();                             //!< replaces non-finite persisted settings with defaults
+    QuatT ComputeAimLocal() const;                       //!< weapon-local extras applied after the aim pose (sway, drag)
+    const FeelState& GetFeel() const { return m_feel; }
+    bool Active() const { return m_settings.enabled != 0 && m_settings.bypass == 0; } //!< viewmodel features on
 
     //! Procedural weapon offsets captured from the game this frame (view space).
-    void SetGameOffset(int which, const QuatT& q) { m_gameOffsets[which] = q; }
+    void SetGameOffset(int which, const QuatT& q);
 
     //! Shotgun spread multiplier for the given weapon (1 = unchanged).
     float GetSpreadMultiplier(const CArkItem* pWeapon);
@@ -379,6 +494,9 @@ private:
     float m_prevCamRecoilTime = 0.0f;
     float m_prevRecoilMag = 0.0f;
     int m_shotsSeen = 0;
+    mutable int m_nanRecoveries = 0;    //!< how often a bad number was caught and reset (debug)
+    FeelState m_feel;
+    bool m_waitingForSteadyKey = false;
     bool m_shotPending = false;         //!< CArkWeapon::FireWeapon ran for the player's weapon since the last camera update
     int m_spreadHookCalls = 0;
 

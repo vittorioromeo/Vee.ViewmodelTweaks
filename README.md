@@ -11,6 +11,10 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
 * **Weapon feel.** Head-bob coupling (still sights or a little lag), the game's procedural recoil and the
   fire animation's own kick while aiming (both per weapon), a per-shot coupling boost, and bullet-spread
   multipliers for aiming vs hip fire on the pistol and shotgun (the only weapons with spread).
+* **Feel.** A sprint pose (the weapon drops and tilts while you run, with extra sway; optionally no aiming
+  while sprinting), sway and settle while aiming (a slow figure-eight that is large when the sights come
+  up, after sprinting or while moving, and calms down as you hold still; a hold-breath key), and GoldenEye
+  style view drag (the weapon follows your turns on a spring, leading or lagging).
 * **Viewmodel.** Global standing and crouch offsets, per-weapon hip offsets, weapon FOV (the stock 55 is
   fixed in vanilla), world FOV, sprint look-sensitivity.
 * **Hip fire helpers.** Weapon convergence (the barrel points at what the crosshair is over), wall pull-back
@@ -48,6 +52,7 @@ frozen so you can drag sliders with the game running; press F1 again to play.
 * **Global** - standing / crouch offsets for all weapons, convergence and wall pull-back tuning.
 * **Weapon** - the equipped weapon: hip offset, aim pose, allow aiming, wall pull-back distance, firing
   feel, bullet spread. Built-in defaults exist for every stock weapon; "Reset to built-in" gets them back.
+* **Feel** - sprint pose, sway & settle while aiming (with the hold-breath key), view drag.
 * **Aim** - key binding, transition time, zoom, ironsight motion (head-bob coupling, recoil, sway), sensitivity.
 * **FOV**, **Nudge keys**, **Options**.
 
@@ -60,6 +65,18 @@ frozen so you can drag sliders with the game running; press F1 again to play.
 3. Or turn on **Nudge keys** and use I/J/K/L/U/O (hold H to rotate, N for slow) without the window.
 
 Poses are saved per weapon automatically (`Prey/Mods/config/Vee.ViewmodelTweaks.weapons.xml`).
+
+### Before / after comparisons
+
+*Vanilla viewmodel* (top of the window, also in Quick Settings, `vm_bypass`) switches every viewmodel feature off at
+once - offsets, ironsights, feel, weapon FOV, convergence, wall pull-back, spread - and keeps only the reticle,
+world FOV and sprint-sensitivity settings. Your values are kept; untick to get everything back.
+
+### Sway and the reticle
+
+The aim sway's rotation moves the sights off the crosshair. With *Hide reticle while aiming* on (the default)
+that is real inaccuracy: shots go where the camera points, so time them for the calm part of the sway or hold
+your breath. With the reticle visible the sway is only cosmetic.
 
 ### Console
 

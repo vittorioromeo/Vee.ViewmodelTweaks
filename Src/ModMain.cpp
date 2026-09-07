@@ -173,7 +173,7 @@ static void CProceduralWeaponAnimationContext_Update_Hook(void* _this, float tim
     // user offset does not pop off during jump/land animations. The pose stacks are simply
     // empty in that case, so the game contributes nothing extra.
     bool forced = false;
-    if (gMod && gMod->GetSettings().enabled && instanceCount < 1 && !modifierNull)
+    if (gMod && gMod->Active() && instanceCount < 1 && !modifierNull)
     {
         instanceCount = 1;
         forced = true;
@@ -203,7 +203,7 @@ static void CProceduralWeaponAnimation_Update_Hook(void* _this, float deltaTime)
     gMod->GetDiag().pwaUpdatesThisFrame++;
 
     const ViewmodelSettings& s = gMod->GetSettings();
-    if (!s.enabled)
+    if (!gMod->Active())
         return;
 
     // Leave the designer debug tool (g_debugWeaponOffset 2) alone.
@@ -308,6 +308,49 @@ static inline float SmoothStep01(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
+// --- Numeric sanity -------------------------------------------------------------------------------
+// Cheap checks used at the boundaries of the pipeline (what we read from the game, what we write back)
+// and on every accumulated state. A NaN compares false with everything, so "!(x < limit)" catches it.
+static inline bool Finite(float v) { return fabsf(v) < 1e30f; } // false for NaN and inf
+static inline bool Finite(const Vec3& v) { return Finite(v.x) && Finite(v.y) && Finite(v.z); }
+static inline bool SaneQuat(const Quat& q)
+{
+    const float n2 = q.w * q.w + q.v.x * q.v.x + q.v.y * q.v.y + q.v.z * q.v.z;
+    return n2 > 0.25f && n2 < 4.0f; // false for NaN
+}
+static inline bool SaneQuatT(const QuatT& t, float maxPos = 100.0f)
+{
+    return SaneQuat(t.q) && Finite(t.t) && t.t.GetLengthSquared() < maxPos * maxPos;
+}
+static inline Quat SafeNormalized(const Quat& q)
+{
+    return SaneQuat(q) ? q.GetNormalized() : Quat(IDENTITY);
+}
+//! Euler angles of a (possibly slightly denormalized) quaternion without the asin() domain hazard.
+static Ang3 SafeAng3(const Quat& qIn)
+{
+    const Quat q = SafeNormalized(qIn);
+    Ang3 a;
+    const float sy = clamp_tpl(-(q.v.x * q.v.z - q.w * q.v.y) * 2.0f, -1.0f, 1.0f);
+    a.y = asinf(sy);
+    if (fabsf(fabsf(a.y) - gf_PI * 0.5f) < 0.01f)
+    {
+        a.x = 0.0f;
+        a.z = atan2f(-2.0f * (q.v.x * q.v.y - q.w * q.v.z), 1.0f - (q.v.x * q.v.x + q.v.z * q.v.z) * 2.0f);
+    }
+    else
+    {
+        a.x = atan2f((q.v.y * q.v.z + q.w * q.v.x) * 2.0f, 1.0f - (q.v.x * q.v.x + q.v.y * q.v.y) * 2.0f);
+        a.z = atan2f((q.v.x * q.v.y + q.w * q.v.z) * 2.0f, 1.0f - (q.v.z * q.v.z + q.v.y * q.v.y) * 2.0f);
+    }
+    return a;
+}
+static inline bool SanePose(const PoseOffset& p)
+{
+    return Finite(p.posX) && Finite(p.posY) && Finite(p.posZ) && Finite(p.pitch) && Finite(p.yaw) && Finite(p.roll)
+        && fabsf(p.posX) < 10.0f && fabsf(p.posY) < 10.0f && fabsf(p.posZ) < 10.0f;
+}
+
 //! Moves `value` towards `target` so that a full 0->1 trip takes `time` seconds.
 static inline void MoveTowards(float& value, float target, float time, float dt)
 {
@@ -346,9 +389,10 @@ static const char* GetWeaponClassName(ArkPlayer* pPlayer)
 
 static QuatT BlendQuatT(const QuatT& a, const QuatT& b, float t)
 {
+    t = clamp_tpl(t, 0.0f, 1.0f);
     QuatT r;
     r.t = LERP(a.t, b.t, t);
-    r.q = Quat::CreateNlerp(a.q, b.q, t);
+    r.q = SafeNormalized(Quat::CreateNlerp(a.q, b.q, t));
     return r;
 }
 
@@ -360,9 +404,25 @@ float ModMain::Now() const
 //---------------------------------------------------------------------------------
 // Additive offsets (global standing / crouch + per-weapon hip + legacy aim)
 //---------------------------------------------------------------------------------
+void ModMain::SetGameOffset(int which, const QuatT& q)
+{
+    if (which < 0 || which > 3)
+        return;
+    if (SaneQuatT(q, 5.0f))
+        m_gameOffsets[which] = q;
+    else
+    {
+        m_gameOffsets[which] = QuatT(IDENTITY);
+        m_nanRecoveries++;
+    }
+}
+
 void ModMain::ApplyOffset(QuatT& offset) const
 {
     const ViewmodelSettings& s = m_settings;
+    if (!SaneQuatT(offset, 10.0f))
+        return; // the game's own offset is bad this frame: leave it alone
+    const QuatT original = offset;
 
     const float ab = s.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f;
     float cb = s.crouchEnabled ? SmoothStep01(m_crouchBlend) : 0.0f;
@@ -374,6 +434,12 @@ void ModMain::ApplyOffset(QuatT& offset) const
         total.AddScaled(s.crouch, cb);
     if (const WeaponSettings* pW = FindCurrentWeapon())
         total.AddScaled(pW->hip, 1.0f);
+    // Feel layer (hip side): sprint pose + sprint sway, view drag. Both fade out as the sights come up;
+    // the aim side has its own versions.
+    if (SanePose(m_feel.sprintOut))
+        total.AddScaled(m_feel.sprintOut, 1.0f - ab);   // already faded to zero when the feature is off
+    if (SanePose(m_feel.dragHipOut))
+        total.AddScaled(m_feel.dragHipOut, 1.0f - ab);
 
     const Quat userRot = total.Rot();
     const Vec3 userPos = total.Pos();
@@ -395,7 +461,12 @@ void ModMain::ApplyOffset(QuatT& offset) const
         const Quat conv = Quat::CreateRotationXYZ(Ang3(DEG2RAD(m_convergePitch * k), 0.0f, DEG2RAD(m_convergeYaw * k)));
         offset.q = conv * offset.q;
     }
-    offset.q.Normalize();
+    offset.q = SafeNormalized(offset.q);
+    if (!SaneQuatT(offset, 10.0f))
+    {
+        offset = original; // never hand the game a bad transform
+        m_nanRecoveries++;
+    }
 }
 
 //---------------------------------------------------------------------------------
@@ -443,10 +514,10 @@ void ModMain::OnProceduralContextSeen(void* pContext, int instanceCount, bool fo
 //---------------------------------------------------------------------------------
 static QuatT ScaleQuatT(const QuatT& q, float k)
 {
-    if (k <= 0.0f) return QuatT(IDENTITY);
+    if (!(k > 0.0f) || !SaneQuatT(q)) return QuatT(IDENTITY);
     if (fabsf(k - 1.0f) < 1e-4f) return q;
     QuatT r;
-    Ang3 a(q.q);
+    const Ang3 a = SafeAng3(q.q);
     r.q = Quat::CreateRotationXYZ(Ang3(a.x * k, a.y * k, a.z * k));
     r.t = q.t * k;
     return r;
@@ -455,7 +526,7 @@ static QuatT ScaleQuatT(const QuatT& q, float k)
 float ModMain::GetLockBlend() const
 {
     const ViewmodelSettings& s = m_settings;
-    if (!s.enabled || !s.aimEnabled)
+    if (!Active() || !s.aimEnabled)
         return 0.0f;
     if (m_playerDead || m_reviveGuard > 0.0f)
         return 0.0f; // death model / model reload: attachments and joints are being recreated
@@ -533,13 +604,33 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     void* pSkelPose = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose);
     if (!pSkelPose)
         return;
-    L.ikAbs = *VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, L.rightIkJoint);
+    const QuatT* pIkAbs = VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, L.rightIkJoint);
+    if (!pIkAbs || !SaneQuatT(*pIkAbs))
+    {
+        // Skeleton not evaluated yet (first frames after a load) or garbage: do nothing this frame.
+        L.active = false;
+        L.captured = false;
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
+        m_nanRecoveries += pIkAbs ? 1 : 0;
+        return;
+    }
+    L.ikAbs = *pIkAbs;
     // "Weapon" here means the weapon attachment (what gets rendered and what the render side places),
     // read from the game's values of the previous frame (before the render side moved the hands).
-    if (R.attOffsetValid)
+    if (R.attOffsetValid && SaneQuatT(R.weaponBoneGame) && SaneQuatT(R.attOffset))
         L.weaponAbs = R.weaponBoneGame * R.attOffset;
     else
         L.weaponAbs = pPlayer->GetBoneTransform(BONE_WEAPON);
+    if (!SaneQuatT(L.weaponAbs))
+    {
+        L.active = false;
+        L.captured = false;
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
+        m_nanRecoveries++;
+        return;
+    }
     L.ikErr = (L.ikAbs.t - L.lastTarget.t).GetLength();
 
     const float ab = L.charMatches ? GetLockBlend() : 0.0f;
@@ -547,33 +638,49 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     // --- Fire animation pass-through -------------------------------------------------------------
     // The animated (pre-modifier) hand of last frame = last frame's final hand minus what we added to it.
     {
-        const QuatT finalIk = R.ikGameValid ? R.ikGame : L.ikAbs;
+        const QuatT finalIk = (R.ikGameValid && SaneQuatT(R.ikGame)) ? R.ikGame : L.ikAbs;
         QuatT anim = finalIk;
         if (L.addValid)
         {
-            anim.t -= L.lastAdd.t;
-            anim.q = (!L.lastAdd.q) * anim.q;
-            anim.q.Normalize();
+            // Only subtract our add if the skeleton actually applied it: the animation update can be skipped
+            // (pause menu, character not updated) while this hook still runs, and subtracting a push that never
+            // happened would make the next push grow without bound. Test: the final hand must be near
+            // "last animated hand + our add".
+            // Two hypotheses for last frame's final hand: "animated + our add" (applied) or "animated only"
+            // (the queue did not run). Pick the closer one; the error is then at most the smaller of the two.
+            const Vec3 expected = L.animIk.t + L.lastAdd.t;
+            const float dApplied = (finalIk.t - expected).GetLengthSquared();
+            const float dSkipped = (finalIk.t - L.animIk.t).GetLengthSquared();
+            if (dApplied <= dSkipped && dApplied < 0.15f * 0.15f)
+            {
+                anim.t -= L.lastAdd.t;
+                anim.q = SafeNormalized((!L.lastAdd.q) * anim.q);
+            }
+            else
+                L.pushesNotApplied++;
         }
         L.animIk = anim;
         // Relative to the camera of that frame, so head motion does not count as hand motion.
-        const QuatT animRelCam = L.camAbs.GetInverted() * anim;
-        const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.016f;
-        if (!L.animRestValid || (animRelCam.t - L.animRestRelCam.t).GetLengthSquared() > 0.5f * 0.5f || !R.camValid)
+        const QuatT animRelCam = SaneQuatT(L.camAbs) ? (L.camAbs.GetInverted() * anim) : QuatT(IDENTITY);
+        L.animRelCam = animRelCam;
+        L.animRelCamValid = R.camValid && L.addValid && SaneQuatT(L.camAbs) && SaneQuatT(animRelCam, 5.0f);
+        const float dt = clamp_tpl((gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.016f, 0.0f, 0.1f);
+        const bool restBad = !L.animRestValid || !SaneQuatT(L.animRestRelCam, 5.0f) || !SaneQuatT(animRelCam, 5.0f)
+            || !((animRelCam.t - L.animRestRelCam.t).GetLengthSquared() < 0.5f * 0.5f) || !R.camValid;
+        if (restBad)
         {
             L.animRestRelCam = animRelCam;
-            L.animRestValid = R.camValid;
+            L.animRestValid = R.camValid && SaneQuatT(animRelCam, 5.0f);
         }
         else if (m_fireTimer <= 0.0f)
         {
             // Slow reference; frozen while a shot plays out so the kick is measured against the pose before it.
             const float k = 1.0f - expf(-dt / 0.35f);
             L.animRestRelCam = BlendQuatT(L.animRestRelCam, animRelCam, k);
-            L.animRestRelCam.q.Normalize();
         }
-        QuatT dev = L.animRestRelCam.GetInverted() * animRelCam; // hand-local deviation
-        dev.q.Normalize();
-        L.kickPos = dev.t.GetLength();
+        QuatT dev = L.animRestValid ? (L.animRestRelCam.GetInverted() * animRelCam) : QuatT(IDENTITY); // hand-local deviation
+        dev.q = SafeNormalized(dev.q);
+        L.kickPos = Finite(dev.t) ? dev.t.GetLength() : 1e9f;
         L.kickRot = 2.0f * acosf(clamp_tpl(fabsf(dev.q.w), 0.0f, 1.0f));
         const WeaponSettings* pW = FindCurrentWeapon();
         const float T = (pW && pW->fireCouplingTime > 0.05f) ? pW->fireCouplingTime : 0.3f;
@@ -585,38 +692,33 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
             // dev is the hand's motion in the hand's own axes. The weapon rides rigidly on the hand
             // (weapon = hand * weaponRel), so the same motion in the weapon's axes is weaponRel^-1 * dev * weaponRel.
             QuatT kickW = L.weaponRel.GetInverted() * dev * L.weaponRel;
-            kickW.q.Normalize();
-            L.kick = ScaleQuatT(kickW, scale);
+            kickW.q = SafeNormalized(kickW.q);
+            L.kick = SaneQuatT(kickW, 1.0f) ? ScaleQuatT(kickW, scale) : QuatT(IDENTITY);
         }
         else
             L.kick = QuatT(IDENTITY);
     }
 
     IEntity* pEnt = pPlayer->GetEntity();
-    Quat entRot = pEnt->GetWorldRotation();
-    entRot.Normalize();
-    const Quat freshRot = pPlayer->m_camera.m_rotation; // this frame's view rotation (updated in PrePhysicsUpdate)
+    const Quat entRot = SafeNormalized(pEnt->GetWorldRotation());
+    const Quat freshRot = SafeNormalized(pPlayer->m_camera.m_rotation); // this frame's view rotation (updated in PrePhysicsUpdate)
 
     // Best available camera for this frame: last frame's exact camera (position in model space is
     // frame-independent; a frame of head motion is a millimetre) with this frame's mouse look applied.
     // Nothing here is filtered or integrated; the render-side step below fixes whatever is left.
-    QuatT camAbs;
-    if (R.camValid)
+    QuatT camAbs(IDENTITY);
+    if (R.camValid && SaneQuat(R.freshRotAtCam) && SaneQuat(R.camWorldRot) && Finite(R.camModelPos))
     {
-        Quat delta = freshRot * (!R.freshRotAtCam);
-        delta.Normalize();
-        Quat camRotWorld = delta * R.camWorldRot;
-        camRotWorld.Normalize();
-        camAbs.q = (!entRot) * camRotWorld;
-        camAbs.q.Normalize();
+        const Quat delta = SafeNormalized(freshRot * (!R.freshRotAtCam));
+        const Quat camRotWorld = SafeNormalized(delta * R.camWorldRot);
+        camAbs.q = SafeNormalized((!entRot) * camRotWorld);
         camAbs.t = R.camModelPos;
     }
     else
     {
         const QuatT camBone = pPlayer->GetBoneTransform(BONE_CAMERA);
-        camAbs.q = (!entRot) * freshRot;
-        camAbs.q.Normalize();
-        camAbs.t = camBone.t;
+        camAbs.q = SafeNormalized((!entRot) * freshRot);
+        camAbs.t = Finite(camBone.t) ? camBone.t : Vec3(0.0f, 0.0f, 1.6f);
     }
 
     PushAimLock(pModifier, camAbs, L.ikAbs, L.weaponAbs, ab);
@@ -640,9 +742,20 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
 
     if (!L.captured || L.weaponClass != m_currentWeaponClass)
     {
+        const QuatT hipRel = camAbs.GetInverted() * ikAbs;       // where the hand is now, relative to the camera
+        const QuatT weaponRel = ikAbs.GetInverted() * weaponBone; // hand -> weapon bone, assumed rigid
+        if (!SaneQuatT(hipRel, 5.0f) || !SaneQuatT(weaponRel, 5.0f))
+        {
+            // Not a usable pose (skeleton still settling): try again next frame, push nothing.
+            L.active = false;
+            L.addValid = false;
+            L.kick = QuatT(IDENTITY);
+            m_nanRecoveries++;
+            return;
+        }
         if (!L.active)
-            L.hipRel = camAbs.GetInverted() * ikAbs; // where the hand was when aiming started
-        L.weaponRel = ikAbs.GetInverted() * weaponBone; // hand -> weapon bone, assumed rigid
+            L.hipRel = hipRel;
+        L.weaponRel = weaponRel;
         L.weaponClass = m_currentWeaponClass;
         L.captured = true;
         L.animRestValid = false;
@@ -650,11 +763,14 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
     L.active = true;
 
     const WeaponSettings& w = GetCurrentWeapon();
-    const QuatT desiredRelCam = ComputeAimExtra() * w.aim.AsQuatT() * L.kick;
+    const QuatT desiredRelCam = ComputeAimExtra() * w.aim.AsQuatT() * ComputeAimLocal() * L.kick;
 
     const QuatT aimWeaponAbs = camAbs * desiredRelCam;                  // where the weapon bone should be
     const QuatT aimIkAbs = aimWeaponAbs * L.weaponRel.GetInverted();    // -> where the hand IK target must be
-    const QuatT hipAbs = camAbs * L.hipRel;                             // hip pose, following the camera
+    // Hip side of the blend: the LIVE animated hand (last frame's, following the camera), not the pose
+    // captured when aiming started - so whatever the hip path does meanwhile (sprint pose, view drag,
+    // crouch) is what the weapon returns to, without a pop when the lock releases.
+    const QuatT hipAbs = camAbs * (L.animRelCamValid ? L.animRelCam : L.hipRel);
     QuatT target = BlendQuatT(hipAbs, aimIkAbs, ab);
     target.q.Normalize();
 
@@ -663,8 +779,16 @@ void ModMain::PushAimLock(void* pModifier, const QuatT& camAbs, const QuatT& ikA
     // animation velocity that leaves is fixed exactly on the render side.
     QuatT add;
     add.t = target.t - L.animIk.t;
-    add.q = target.q * (!L.animIk.q);
-    add.q.Normalize();
+    add.q = SafeNormalized(target.q * (!L.animIk.q));
+    // Never push anything unreasonable into the skeleton: a hand more than ~a metre from where the
+    // animation put it means our bookkeeping is off - drop this frame and start the additive chain afresh.
+    if (!SaneQuatT(target, 50.0f) || !Finite(add.t) || add.t.GetLengthSquared() > 1.0f * 1.0f)
+    {
+        L.addValid = false;
+        L.kick = QuatT(IDENTITY);
+        m_nanRecoveries++;
+        return;
+    }
     VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, L.rightIkJoint, OP_ADDITIVE, &add.t);
     VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, L.rightIkJoint, OP_ADDITIVE, &add.q);
     L.lastAdd = add;
@@ -764,6 +888,7 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         R.frameOfLastCall = m_frameIndex;
     }
     R.callsThisFrame++;
+    R.ikGameValid = false; // re-captured below when everything checks out; stale values must never survive an early return
 
     ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
     if (!pPlayer || pCamera != &pPlayer->m_camera || !pPlayer->GetEntity())
@@ -773,19 +898,34 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     // --- Exact camera of this frame, in model (entity) space -------------------------------------
     // With camera-space rendering (ENTITY_SLOT_RENDER_NEAREST on the arms) UpdateView returns the
     // position relative to the entity; CView adds the entity position afterwards. Detect the other case.
-    Quat entRot = pEnt->GetWorldRotation();
-    entRot.Normalize();
+    // Anything that is not a number (first frames of a load, a camera that has not been set up yet) means
+    // this frame is skipped and every accumulated state is invalidated rather than poisoned.
+    if (!SaneQuat(params.rotation) || !Finite(params.position) || !SaneQuat(pEnt->GetWorldRotation()) || !Finite(pEnt->GetWorldPos()))
+    {
+        R.camValid = false;
+        R.attachValid = false;
+        R.bobValid = false;
+        m_nanRecoveries++;
+        return;
+    }
+    const Quat entRot = SafeNormalized(pEnt->GetWorldRotation());
     Vec3 camPosRel = params.position;
     R.positionWasWorld = camPosRel.GetLengthSquared() > 20.0f * 20.0f;
     if (R.positionWasWorld)
         camPosRel -= pEnt->GetWorldPos();
-    Quat camRotWorld = params.rotation;
-    camRotWorld.Normalize();
+    const Quat camRotWorld = SafeNormalized(params.rotation);
 
     QuatT camModel;
-    camModel.q = (!entRot) * camRotWorld;
-    camModel.q.Normalize();
+    camModel.q = SafeNormalized((!entRot) * camRotWorld);
     camModel.t = (!entRot) * camPosRel;
+    if (!SaneQuatT(camModel, 50.0f))
+    {
+        R.camValid = false;
+        R.attachValid = false;
+        R.bobValid = false;
+        m_nanRecoveries++;
+        return;
+    }
     R.camModel = camModel;
 
     R.camWorldRot = camRotWorld;
@@ -797,7 +937,7 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
 
     // Head bob = camera motion minus its slow component (posture, crouch, lean, eye height).
     {
-        if (!R.bobValid || (camModel.t - R.camLowPass).GetLengthSquared() > 1.0f)
+        if (!R.bobValid || !Finite(R.camLowPass) || !((camModel.t - R.camLowPass).GetLengthSquared() < 1.0f))
         {
             R.camLowPass = camModel.t;
             R.bobValid = true;
@@ -856,13 +996,25 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         R.attachValid = false;
         return;
     }
-    R.attachValid = true;
     const QuatT gameModel = *pModelRel;
+    const QuatT weaponBone = pPlayer->GetBoneTransform(BONE_WEAPON);
+    if (!SaneQuatT(gameModel, 50.0f) || !SaneQuatT(weaponBone, 50.0f))
+    {
+        // The game's own values are not usable this frame (attachment being recreated, model reload):
+        // leave everything as the game has it and forget our references.
+        R.attachValid = false;
+        R.attOffsetValid = false;
+        R.hipValid = false;
+        R.ikGameValid = false;
+        m_nanRecoveries++;
+        return;
+    }
+    R.attachValid = true;
     R.weaponModelGame = gameModel;
     R.weaponRelCam = camModel.GetInverted() * gameModel;
     // Final (unmodified) weapon bone of this frame and its constant offset to the attachment, so the
     // skeleton-side push next frame targets the very same thing we place here.
-    R.weaponBoneGame = pPlayer->GetBoneTransform(BONE_WEAPON);
+    R.weaponBoneGame = weaponBone;
     R.attOffset = R.weaponBoneGame.GetInverted() * gameModel;
     R.attOffsetValid = true;
     R.ikGameValid = false;
@@ -872,7 +1024,7 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
             if (const QuatT* pIk = VCall<const QuatT*>(pSkelPose0, VT_ISkeletonPose_GetAbsJointByID, m_lock.rightIkJoint))
             {
                 R.ikGame = *pIk;
-                R.ikGameValid = true;
+                R.ikGameValid = SaneQuatT(R.ikGame, 50.0f);
             }
     }
 
@@ -892,25 +1044,36 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     if (ab > 0.0f && s.aimRenderLock)
     {
         const WeaponSettings& w = GetCurrentWeapon();
-        const QuatT aimRelCam = ComputeAimExtra() * w.aim.AsQuatT() * m_lock.kick;
+        const QuatT aimRelCam = ComputeAimExtra() * w.aim.AsQuatT() * ComputeAimLocal() * m_lock.kick;
         QuatT desiredRelCam = BlendQuatT(R.weaponRelCam, aimRelCam, ab);
         desiredRelCam.q.Normalize();
         desiredModel = camModel * desiredRelCam;
         changed = true;
     }
-    if (s.testOffsetUp != 0.0f)
+    if (Active() && s.testOffsetUp != 0.0f)
     {
         desiredModel.t += (camModel.q * Vec3(0.0f, 0.0f, s.testOffsetUp));
         changed = true;
     }
     if (!changed)
         return;
-    desiredModel.q.Normalize();
+    desiredModel.q = SafeNormalized(desiredModel.q);
+    if (!SaneQuatT(desiredModel, 50.0f) || !((desiredModel.t - gameModel.t).GetLengthSquared() < 2.0f * 2.0f))
+    {
+        // Our own numbers went bad (or absurd): leave the game's pose for this frame and restart the
+        // lock's accumulated state so the next frame begins from clean values.
+        m_lock.addValid = false;
+        m_lock.animRestValid = false;
+        m_lock.kick = QuatT(IDENTITY);
+        R.bobValid = false;
+        m_nanRecoveries++;
+        return;
+    }
     R.desiredModel = desiredModel;
 
     // Rigid delta that takes the game's weapon transform to ours (model space).
     QuatT D = desiredModel * gameModel.GetInverted();
-    D.q.Normalize();
+    D.q = SafeNormalized(D.q);
     R.residualPos = D.t.GetLength();
     {
         Quat dq = desiredModel.q * (!gameModel.q);
@@ -943,20 +1106,22 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     };
     for (int j : R.rightSubtree)
         if (QuatT* p = jointRef(j))
-            *p = D * (*p);
+            if (SaneQuatT(*p, 50.0f))
+                *p = D * (*p);
 
     R.leftOnWeapon = false;
     if (R.leftHand >= 0 && (s.aimLeftHandFollow || ab <= 0.0f))
     {
         if (QuatT* pl = jointRef(R.leftHand))
         {
-            R.leftHandDist = (pl->t - gameModel.t).GetLength();
+            R.leftHandDist = Finite(pl->t) ? (pl->t - gameModel.t).GetLength() : 1e9f;
             R.leftOnWeapon = R.leftHandDist < 0.35f;
         }
         if (R.leftOnWeapon)
             for (int j : R.leftSubtree)
                 if (QuatT* p = jointRef(j))
-                    *p = D * (*p);
+                    if (SaneQuatT(*p, 50.0f))
+                        *p = D * (*p);
     }
 }
 
@@ -967,7 +1132,7 @@ void ModMain::UpdateConvergence(float dt)
     const bool wantConverge = s.convergeEnabled != 0;
     const bool wantWall = s.wallPushEnabled != 0;
     const bool wantBlock = s.aimWallBlockEnabled != 0 && s.aimEnabled != 0;
-    if (!s.enabled || (!wantConverge && !wantWall && !wantBlock) || !gEnv || !gEnv->pPhysicalWorld || !gEnv->pSystem)
+    if (!Active() || (!wantConverge && !wantWall && !wantBlock) || !gEnv || !gEnv->pPhysicalWorld || !gEnv->pSystem)
     {
         m_convergeTargetYaw = m_convergeTargetPitch = 0.0f;
         m_convergeYaw = m_convergePitch = 0.0f;
@@ -992,15 +1157,15 @@ void ModMain::UpdateConvergence(float dt)
     const int n = gEnv->pPhysicalWorld->RayWorldIntersection(camPos, dir * maxDist, ent_all,
         rwi_stop_at_pierceable | rwi_colltype_any(geom_colltype_ray | geom_colltype0 | geom_colltype_player), &hit, 1, pSkip);
     m_convergeHit = (n > 0);
-    m_convergeDist = m_convergeHit ? hit.dist : maxDist;
+    m_convergeDist = (m_convergeHit && Finite(hit.dist)) ? hit.dist : maxDist;
 
     // --- Convergence: point the barrel at the impact point --------------------------------------
     float yaw = 0.0f, pitch = 0.0f;
     if (wantConverge)
     {
         // Weapon offset from the camera in view space (exact, measured at render time while not aiming).
-        const Vec3 w = m_render.hipRelCam.t;
-        const float d = max(m_convergeDist - w.y, 0.15f); // distance from roughly the weapon to the target
+        const Vec3 w = (m_render.hipValid && Finite(m_render.hipRelCam.t)) ? m_render.hipRelCam.t : Vec3(0.0f, 0.25f, -0.1f);
+        const float d = max((Finite(m_convergeDist) ? m_convergeDist : 100.0f) - w.y, 0.15f); // distance from roughly the weapon to the target
         yaw = RAD2DEG(atan2f(w.x, d));   // weapon right of the eye -> turn left (+yaw)
         pitch = RAD2DEG(atan2f(-w.z, d)); // weapon below the eye -> tilt up (+pitch)
         const float maxA = clamp_tpl(s.convergeMaxAngle, 0.0f, 45.0f);
@@ -1014,6 +1179,11 @@ void ModMain::UpdateConvergence(float dt)
         const float k = (tau > 0.0005f) ? (1.0f - expf(-dt / tau)) : 1.0f;
         m_convergeYaw += (yaw - m_convergeYaw) * k;
         m_convergePitch += (pitch - m_convergePitch) * k;
+        if (!Finite(m_convergeYaw) || !Finite(m_convergePitch))
+        {
+            m_convergeYaw = m_convergePitch = 0.0f;
+            m_nanRecoveries++;
+        }
     }
 
     // --- Wall pull-back: move the weapon towards the camera when something is close ------------
@@ -1033,6 +1203,11 @@ void ModMain::UpdateConvergence(float dt)
         const float tau = max(s.wallPushSmoothTime, 0.0f);
         const float k = (tau > 0.0005f) ? (1.0f - expf(-dt / tau)) : 1.0f;
         m_wallPush += (push - m_wallPush) * k;
+        if (!Finite(m_wallPush))
+        {
+            m_wallPush = 0.0f;
+            m_nanRecoveries++;
+        }
     }
 
     // --- Aim block: no ironsights while the weapon would be poking into the wall -----------------
@@ -1076,7 +1251,7 @@ float ModMain::GetAimSensitivityMultiplier(float currentMultiplier, float zoomed
 
 float ModMain::GetSpreadMultiplier(const CArkItem* pWeapon)
 {
-    if (!m_settings.enabled || !pWeapon)
+    if (!Active() || !pWeapon)
         return 1.0f;
     ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
     if (!pPlayer || !pPlayer->GetEntity() || pWeapon->GetOwnerId() != pPlayer->GetEntity()->GetId())
@@ -1092,7 +1267,8 @@ float ModMain::GetSpreadMultiplier(const CArkItem* pWeapon)
     const float ab = m_settings.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f;
     const float hip = clamp_tpl(pW->hipSpreadMult, 0.0f, 5.0f);
     const float ads = clamp_tpl(pW->aimSpreadMult, 0.0f, 5.0f);
-    return LERP(hip, ads, ab);
+    const float m = LERP(hip, ads, ab);
+    return Finite(m) ? clamp_tpl(m, 0.0f, 5.0f) : 1.0f;
 }
 
 //---------------------------------------------------------------------------------
@@ -1120,6 +1296,7 @@ void ModMain::UpdateBlendStates(float dt)
 
         const EStance stance = pPlayer->m_stance;
         crouching = (stance == EStance::STANCE_SNEAK || stance == EStance::STANCE_CRAWL);
+        m_feel.sprinting = !dead && pPlayer->m_movementFSM.IsSprinting();
 
         m_currentWeaponClass = GetWeaponClassName(pPlayer);
 
@@ -1127,13 +1304,15 @@ void ModMain::UpdateBlendStates(float dt)
         // character (no cursor on screen: menus, inventory, our own settings window...).
         const WeaponSettings* pW = FindCurrentWeapon();
         const bool weaponAllows = !m_currentWeaponClass.empty() && (!pW || pW->aimAllowed);
-        aiming = m_settings.aimEnabled && m_aimKeyHeld && weaponAllows && !m_mouseCaptured && !IsHardwareCursorVisible()
-                 && !(m_settings.aimWallBlockEnabled && m_aimBlockedByWall) && !dead && m_reviveGuard <= 0.0f;
+        aiming = Active() && m_settings.aimEnabled && m_aimKeyHeld && weaponAllows && !m_mouseCaptured && !IsHardwareCursorVisible()
+                 && !(m_settings.aimWallBlockEnabled && m_aimBlockedByWall) && !dead && m_reviveGuard <= 0.0f
+                 && !(m_settings.sprintPoseEnabled && m_settings.sprintBlocksAim && m_feel.sprinting);
     }
     else
     {
         m_aimKeyHeld = false;
         m_currentWeaponClass.clear();
+        m_feel.sprinting = false;
     }
 
     if (!aiming && m_settings.aimToggle && (IsHardwareCursorVisible() || !pPlayer))
@@ -1146,6 +1325,249 @@ void ModMain::UpdateBlendStates(float dt)
 
     MoveTowards(m_crouchBlend, crouching ? 1.0f : 0.0f, m_settings.crouchTime, dt);
     MoveTowards(m_aimBlend, aiming ? 1.0f : 0.0f, m_settings.aimTime, dt);
+    if (!Finite(m_crouchBlend)) { m_crouchBlend = 0.0f; m_nanRecoveries++; }
+    if (!Finite(m_aimBlend)) { m_aimBlend = 0.0f; m_nanRecoveries++; }
+}
+
+//---------------------------------------------------------------------------------
+// Feel: sprint pose, aim sway & settle, view drag. Pure state, evaluated once per frame; the outputs
+// are added in ApplyOffset (hip path) and ComputeAimLocal (aim path).
+//---------------------------------------------------------------------------------
+static inline float WrapAngle(float a)
+{
+    while (a > gf_PI) a -= 2.0f * gf_PI;
+    while (a < -gf_PI) a += 2.0f * gf_PI;
+    return a;
+}
+
+void ModMain::UpdateFeel(float dt, ArkPlayer* pPlayer)
+{
+    const ViewmodelSettings& s = m_settings;
+    FeelState& f = m_feel;
+    dt = clamp_tpl(dt, 0.0f, 0.1f);
+    if (!f.lastLookValid)
+        f.steadyLeft = s.steadyDuration; // first frame (or after a reset): a full breath
+
+    IEntity* pEnt = pPlayer ? pPlayer->GetEntity() : nullptr;
+    if (!pEnt)
+    {
+        f = FeelState();
+        f.steadyLeft = s.steadyDuration;
+        return;
+    }
+
+    // --- Player speed (horizontal) ---
+    f.speed = 0.0f;
+    if (IPhysicalEntity* pPhys = pEnt->GetPhysics())
+    {
+        pe_status_living living;
+        if (pPhys->GetStatus(&living) && Finite(living.vel))
+            f.speed = Vec2(living.vel.x, living.vel.y).GetLength();
+    }
+    f.speedNorm = clamp_tpl(f.speed / 3.0f, 0.0f, 1.5f);
+
+    // --- Sprint blend and phase ---
+    if (f.sprinting)
+        f.timeSinceSprint = 0.0f;
+    else
+        f.timeSinceSprint += dt;
+    const bool wantSprintPose = s.sprintPoseEnabled && f.sprinting;
+    MoveTowards(f.sprintBlend, wantSprintPose ? 1.0f : 0.0f, wantSprintPose ? s.sprintBlendIn : s.sprintBlendOut, dt);
+    f.sprintOut = PoseOffset();
+    if (f.sprintBlend > 0.0f)
+    {
+        f.sprintOut.AddScaled(s.sprint, f.sprintBlend);
+        if (s.sprintSwayEnabled)
+        {
+            f.sprintPhase = fmodf(f.sprintPhase + 2.0f * gf_PI * max(s.sprintSwayFreq, 0.01f) * dt, 2.0f * gf_PI);
+            const float k = f.sprintBlend;
+            PoseOffset sw;
+            sw.posX = s.sprintSwayPos * sinf(f.sprintPhase);
+            sw.posZ = s.sprintSwayPos * 0.6f * sinf(2.0f * f.sprintPhase);
+            sw.roll = s.sprintSwayRot * sinf(f.sprintPhase);
+            sw.pitch = s.sprintSwayRot * 0.4f * sinf(2.0f * f.sprintPhase + 0.5f);
+            f.sprintOut.AddScaled(sw, k);
+        }
+    }
+    else
+        f.sprintPhase = 0.0f;
+
+    // --- Aim sway & settle ---
+    f.swayOut = PoseOffset();
+    if (m_aimBlend > 0.0f)
+        f.aimTime += dt;
+    else
+        f.aimTime = 0.0f;
+    // Breath: held only while aiming and with breath left; recovers otherwise.
+    const bool wantSteady = s.steadyEnabled && f.steadyHeld && m_isAiming;
+    if (wantSteady && f.steadyLeft > 0.0f)
+    {
+        f.steadyActive = true;
+        f.steadyLeft = max(0.0f, f.steadyLeft - dt);
+    }
+    else
+    {
+        f.steadyActive = false;
+        if (s.steadyRecover > 0.01f)
+            f.steadyLeft = min(s.steadyDuration, f.steadyLeft + dt * s.steadyDuration / s.steadyRecover);
+        else
+            f.steadyLeft = s.steadyDuration;
+    }
+    if (s.aimSwayEnabled && m_aimBlend > 0.0f)
+    {
+        f.swayPhase = fmodf(f.swayPhase + 2.0f * gf_PI * max(s.aimSwayFreq, 0.01f) * dt, 2.0f * gf_PI);
+        float amp = 1.0f;
+        if (s.aimSwaySettleTime > 0.01f)
+            amp *= 1.0f + (max(s.aimSwayInitial, 1.0f) - 1.0f) * expf(-f.aimTime / s.aimSwaySettleTime);
+        amp *= 1.0f + s.aimSwayMoveMult * f.speedNorm;
+        if (s.aimSwaySprintRecover > 0.01f)
+            amp *= 1.0f + s.aimSwaySprintPenalty * expf(-f.timeSinceSprint / s.aimSwaySprintRecover);
+        if (f.steadyActive)
+            amp *= 1.0f - clamp_tpl(s.steadyReduce, 0.0f, 1.0f);
+        f.swayAmplitude = amp;
+        const float ph = f.swayPhase;
+        // Figure-eight: slow axis sideways, twice the rate vertically; the rotation is what moves the sights.
+        f.swayOut.posX = s.aimSwayPos * amp * sinf(ph);
+        f.swayOut.posZ = s.aimSwayPos * amp * 0.5f * sinf(2.0f * ph + 1.57f);
+        f.swayOut.yaw = s.aimSwayRot * amp * sinf(ph + 0.3f);
+        f.swayOut.pitch = s.aimSwayRot * amp * 0.6f * sinf(2.0f * ph);
+    }
+    else
+    {
+        f.swayAmplitude = 0.0f;
+        if (m_aimBlend <= 0.0f)
+            f.swayPhase = 0.0f;
+    }
+
+    // --- View drag (spring on the turn rate) ---
+    f.dragHipOut = PoseOffset();
+    f.dragAimOut = PoseOffset();
+    {
+        const Quat camQ = pPlayer->m_camera.m_rotation;
+        const bool lookOk = camQ.IsValid();
+        const Ang3 look = lookOk ? SafeAng3(camQ) : Ang3(ZERO);
+        const float yaw = look.z, pitch = look.x;
+        float dYaw = 0.0f, dPitch = 0.0f;
+        if (lookOk && f.lastLookValid && dt > 0.0f)
+        {
+            dYaw = WrapAngle(yaw - f.lastYaw);
+            dPitch = WrapAngle(pitch - f.lastPitch);
+        }
+        f.lastYaw = yaw; f.lastPitch = pitch; f.lastLookValid = lookOk;
+        // Ignore the one-frame jumps of teleports / loads (and anything that is not a number).
+        if (!(fabsf(dYaw) < DEG2RAD(60.0f)) || !(fabsf(dPitch) < DEG2RAD(60.0f)) || dt <= 0.0f)
+            f.yawRate = f.pitchRate = 0.0f;
+        else
+        {
+            f.yawRate = dYaw / dt;
+            f.pitchRate = dPitch / dt;
+        }
+        if (!(fabsf(f.dragX) < 1e3f) || !(fabsf(f.dragY) < 1e3f) || !(fabsf(f.dragVX) < 1e5f) || !(fabsf(f.dragVY) < 1e5f))
+            f.dragX = f.dragY = f.dragVX = f.dragVY = 0.0f; // never let a bad frame poison the spring
+
+        // The spring always runs (towards zero when disabled) so toggling the feature fades instead of snapping.
+        {
+            const float w = clamp_tpl(s.dragStiffness, 0.5f, 60.0f);
+            const float c = 2.0f * clamp_tpl(s.dragDamping, 0.1f, 2.0f) * w;
+            // Sub-step for stability at low frame rates.
+            const int n = max(1, (int)ceilf(dt / 0.008f));
+            const float h = dt / n;
+            const float tx = s.dragEnabled ? f.yawRate : 0.0f;
+            const float ty = s.dragEnabled ? f.pitchRate : 0.0f;
+            for (int i = 0; i < n; i++)
+            {
+                const float a1 = w * w * (tx - f.dragX) - c * f.dragVX;
+                f.dragVX += a1 * h; f.dragX += f.dragVX * h;
+                const float a2 = w * w * (ty - f.dragY) - c * f.dragVY;
+                f.dragVY += a2 * h; f.dragY += f.dragVY * h;
+            }
+            const float sign = s.dragLead ? 1.0f : -1.0f;
+            // Turning left = positive yaw rate. Leading: the weapon moves/turns left with it.
+            PoseOffset d;
+            d.posX = clamp_tpl(-sign * f.dragX * s.dragPos, -s.dragMaxPos, s.dragMaxPos);
+            d.posZ = clamp_tpl(sign * f.dragY * s.dragPos * s.dragPitchScale, -s.dragMaxPos, s.dragMaxPos);
+            d.yaw = clamp_tpl(sign * f.dragX * s.dragRot, -s.dragMaxRot, s.dragMaxRot);
+            d.pitch = clamp_tpl(sign * f.dragY * s.dragRot * s.dragPitchScale, -s.dragMaxRot, s.dragMaxRot);
+            f.dragHipOut = d;
+            f.dragAimOut = PoseOffset();
+            f.dragAimOut.AddScaled(d, clamp_tpl(s.dragAimScale, 0.0f, 1.0f));
+        }
+    }
+}
+
+void ModMain::SanitizeSettings()
+{
+    // Persisted numbers (cvars, weapons.xml) are the one place a bad value could come back session after
+    // session; anything that is not a number goes back to its default.
+    ViewmodelSettings& s = m_settings;
+    const ViewmodelSettings def;
+    int fixed = 0;
+    auto fixF = [&](float& v, float d) { if (!Finite(v)) { v = d; fixed++; } };
+    fixF(s.crouchTime, def.crouchTime); fixF(s.aimBobAmount, def.aimBobAmount); fixF(s.aimBobTau, def.aimBobTau);
+    fixF(s.aimAnimRecoil, def.aimAnimRecoil); fixF(s.aimAnimSway, def.aimAnimSway); fixF(s.aimSensScale, def.aimSensScale);
+    fixF(s.aimTime, def.aimTime); fixF(s.aimFov, def.aimFov); fixF(s.aimCameraZoomFactor, def.aimCameraZoomFactor);
+    fixF(s.nudgePosSpeed, def.nudgePosSpeed); fixF(s.nudgeRotSpeed, def.nudgeRotSpeed); fixF(s.reticleY, def.reticleY);
+    fixF(s.convergeStrength, def.convergeStrength); fixF(s.convergeMaxAngle, def.convergeMaxAngle);
+    fixF(s.convergeSmoothTime, def.convergeSmoothTime); fixF(s.convergeMaxDist, def.convergeMaxDist);
+    fixF(s.aimWallBlockScale, def.aimWallBlockScale); fixF(s.wallPushStartDist, def.wallPushStartDist);
+    fixF(s.wallPushFullDist, def.wallPushFullDist); fixF(s.wallPushSmoothTime, def.wallPushSmoothTime);
+    fixF(s.sprintBlendIn, def.sprintBlendIn); fixF(s.sprintBlendOut, def.sprintBlendOut);
+    fixF(s.sprintSwayPos, def.sprintSwayPos); fixF(s.sprintSwayRot, def.sprintSwayRot); fixF(s.sprintSwayFreq, def.sprintSwayFreq);
+    fixF(s.aimSwayPos, def.aimSwayPos); fixF(s.aimSwayRot, def.aimSwayRot); fixF(s.aimSwayFreq, def.aimSwayFreq);
+    fixF(s.aimSwayInitial, def.aimSwayInitial); fixF(s.aimSwaySettleTime, def.aimSwaySettleTime); fixF(s.aimSwayMoveMult, def.aimSwayMoveMult);
+    fixF(s.aimSwaySprintPenalty, def.aimSwaySprintPenalty); fixF(s.aimSwaySprintRecover, def.aimSwaySprintRecover);
+    fixF(s.steadyReduce, def.steadyReduce); fixF(s.steadyDuration, def.steadyDuration); fixF(s.steadyRecover, def.steadyRecover);
+    fixF(s.dragPos, def.dragPos); fixF(s.dragRot, def.dragRot); fixF(s.dragStiffness, def.dragStiffness); fixF(s.dragDamping, def.dragDamping);
+    fixF(s.dragMaxPos, def.dragMaxPos); fixF(s.dragMaxRot, def.dragMaxRot); fixF(s.dragAimScale, def.dragAimScale); fixF(s.dragPitchScale, def.dragPitchScale);
+    fixF(s.worldFov, def.worldFov); fixF(s.sprintSensScale, def.sprintSensScale); fixF(s.fov, def.fov);
+    if (s.base.Sanitize(def.base)) fixed++;
+    if (s.crouch.Sanitize(def.crouch)) fixed++;
+    if (s.sprint.Sanitize(def.sprint)) fixed++;
+    for (auto& kv : m_weapons)
+    {
+        WeaponSettings& w = kv.second;
+        const WeaponSettings* pB = WeaponSettings::BuiltIn(kv.first.c_str());
+        WeaponSettings d;
+        if (pB) d = *pB; else d.aim = WeaponSettings::DefaultAim();
+        if (w.hip.Sanitize(d.hip)) fixed++;
+        if (w.aim.Sanitize(d.aim)) fixed++;
+        fixF(w.wallPush, d.wallPush); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
+        fixF(w.aimRecoilScale, d.aimRecoilScale); fixF(w.aimKickScale, d.aimKickScale); fixF(w.aimSpreadMult, d.aimSpreadMult); fixF(w.hipSpreadMult, d.hipSpreadMult);
+    }
+    if (fixed > 0)
+    {
+        CryLog("ViewmodelTweaks: {} persisted setting(s) were not numbers and were reset to defaults", fixed);
+        m_nanRecoveries += fixed;
+    }
+}
+
+void ModMain::SanitizeFeel()
+{
+    FeelState& f = m_feel;
+    const bool ok = SanePose(f.sprintOut) && SanePose(f.swayOut) && SanePose(f.dragHipOut) && SanePose(f.dragAimOut)
+        && Finite(f.sprintBlend) && Finite(f.sprintPhase) && Finite(f.swayPhase) && Finite(f.aimTime) && Finite(f.steadyLeft)
+        && Finite(f.dragX) && Finite(f.dragY) && Finite(f.dragVX) && Finite(f.dragVY) && Finite(f.speed);
+    if (!ok)
+    {
+        const float breath = Finite(f.steadyLeft) ? f.steadyLeft : m_settings.steadyDuration;
+        f = FeelState();
+        f.steadyLeft = breath;
+        m_nanRecoveries++;
+    }
+}
+
+QuatT ModMain::ComputeAimLocal() const
+{
+    // Weapon-local (post-multiplied) extras: rotate in place around the weapon's pivot so the sights move
+    // off the crosshair, translate along the weapon's own axes.
+    PoseOffset total;
+    if (SanePose(m_feel.swayOut))
+        total.AddScaled(m_feel.swayOut, 1.0f);      // both are zero when their feature is off
+    if (SanePose(m_feel.dragAimOut))
+        total.AddScaled(m_feel.dragAimOut, 1.0f);
+    if (total.IsZero())
+        return QuatT(IDENTITY);
+    return total.AsQuatT();
 }
 
 void ModMain::UpdateCameraZoom(bool aiming)
@@ -1404,14 +1826,32 @@ bool ModMain::OnInputEvent(const SInputEvent& event)
         return false;
     }
 
+    if (m_waitingForSteadyKey)
+    {
+        if (pressed)
+        {
+            if (event.keyId != eKI_Escape)
+                m_settings.steadyKey = (int)event.keyId;
+            m_waitingForSteadyKey = false;
+            return true;
+        }
+        return false;
+    }
+    if (m_settings.steadyKey != 0 && (int)event.keyId == m_settings.steadyKey)
+    {
+        m_feel.steadyHeld = pressed;
+        if (Active() && m_settings.steadyEnabled && m_settings.steadyConsumeKey && (int)event.keyId != m_settings.aimKey)
+            return true;
+    }
+
     // Nudge keys (only while enabled). They are swallowed so the game does not react to them.
-    if (m_settings.nudgeKeys && event.deviceType == eIDT_Keyboard && !m_mouseCaptured && !IsHardwareCursorVisible())
+    if (Active() && m_settings.nudgeKeys && event.deviceType == eIDT_Keyboard && !m_mouseCaptured && !IsHardwareCursorVisible())
     {
         if (HandleNudgeKey(event.keyId, pressed))
             return true;
     }
 
-    if (!m_settings.aimEnabled || (int)event.keyId != m_settings.aimKey)
+    if (!Active() || !m_settings.aimEnabled || (int)event.keyId != m_settings.aimKey)
         return false;
 
     if (m_settings.aimToggle)
@@ -1460,7 +1900,7 @@ void ModMain::EnforceWeaponFov()
     if (zoom.m_nearFOVLockedCount != 0)
         return;
 
-    if (!m_settings.fovEnabled)
+    if (!m_settings.fovEnabled || m_settings.bypass)
     {
         // Put the stock value back once when the override gets disabled.
         if (m_lastAppliedFov >= 0.0f)
@@ -1679,6 +2119,7 @@ void ModMain::LoadWeapons()
         m_weapons[cls] = w;
     }
     CryLog("ViewmodelTweaks: loaded {} weapon entries from {}", m_weapons.size(), path.u8string());
+    SanitizeSettings();
 }
 
 void ModMain::SaveWeapons()
@@ -1760,6 +2201,7 @@ void ModMain::RegisterCVars()
 {
     ViewmodelSettings& s = m_settings;
     REGISTER_CVAR2("vm_enabled", &s.enabled, s.enabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: enable position/rotation offsets (0/1)");
+    REGISTER_CVAR2("vm_bypass", &s.bypass, s.bypass, VF_DUMPTOCHAIR, "Viewmodel Tweaks: vanilla viewmodel - switch off every viewmodel feature except reticle, world FOV and sprint sensitivity (0/1)");
     RegisterPoseCVars(s.base, "", "global standing");
 
     REGISTER_CVAR2("vm_crouch_enabled", &s.crouchEnabled, s.crouchEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: blend in the crouch pose while sneaking (0/1)");
@@ -1813,6 +2255,44 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_world_fov", &s.worldFov, s.worldFov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: horizontal FOV in degrees");
     REGISTER_CVAR2("vm_sprint_sens_enabled", &s.sprintSensEnabled, s.sprintSensEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the look-sensitivity scale while sprinting (0/1)");
     REGISTER_CVAR2("vm_sprint_sens_scale", &s.sprintSensScale, s.sprintSensScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: look-sensitivity multiplier while sprinting (1 = same as walking)");
+    // feel: sprint
+    REGISTER_CVAR2("vm_sprint_pose", &s.sprintPoseEnabled, s.sprintPoseEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: lower / tilt the weapon while sprinting (0/1)");
+    RegisterPoseCVars(s.sprint, "sprint_", "sprint pose, added while sprinting");
+    REGISTER_CVAR2("vm_sprint_blend_in", &s.sprintBlendIn, s.sprintBlendIn, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to blend into the sprint pose");
+    REGISTER_CVAR2("vm_sprint_blend_out", &s.sprintBlendOut, s.sprintBlendOut, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to blend out of the sprint pose");
+    REGISTER_CVAR2("vm_sprint_blocks_aim", &s.sprintBlocksAim, s.sprintBlocksAim, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no aiming down sights while sprinting (0/1)");
+    REGISTER_CVAR2("vm_sprint_sway", &s.sprintSwayEnabled, s.sprintSwayEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: extra weapon sway while sprinting (0/1)");
+    REGISTER_CVAR2("vm_sprint_sway_pos", &s.sprintSwayPos, s.sprintSwayPos, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sprint sway amplitude in meters");
+    REGISTER_CVAR2("vm_sprint_sway_rot", &s.sprintSwayRot, s.sprintSwayRot, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sprint sway roll amplitude in degrees");
+    REGISTER_CVAR2("vm_sprint_sway_freq", &s.sprintSwayFreq, s.sprintSwayFreq, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sprint sway frequency in Hz");
+    // feel: aim sway
+    REGISTER_CVAR2("vm_sway_enabled", &s.aimSwayEnabled, s.aimSwayEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sway and settle while aiming (0/1)");
+    REGISTER_CVAR2("vm_sway_pos", &s.aimSwayPos, s.aimSwayPos, VF_DUMPTOCHAIR, "Viewmodel Tweaks: aim sway position amplitude at rest, meters");
+    REGISTER_CVAR2("vm_sway_rot", &s.aimSwayRot, s.aimSwayRot, VF_DUMPTOCHAIR, "Viewmodel Tweaks: aim sway rotation amplitude at rest, degrees");
+    REGISTER_CVAR2("vm_sway_freq", &s.aimSwayFreq, s.aimSwayFreq, VF_DUMPTOCHAIR, "Viewmodel Tweaks: aim sway frequency in Hz");
+    REGISTER_CVAR2("vm_sway_initial", &s.aimSwayInitial, s.aimSwayInitial, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sway multiplier when the sights come up");
+    REGISTER_CVAR2("vm_sway_settle", &s.aimSwaySettleTime, s.aimSwaySettleTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds for the sway to settle");
+    REGISTER_CVAR2("vm_sway_move", &s.aimSwayMoveMult, s.aimSwayMoveMult, VF_DUMPTOCHAIR, "Viewmodel Tweaks: extra sway at walking speed");
+    REGISTER_CVAR2("vm_sway_sprint_penalty", &s.aimSwaySprintPenalty, s.aimSwaySprintPenalty, VF_DUMPTOCHAIR, "Viewmodel Tweaks: extra sway right after sprinting");
+    REGISTER_CVAR2("vm_sway_sprint_recover", &s.aimSwaySprintRecover, s.aimSwaySprintRecover, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds for the sprint penalty to fade");
+    REGISTER_CVAR2("vm_steady_enabled", &s.steadyEnabled, s.steadyEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: hold-breath key steadies the sights (0/1)");
+    REGISTER_CVAR2("vm_steady_key", &s.steadyKey, s.steadyKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: EKeyId of the steady key (0 = none)");
+    REGISTER_CVAR2("vm_steady_reduce", &s.steadyReduce, s.steadyReduce, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sway reduction while steady (0..1)");
+    REGISTER_CVAR2("vm_steady_duration", &s.steadyDuration, s.steadyDuration, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds of breath");
+    REGISTER_CVAR2("vm_steady_recover", &s.steadyRecover, s.steadyRecover, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to recover a full breath");
+    REGISTER_CVAR2("vm_steady_consume_key", &s.steadyConsumeKey, s.steadyConsumeKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: swallow the steady key (0/1)");
+    // feel: view drag
+    REGISTER_CVAR2("vm_drag_enabled", &s.dragEnabled, s.dragEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: GoldenEye-style view drag (0/1)");
+    REGISTER_CVAR2("vm_drag_lead", &s.dragLead, s.dragLead, VF_DUMPTOCHAIR, "Viewmodel Tweaks: 1 = weapon leads into the turn, 0 = lags behind");
+    REGISTER_CVAR2("vm_drag_pos", &s.dragPos, s.dragPos, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag meters per rad/s");
+    REGISTER_CVAR2("vm_drag_rot", &s.dragRot, s.dragRot, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag degrees per rad/s");
+    REGISTER_CVAR2("vm_drag_stiffness", &s.dragStiffness, s.dragStiffness, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag spring stiffness");
+    REGISTER_CVAR2("vm_drag_damping", &s.dragDamping, s.dragDamping, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag damping ratio");
+    REGISTER_CVAR2("vm_drag_max_pos", &s.dragMaxPos, s.dragMaxPos, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag position clamp, meters");
+    REGISTER_CVAR2("vm_drag_max_rot", &s.dragMaxRot, s.dragMaxRot, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag rotation clamp, degrees");
+    REGISTER_CVAR2("vm_drag_aim_scale", &s.dragAimScale, s.dragAimScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag while aiming, 0..1 of the hip amount");
+    REGISTER_CVAR2("vm_drag_pitch_scale", &s.dragPitchScale, s.dragPitchScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: view drag pitch (look up/down) relative to yaw");
+
     REGISTER_CVAR2("vm_fov_enabled", &s.fovEnabled, s.fovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: enable weapon FOV override (0/1)");
     REGISTER_CVAR2("vm_fov", &s.fov, s.fov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: weapon FOV in degrees (game default 55)");
     REGISTER_CVAR2("vm_gui_mouse", &s.guiMouse, s.guiMouse, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show cursor and block look input while the settings window is open (0/1)");
@@ -1824,6 +2304,7 @@ void ModMain::InitSystem(const ModInitInfo& initInfo, ModDllInfo& dllInfo)
 {
     BaseClass::InitSystem(initInfo, dllInfo);
     RegisterCVars();
+    SanitizeSettings();
     m_offsetHookActive = s_hookPwaUpdate.IsHooked() && s_hookPwaContextUpdate.IsHooked();
     m_cameraHookActive = s_hookUpdateView.IsHooked();
     CryLog("ViewmodelTweaks: initialized (weapon offset hooks {}, camera hook {})", m_offsetHookActive ? "installed" : "NOT installed",
@@ -1861,6 +2342,28 @@ void ModMain::ShutdownGame(bool isHotUnloading)
     BaseClass::ShutdownGame(isHotUnloading);
 }
 
+
+//! Removes every console variable with the given prefix. The console keeps raw pointers to the names, help
+//! strings and value storage we registered - all of which vanish with this DLL - and the engine touches them
+//! again at shutdown (crash on exit) unless they are gone before the module is unloaded.
+static void UnregisterCVarsWithPrefix(const char* prefix)
+{
+    if (!gEnv || !gEnv->pConsole)
+        return;
+    const int total = gEnv->pConsole->GetNumVars(false);
+    if (total <= 0)
+        return;
+    std::vector<const char*> names((size_t)total + 1, nullptr);
+    const size_t n = gEnv->pConsole->GetSortedVars(names.data(), names.size(), prefix);
+    std::vector<std::string> copies;
+    for (size_t i = 0; i < n && i < names.size(); i++)
+        if (names[i])
+            copies.emplace_back(names[i]);
+    for (const std::string& name : copies)
+        gEnv->pConsole->UnregisterVariable(name.c_str(), true);
+    CryLog("Unregistered {} console variable(s) with prefix '{}'", copies.size(), prefix);
+}
+
 void ModMain::ShutdownSystem(bool isHotUnloading)
 {
     // Restore the stock weapon FOV so unloading leaves the game as we found it.
@@ -1869,6 +2372,7 @@ void ModMain::ShutdownSystem(bool isHotUnloading)
         float stock = PreyInternals::STOCK_WEAPON_FOV;
         gEnv->pRenderer->EF_Query(EFQ_SetDrawNearFov, stock);
     }
+    UnregisterCVarsWithPrefix("vm_");
     BaseClass::ShutdownSystem(isHotUnloading);
 }
 
@@ -1880,6 +2384,8 @@ void ModMain::MainUpdate(unsigned updateFlags)
     m_frameIndex++;
     const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.0f;
     UpdateBlendStates(dt);
+    UpdateFeel(dt, ArkPlayer::GetInstancePtr());
+    SanitizeFeel();
     UpdateNudge(dt);
     UpdateConvergence(dt);
 
@@ -2092,11 +2598,27 @@ void ModMain::DrawWindow()
         ImGui::TextDisabled("New here? Start with Quick Settings. Aim with %s. Per-weapon poses live in the Weapon tab. Ctrl+click a slider to type a value.", GetKeyName(s.aimKey));
         CheckboxInt("Enable position / rotation offsets", s.enabled);
         ImGui::SameLine();
-        ImGui::TextDisabled("| %s%s | %s", m_isCrouching ? "crouching" : "standing", m_isAiming ? " | aiming" : "",
+        ImGui::TextDisabled("| %s%s%s | %s", m_isCrouching ? "crouching" : "standing", m_isAiming ? " | aiming" : "", m_feel.sprinting ? " | sprinting" : "",
             m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
+        {
+            bool vanilla = s.bypass != 0;
+            if (ImGui::Checkbox("Vanilla viewmodel (bypass the whole mod)", &vanilla))
+                s.bypass = vanilla ? 1 : 0;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Switches off every viewmodel feature at once - offsets, ironsights, feel, weapon FOV, convergence, wall pull-back,\n"
+                                  "spread changes - for before/after comparisons. The reticle, world FOV and sprint sensitivity settings stay as they are.\n"
+                                  "Your settings are kept; untick to get everything back.");
+            if (s.bypass)
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "VANILLA - the mod is bypassed");
+            }
+        }
         if (!m_offsetHookActive || !m_cameraHookActive)
             ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Warning: some game hooks could not be installed (%s%s). This game build is not the one Chairloader supports; the mod is partly disabled.",
                 m_offsetHookActive ? "" : "weapon offsets ", m_cameraHookActive ? "" : "camera/ironsights");
+        if (m_nanRecoveries > 0 && s.showAdvanced)
+            ImGui::TextDisabled("Numeric recoveries this session: %d (frames where a bad value from the game or the mod was caught and reset)", m_nanRecoveries);
 
         ImGui::Separator();
 
@@ -2109,6 +2631,8 @@ void ModMain::DrawWindow()
                 ImGui::Spacing();
 
                 CheckboxInt("Enable weapon offsets", s.enabled, "Master switch for all position / rotation offsets, convergence and wall pull-back.");
+                ImGui::SameLine();
+                CheckboxInt("Vanilla viewmodel##q", s.bypass, "Bypass every viewmodel feature (everything except reticle, world FOV and sprint sensitivity) for before/after comparisons.");
                 ImGui::Indent();
                 CheckboxInt("Override weapon FOV", s.fovEnabled, "Vertical FOV used to render the weapon and arms. Game default is 55. Higher = smaller weapon.");
                 ImGui::BeginDisabled(!s.fovEnabled);
@@ -2176,6 +2700,14 @@ void ModMain::DrawWindow()
                     "Hip fire: rotates the weapon so the barrel points at what the crosshair is over. Tuning in the Global tab.");
                 CheckboxInt("Enable wall pull-back", s.wallPushEnabled,
                     "Slides the weapon back towards the camera near walls. Distances in the Global tab, amount per weapon in the Weapon tab.");
+                ImGui::Spacing();
+                ImGui::Text("Feel");
+                ImGui::SameLine();
+                CheckboxInt("Sprint pose##q", s.sprintPoseEnabled, "Lowers and tilts the weapon while sprinting, with a bit more sway. Tuning in the Feel tab.");
+                ImGui::SameLine();
+                CheckboxInt("Sway while aiming##q", s.aimSwayEnabled, "The sights drift in a slow figure-eight: large when they come up, after sprinting or while moving, calm when you hold still. Tuning in the Feel tab.");
+                ImGui::SameLine();
+                CheckboxInt("View drag##q", s.dragEnabled, "GoldenEye-style: the weapon follows your turns on a spring. Tuning in the Feel tab.");
                 ImGui::Spacing();
                 DrawReticleControls(s, "qret");
                 ImGui::EndTabItem();
@@ -2249,6 +2781,96 @@ void ModMain::DrawWindow()
                 ImGui::EndTabItem();
             }
 
+            //------------------------------------------------------------------ Feel
+            if (ImGui::BeginTabItem("Feel"))
+            {
+                ImGui::BeginDisabled(!s.enabled);
+                const FeelState& f = m_feel;
+                if (ImGui::CollapsingHeader("Sprint pose", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    CheckboxInt("Lower the weapon while sprinting", s.sprintPoseEnabled);
+                    ImGui::BeginDisabled(!s.sprintPoseEnabled);
+                    ImGui::TextDisabled("%s | blend %.2f | speed %.1f m/s", f.sprinting ? "sprinting" : "not sprinting", f.sprintBlend, f.speed);
+                    DrawPoseSliders(s.sprint, "sprintpose", 20.0f, 30.0f);
+                    ImGui::SliderFloat("Blend in", &s.sprintBlendIn, 0.05f, 1.0f, "%.2f s");
+                    ImGui::SliderFloat("Blend out", &s.sprintBlendOut, 0.05f, 1.0f, "%.2f s");
+                    CheckboxInt("No aiming while sprinting", s.sprintBlocksAim, "The aim key is ignored while sprinting; the sights come up as soon as you stop.");
+                    CheckboxInt("Extra sway while sprinting", s.sprintSwayEnabled, "A side-to-side / up-down figure on top of the game's own sprint animation.");
+                    ImGui::BeginDisabled(!s.sprintSwayEnabled);
+                    ImGui::SliderFloat("Sway position", &s.sprintSwayPos, 0.0f, 0.05f, "%.3f m");
+                    ImGui::SliderFloat("Sway roll", &s.sprintSwayRot, 0.0f, 6.0f, "%.1f deg");
+                    ImGui::SliderFloat("Sway frequency", &s.sprintSwayFreq, 0.5f, 5.0f, "%.2f Hz");
+                    ImGui::EndDisabled();
+                    ImGui::EndDisabled();
+                }
+                if (ImGui::CollapsingHeader("Sway and settle while aiming", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    CheckboxInt("Sway while aiming", s.aimSwayEnabled,
+                        "A slow figure-eight of the sights. The rotation part moves the sights off the crosshair, so with the reticle hidden\n"
+                        "while aiming (FOV tab) it is real inaccuracy you have to time your shots around; with the reticle visible it is cosmetic.");
+                    ImGui::BeginDisabled(!s.aimSwayEnabled);
+                    ImGui::TextDisabled("amplitude x%.2f | aiming for %.1f s | %.1f s since sprint | breath %.1f s%s", f.swayAmplitude, f.aimTime,
+                        min(f.timeSinceSprint, 999.0f), f.steadyLeft, f.steadyActive ? " (steady)" : "");
+                    ImGui::SliderFloat("Position at rest", &s.aimSwayPos, 0.0f, 0.02f, "%.4f m");
+                    ImGui::SliderFloat("Rotation at rest", &s.aimSwayRot, 0.0f, 3.0f, "%.2f deg");
+                    ImGui::SliderFloat("Frequency", &s.aimSwayFreq, 0.05f, 2.0f, "%.2f Hz");
+                    ImGui::SliderFloat("When the sights come up", &s.aimSwayInitial, 1.0f, 8.0f, "x%.1f");
+                    ImGui::SliderFloat("Settle time", &s.aimSwaySettleTime, 0.1f, 4.0f, "%.2f s");
+                    ImGui::SliderFloat("Moving", &s.aimSwayMoveMult, 0.0f, 8.0f, "+x%.1f at walking speed");
+                    ImGui::SliderFloat("After sprinting", &s.aimSwaySprintPenalty, 0.0f, 8.0f, "+x%.1f");
+                    ImGui::SliderFloat("Sprint recovery", &s.aimSwaySprintRecover, 0.1f, 5.0f, "%.2f s");
+                    ImGui::Separator();
+                    CheckboxInt("Hold breath to steady", s.steadyEnabled);
+                    ImGui::BeginDisabled(!s.steadyEnabled);
+                    ImGui::Text("Steady key: %s", GetKeyName(s.steadyKey));
+                    ImGui::SameLine();
+                    if (m_waitingForSteadyKey)
+                        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "press a key... (Esc cancels)");
+                    else if (ImGui::Button("Bind##steady"))
+                        m_waitingForSteadyKey = true;
+                    ImGui::SameLine();
+                    if (ImGui::Button("None##steady"))
+                        s.steadyKey = 0;
+                    CheckboxInt("Swallow the steady key", s.steadyConsumeKey, "The game does not see the key while it is bound here.");
+                    {
+                        float pct = s.steadyReduce * 100.0f;
+                        if (ImGui::SliderFloat("Sway reduction", &pct, 0.0f, 100.0f, "%.0f %%"))
+                            s.steadyReduce = pct / 100.0f;
+                    }
+                    ImGui::SliderFloat("Breath", &s.steadyDuration, 0.5f, 15.0f, "%.1f s");
+                    ImGui::SliderFloat("Recovery", &s.steadyRecover, 0.5f, 15.0f, "%.1f s");
+                    ImGui::EndDisabled();
+                    ImGui::EndDisabled();
+                }
+                if (ImGui::CollapsingHeader("View drag (GoldenEye)", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    CheckboxInt("Weapon follows your turns on a spring", s.dragEnabled,
+                        "Turning drags the weapon along (or behind), then it springs back. Uses this frame's turn rate, so there is no input lag on the camera itself.");
+                    ImGui::BeginDisabled(!s.dragEnabled);
+                    ImGui::TextDisabled("turn rate %.2f / %.2f rad/s | spring %.2f / %.2f", f.yawRate, f.pitchRate, f.dragX, f.dragY);
+                    ImGui::Text("Direction");
+                    ImGui::SameLine();
+                    ImGui::RadioButton("Leads into the turn (GoldenEye)", &s.dragLead, 1);
+                    ImGui::SameLine();
+                    ImGui::RadioButton("Lags behind", &s.dragLead, 0);
+                    ImGui::SliderFloat("Position amount", &s.dragPos, 0.0f, 0.05f, "%.3f m per rad/s");
+                    ImGui::SliderFloat("Rotation amount", &s.dragRot, 0.0f, 10.0f, "%.1f deg per rad/s");
+                    ImGui::SliderFloat("Stiffness", &s.dragStiffness, 1.0f, 30.0f, "%.1f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Higher = reacts and returns faster.");
+                    ImGui::SliderFloat("Damping", &s.dragDamping, 0.2f, 1.5f, "%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("1 = settles without overshoot; lower values wobble a little at the end of a turn.");
+                    ImGui::SliderFloat("Max position", &s.dragMaxPos, 0.0f, 0.15f, "%.3f m");
+                    ImGui::SliderFloat("Max rotation", &s.dragMaxRot, 0.0f, 20.0f, "%.1f deg");
+                    ImGui::SliderFloat("Up / down relative to sideways", &s.dragPitchScale, 0.0f, 1.5f, "x%.2f");
+                    ImGui::SliderFloat("While aiming", &s.dragAimScale, 0.0f, 1.0f, "x%.2f");
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndDisabled();
+                ImGui::EndTabItem();
+            }
+
             //------------------------------------------------------------------ Weapon
             if (ImGui::BeginTabItem("Weapon"))
             {
@@ -2269,7 +2891,10 @@ void ModMain::DrawWindow()
                             if (const WeaponSettings* pB = WeaponSettings::BuiltIn(m_currentWeaponClass.c_str()))
                                 w = *pB;
                             else
+                            {
                                 w = WeaponSettings();
+                                w.aim = WeaponSettings::DefaultAim();
+                            }
                             m_weaponsDirty = true;
                         }
                     }
@@ -2480,7 +3105,8 @@ void ModMain::DrawWindow()
                     TextQuatT("Weapon bone", m_lock.weaponAbs);
                     TextQuatT("Last override", m_lock.lastTarget);
                     ImGui::Text("IK joint vs pushed target: %.2f cm (one frame of animation velocity is expected) | sensitivity hook calls: %d", m_lock.ikErr * 100, m_sensHookCalls);
-                    ImGui::Text("Fire animation deviation: %.2f cm, %.1f deg | kick applied: %.2f cm", m_lock.kickPos * 100, RAD2DEG(m_lock.kickRot), m_lock.kick.t.GetLength() * 100);
+                    ImGui::Text("Fire animation deviation: %.2f cm, %.1f deg | kick applied: %.2f cm | pushes not applied by the skeleton: %d | numeric recoveries: %d",
+                        m_lock.kickPos * 100, RAD2DEG(m_lock.kickRot), m_lock.kick.t.GetLength() * 100, m_lock.pushesNotApplied, m_nanRecoveries);
                     TextQuatT("Game recoil", m_gameOffsets[2]);
                     TextQuatT("Game bump", m_gameOffsets[3]);
                     ImGui::Separator();
