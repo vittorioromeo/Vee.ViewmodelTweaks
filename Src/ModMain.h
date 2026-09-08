@@ -490,9 +490,9 @@ private:
     int m_frameIndex = 0;
     // Frame timing as seen by MainUpdate: the smoothing filters use the measured wall-clock step between
     // updates (clamped), so a wrong game frame time or several updates per frame cannot defeat them.
-    float m_lastUpdateWallTime = -1.0f;
-    float m_dtGame = 0.0f;              //!< last ITimer::GetFrameTime()
-    float m_dtUsed = 0.0f;              //!< what the filters were stepped with
+    int64 m_lastAsyncTicks = -1;        //!< previous MainUpdate's async clock reading (int64, 100000/s); -1 = none yet
+    float m_dtGame = 0.0f;              //!< last ITimer::GetFrameTime() (for the debug readout only)
+    float m_dtUsed = 0.0f;              //!< what the filters were actually stepped with (seconds)
     float m_updateHz = 0.0f;            //!< measured MainUpdate rate (smoothed)
     QuatT m_gameOffsets[4] = { QuatT(IDENTITY), QuatT(IDENTITY), QuatT(IDENTITY), QuatT(IDENTITY) }; //!< look, strafe, recoil, bump
     int m_sensHookCalls = 0;

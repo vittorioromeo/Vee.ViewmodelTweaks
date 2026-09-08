@@ -2387,27 +2387,31 @@ void ModMain::ShutdownSystem(bool isHotUnloading)
 void ModMain::MainUpdate(unsigned updateFlags)
 {
     m_frameIndex++;
-    // Step for the filters (blends, convergence, pull-back, feel). The game's frame time is the natural
-    // choice, but a filter that is stepped with it is only as good as the number it gets and the number
-    // of times it is stepped per frame - so the measured wall-clock step between two updates is used
-    // instead (clamped to a tenth of a second: a longer gap is a load or a pause, not a frame), with the
-    // game frame time as the fallback for the first update.
+    // Time step for the filters (blends, convergence, wall pull-back, feel). This must be a real,
+    // per-update delta: an exponential smoother uses k = 1 - exp(-dt/tau), which is exactly 0 when dt is
+    // 0 (the value never moves - the filter looks "dead") and 1 when dt is huge (the value snaps - the
+    // filter looks "off"). So a wrong dt does not merely mistune the smoothing, it disables it.
+    //
+    // The game frame time (ITimer::GetFrameTime) is the game clock: it is scaled by the trainer's time
+    // dilation and paused with the game, and reads oddly here. The async *seconds* accessor is a float32
+    // of absolute time, which after a while cannot resolve a 16 ms step at all (huge value minus huge
+    // value rounds to 0). The async clock as an int64 tick count (100000/s) is precise and monotonic, so
+    // the step between two updates is taken from that. GetFrameTime is kept only for the on-screen readout.
     m_dtGame = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.0f;
-    float dt = Finite(m_dtGame) ? clamp_tpl(m_dtGame, 0.0f, 0.1f) : 0.0f;
+    float dt = 1.0f / 60.0f; // sane default until the clock gives us two readings (never 0 -> never frozen)
     if (gEnv && gEnv->pTimer)
     {
-        const float now = gEnv->pTimer->GetAsyncCurTime();
-        if (Finite(now))
+        const int64 nowTicks = gEnv->pTimer->GetAsyncTime().GetValue();
+        if (m_lastAsyncTicks >= 0 && nowTicks > m_lastAsyncTicks)
         {
-            if (m_lastUpdateWallTime >= 0.0f && now >= m_lastUpdateWallTime)
+            const float delta = (float)(nowTicks - m_lastAsyncTicks) * (1.0f / 100000.0f);
+            if (Finite(delta) && delta > 0.0f)
             {
-                const float wall = now - m_lastUpdateWallTime;
-                dt = clamp_tpl(wall, 0.0f, 0.1f);
-                if (wall > 1e-5f)
-                    m_updateHz += (1.0f / wall - m_updateHz) * 0.05f;
+                dt = clamp_tpl(delta, 0.0f, 0.1f); // a longer gap is a load / alt-tab / pause, not a frame
+                m_updateHz += (1.0f / clamp_tpl(delta, 1e-4f, 1.0f) - m_updateHz) * 0.05f;
             }
-            m_lastUpdateWallTime = now;
         }
+        m_lastAsyncTicks = nowTicks;
     }
     m_dtUsed = dt;
     UpdateBlendStates(dt);
