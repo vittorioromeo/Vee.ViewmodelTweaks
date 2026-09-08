@@ -1296,7 +1296,10 @@ void ModMain::UpdateBlendStates(float dt)
 
         const EStance stance = pPlayer->m_stance;
         crouching = (stance == EStance::STANCE_SNEAK || stance == EStance::STANCE_CRAWL);
-        m_feel.sprinting = !dead && pPlayer->m_movementFSM.IsSprinting();
+        // Zero-G: the thruster boost reports as sprinting, but there is no running body to lower the weapon
+        // for, so it only counts as a sprint if the user asks for it.
+        m_feel.zeroG = pPlayer->m_movementFSM.IsInZeroG();
+        m_feel.sprinting = !dead && pPlayer->m_movementFSM.IsSprinting() && (!m_feel.zeroG || m_settings.sprintInZeroG);
 
         m_currentWeaponClass = GetWeaponClassName(pPlayer);
 
@@ -1313,6 +1316,7 @@ void ModMain::UpdateBlendStates(float dt)
         m_aimKeyHeld = false;
         m_currentWeaponClass.clear();
         m_feel.sprinting = false;
+        m_feel.zeroG = false;
     }
 
     if (!aiming && m_settings.aimToggle && (IsHardwareCursorVisible() || !pPlayer))
@@ -2261,6 +2265,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_sprint_blend_in", &s.sprintBlendIn, s.sprintBlendIn, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to blend into the sprint pose");
     REGISTER_CVAR2("vm_sprint_blend_out", &s.sprintBlendOut, s.sprintBlendOut, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to blend out of the sprint pose");
     REGISTER_CVAR2("vm_sprint_blocks_aim", &s.sprintBlocksAim, s.sprintBlocksAim, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no aiming down sights while sprinting (0/1)");
+    REGISTER_CVAR2("vm_sprint_zerog", &s.sprintInZeroG, s.sprintInZeroG, VF_DUMPTOCHAIR, "Viewmodel Tweaks: treat the zero-G thruster boost as sprinting (pose, sway, aim block) (0/1)");
     REGISTER_CVAR2("vm_sprint_sway", &s.sprintSwayEnabled, s.sprintSwayEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: extra weapon sway while sprinting (0/1)");
     REGISTER_CVAR2("vm_sprint_sway_pos", &s.sprintSwayPos, s.sprintSwayPos, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sprint sway amplitude in meters");
     REGISTER_CVAR2("vm_sprint_sway_rot", &s.sprintSwayRot, s.sprintSwayRot, VF_DUMPTOCHAIR, "Viewmodel Tweaks: sprint sway roll amplitude in degrees");
@@ -2382,7 +2387,29 @@ void ModMain::ShutdownSystem(bool isHotUnloading)
 void ModMain::MainUpdate(unsigned updateFlags)
 {
     m_frameIndex++;
-    const float dt = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.0f;
+    // Step for the filters (blends, convergence, pull-back, feel). The game's frame time is the natural
+    // choice, but a filter that is stepped with it is only as good as the number it gets and the number
+    // of times it is stepped per frame - so the measured wall-clock step between two updates is used
+    // instead (clamped to a tenth of a second: a longer gap is a load or a pause, not a frame), with the
+    // game frame time as the fallback for the first update.
+    m_dtGame = (gEnv && gEnv->pTimer) ? gEnv->pTimer->GetFrameTime() : 0.0f;
+    float dt = Finite(m_dtGame) ? clamp_tpl(m_dtGame, 0.0f, 0.1f) : 0.0f;
+    if (gEnv && gEnv->pTimer)
+    {
+        const float now = gEnv->pTimer->GetAsyncCurTime();
+        if (Finite(now))
+        {
+            if (m_lastUpdateWallTime >= 0.0f && now >= m_lastUpdateWallTime)
+            {
+                const float wall = now - m_lastUpdateWallTime;
+                dt = clamp_tpl(wall, 0.0f, 0.1f);
+                if (wall > 1e-5f)
+                    m_updateHz += (1.0f / wall - m_updateHz) * 0.05f;
+            }
+            m_lastUpdateWallTime = now;
+        }
+    }
+    m_dtUsed = dt;
     UpdateBlendStates(dt);
     UpdateFeel(dt, ArkPlayer::GetInstancePtr());
     SanitizeFeel();
@@ -2741,6 +2768,12 @@ void ModMain::DrawWindow()
                     ImGui::TextDisabled("Hit: %s at %.2f m | yaw %.2f (target %.2f) pitch %.2f (target %.2f) deg | weapon offset from eye (%.1f, %.1f, %.1f) cm",
                         m_convergeHit ? "yes" : "no", m_convergeDist, m_convergeYaw, m_convergeTargetYaw, m_convergePitch, m_convergeTargetPitch,
                         m_render.hipRelCam.t.x * 100, m_render.hipRelCam.t.y * 100, m_render.hipRelCam.t.z * 100);
+                    {
+                        const float tau = max(s.convergeSmoothTime, 0.0f);
+                        const float k = (tau > 0.0005f) ? (1.0f - expf(-m_dtUsed / tau)) : 1.0f;
+                        ImGui::TextDisabled("Filter step %.2f ms (game frame time %.2f ms) | %.0f updates/s | %.1f %% of the gap closed per update",
+                            m_dtUsed * 1000.0f, m_dtGame * 1000.0f, m_updateHz, k * 100.0f);
+                    }
                     ImGui::EndDisabled();
                     ImGui::Spacing();
                     CheckboxInt("Prevent aiming while colliding with a wall", s.aimWallBlockEnabled,
@@ -2790,11 +2823,14 @@ void ModMain::DrawWindow()
                 {
                     CheckboxInt("Lower the weapon while sprinting", s.sprintPoseEnabled);
                     ImGui::BeginDisabled(!s.sprintPoseEnabled);
-                    ImGui::TextDisabled("%s | blend %.2f | speed %.1f m/s", f.sprinting ? "sprinting" : "not sprinting", f.sprintBlend, f.speed);
+                    ImGui::TextDisabled("%s%s | blend %.2f | speed %.1f m/s", f.sprinting ? "sprinting" : "not sprinting", f.zeroG ? " | zero-G" : "", f.sprintBlend, f.speed);
                     DrawPoseSliders(s.sprint, "sprintpose", 20.0f, 30.0f);
                     ImGui::SliderFloat("Blend in", &s.sprintBlendIn, 0.05f, 1.0f, "%.2f s");
                     ImGui::SliderFloat("Blend out", &s.sprintBlendOut, 0.05f, 1.0f, "%.2f s");
                     CheckboxInt("No aiming while sprinting", s.sprintBlocksAim, "The aim key is ignored while sprinting; the sights come up as soon as you stop.");
+                    CheckboxInt("Also in zero-G", s.sprintInZeroG,
+                        "The thruster boost in zero-G counts as sprinting for the game. Off (default): no sprint pose, sway or aim block while\n"
+                        "floating - there is no running body to lower the weapon for. On: boosting behaves like sprinting.");
                     CheckboxInt("Extra sway while sprinting", s.sprintSwayEnabled, "A side-to-side / up-down figure on top of the game's own sprint animation.");
                     ImGui::BeginDisabled(!s.sprintSwayEnabled);
                     ImGui::SliderFloat("Sway position", &s.sprintSwayPos, 0.0f, 0.05f, "%.3f m");

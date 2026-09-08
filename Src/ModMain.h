@@ -142,6 +142,7 @@ struct ViewmodelSettings
     float sprintBlendIn = 0.29f;    //!< seconds to reach the sprint pose
     float sprintBlendOut = 0.20f;   //!< seconds to return from it
     int   sprintBlocksAim = 1;      //!< No aiming down sights while sprinting (the aim resumes when you stop).
+    int   sprintInZeroG = 0;        //!< Treat the zero-G thruster boost as sprinting too (pose, sway, aim block). Off: nothing happens in zero-G.
     int   sprintSwayEnabled = 1;    //!< Extra procedural sway while sprinting (on top of the game's own).
     float sprintSwayPos = 0.012f;   //!< meters (side to side; the vertical part is 60 % of it, twice the rate)
     float sprintSwayRot = 1.5f;     //!< degrees of roll (pitch is 40 % of it)
@@ -197,7 +198,8 @@ struct ViewmodelSettings
 //! Per-frame state of the procedural "feel" layer (sprint pose, aim sway, view drag).
 struct FeelState
 {
-    bool sprinting = false;
+    bool sprinting = false;         //!< sprinting for our purposes (already excludes zero-G unless allowed)
+    bool zeroG = false;             //!< player is in zero-G / grav-shaft movement
     float sprintBlend = 0.0f;       //!< 0..1
     float timeSinceSprint = 1e9f;   //!< seconds since sprinting stopped
     float sprintPhase = 0.0f;       //!< radians
@@ -486,6 +488,12 @@ private:
     float m_wallPush = 0.0f;        //!< smoothed pull-back (m)
     float m_wallPushTarget = 0.0f;
     int m_frameIndex = 0;
+    // Frame timing as seen by MainUpdate: the smoothing filters use the measured wall-clock step between
+    // updates (clamped), so a wrong game frame time or several updates per frame cannot defeat them.
+    float m_lastUpdateWallTime = -1.0f;
+    float m_dtGame = 0.0f;              //!< last ITimer::GetFrameTime()
+    float m_dtUsed = 0.0f;              //!< what the filters were stepped with
+    float m_updateHz = 0.0f;            //!< measured MainUpdate rate (smoothed)
     QuatT m_gameOffsets[4] = { QuatT(IDENTITY), QuatT(IDENTITY), QuatT(IDENTITY), QuatT(IDENTITY) }; //!< look, strafe, recoil, bump
     int m_sensHookCalls = 0;
     bool m_playerDead = false;

@@ -12,7 +12,7 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   fire animation's own kick while aiming (both per weapon), a per-shot coupling boost, and bullet-spread
   multipliers for aiming vs hip fire on the pistol and shotgun (the only weapons with spread).
 * **Feel.** A sprint pose (the weapon drops and tilts while you run, with extra sway; optionally no aiming
-  while sprinting), sway and settle while aiming (a slow figure-eight that is large when the sights come
+  while sprinting; off in zero-G unless you want the thruster boost to count), sway and settle while aiming (a slow figure-eight that is large when the sights come
   up, after sprinting or while moving, and calms down as you hold still; a hold-breath key), and GoldenEye
   style view drag (the weapon follows your turns on a spring, leading or lagging).
 * **Viewmodel.** Global standing and crouch offsets, per-weapon hip offsets, weapon FOV (the stock 55 is
