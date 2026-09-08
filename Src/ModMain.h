@@ -124,6 +124,8 @@ struct ViewmodelSettings
     int   aimWallBlockEnabled = 1;  //!< Do not allow aiming while the weapon would be poking into a wall.
     int   aimBlockReload = 1;       //!< No aiming while the weapon reloads (the reload animation is not authored for the aim pose).
     int   aimBlockSwitch = 1;       //!< No aiming while a weapon is being holstered / drawn (select action in progress).
+    float aimSwitchDelay = 0.75f;   //!< seconds after a weapon change before aiming is allowed again (the game reports the
+                                    //!< weapon ready before its raise animation has finished).
     int   reloadFadesOffsets = 1;   //!< Fade the hip offsets (pose, convergence, pull-back, feel) out while reloading: the support
                                     //!< hand is animated in place during reloads and would otherwise miss a shifted weapon.
     float reloadFadeTime = 0.2f;    //!< seconds
