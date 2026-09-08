@@ -122,6 +122,11 @@ struct ViewmodelSettings
     float convergeMaxDist = 100.0f; //!< meters; no hit within this = parallel
 
     int   aimWallBlockEnabled = 1;  //!< Do not allow aiming while the weapon would be poking into a wall.
+    int   aimBlockReload = 1;       //!< No aiming while the weapon reloads (the reload animation is not authored for the aim pose).
+    int   aimBlockSwitch = 1;       //!< No aiming while a weapon is being holstered / drawn (select action in progress).
+    int   reloadFadesOffsets = 1;   //!< Fade the hip offsets (pose, convergence, pull-back, feel) out while reloading: the support
+                                    //!< hand is animated in place during reloads and would otherwise miss a shifted weapon.
+    float reloadFadeTime = 0.2f;    //!< seconds
     float aimWallBlockScale = 1.75f; //!< Tolerance multiplier on the blocking distance (higher = blocks further from the wall).
 
     int   wallPushEnabled = 1;      //!< Pull the weapon back towards the camera when the view ray hits something close.
@@ -465,6 +470,9 @@ private:
     // Runtime state
     float m_crouchBlend = 0.0f;         //!< 0 = standing, 1 = crouched (linear progress, smoothed when applied).
     float m_aimBlend = 0.0f;            //!< 0 = hip, 1 = aiming.
+    float m_reloadFade = 0.0f;          //!< 0 = offsets fully applied, 1 = fully faded (reload in progress).
+    // Weapon state as read from the game each update (debug + gates).
+    bool m_wsReloading = false, m_wsUnequipping = false, m_wsSwitching = false, m_wsReady = true;
     bool m_isCrouching = false;
     bool m_isAiming = false;
     bool m_aimKeyHeld = false;          //!< Raw state of the aim key (hold mode) or the toggle state.

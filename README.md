@@ -19,7 +19,8 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   fixed in vanilla), world FOV, sprint look-sensitivity.
 * **Hip fire helpers.** Weapon convergence (the barrel points at what the crosshair is over), wall pull-back
   (the weapon slides towards you near walls, more for longer weapons), no aiming while the muzzle would be
-  in a wall.
+  in a wall, while reloading or while switching weapons; the offsets ease out during reloads so the support
+  hand meets the shells.
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 

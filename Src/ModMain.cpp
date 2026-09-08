@@ -479,6 +479,16 @@ void ModMain::ApplyOffset(QuatT& offset) const
     if (SanePose(m_feel.dragHipOut))
         total.AddScaled(m_feel.dragHipOut, 1.0f - ab);
 
+    // Reloads: the support hand is animated in place (shells, magazines) against where the weapon is in
+    // the stock pose, so everything that moves the weapon fades out for the duration and comes back after.
+    const float keep = 1.0f - SmoothStep01(m_reloadFade);
+    if (keep < 1.0f)
+    {
+        PoseOffset scaled;
+        scaled.AddScaled(total, keep);
+        total = scaled;
+    }
+
     const Quat userRot = total.Rot();
     const Vec3 userPos = total.Pos();
 
@@ -489,13 +499,13 @@ void ModMain::ApplyOffset(QuatT& offset) const
     // Wall pull-back: slide the weapon towards the camera along the view axis. While aiming the lock
     // takes over (see ComputeAimExtra), so fade this copy out with the aim blend.
     if (s.wallPushEnabled && m_wallPush != 0.0f)
-        offset.t.y -= m_wallPush * (1.0f - ab);
+        offset.t.y -= m_wallPush * (1.0f - ab) * keep;
 
     // Hip-fire convergence: rotate in place so the barrel points at the crosshair's impact point.
     // Fades out with the aim blend (the ironsight lock is on the camera ray by definition).
-    if (s.convergeEnabled && (m_convergeYaw != 0.0f || m_convergePitch != 0.0f))
+    if (s.convergeEnabled && (m_convergeYaw != 0.0f || m_convergePitch != 0.0f) && keep > 0.0f)
     {
-        const float k = 1.0f - ab;
+        const float k = (1.0f - ab) * keep;
         const Quat conv = Quat::CreateRotationXYZ(Ang3(DEG2RAD(m_convergePitch * k), 0.0f, DEG2RAD(m_convergeYaw * k)));
         offset.q = conv * offset.q;
     }
@@ -1341,13 +1351,29 @@ void ModMain::UpdateBlendStates(float dt)
 
         m_currentWeaponClass = GetWeaponClassName(pPlayer);
 
+        // Weapon state: reloading, and "switching" = holster / draw in progress or any weapon action that
+        // leaves the weapon not ready (select, reload action, charge release).
+        {
+            const ArkPlayerWeaponComponent& wc = pPlayer->m_weaponComponent;
+            CArkWeapon* pWeapon = wc.GetEquippedWeapon();
+            if (pWeapon && pWeapon->GetOwnerId() != pPlayer->GetEntity()->GetId())
+                pWeapon = nullptr;
+            m_wsReloading = pWeapon && pWeapon->m_bIsReloading;
+            m_wsReady = !pWeapon || pWeapon->m_bIsReadyToAttack;
+            m_wsUnequipping = (pWeapon && pWeapon->m_bIsUnequipping) || wc.m_bIsUnequipping
+                || (wc.m_toBeEquippedWeaponId != 0 && wc.m_toBeEquippedWeaponId != wc.m_equippedWeaponId);
+            m_wsSwitching = m_wsUnequipping || (!m_wsReady && !m_wsReloading);
+        }
+
         // Aim key held/toggled, weapon allows aiming, and the player is actually controlling the
         // character (no cursor on screen: menus, inventory, our own settings window...).
         const WeaponSettings* pW = FindCurrentWeapon();
         const bool weaponAllows = !m_currentWeaponClass.empty() && (!pW || pW->aimAllowed);
         aiming = Active() && m_settings.aimEnabled && m_aimKeyHeld && weaponAllows && !m_mouseCaptured && !IsHardwareCursorVisible()
                  && !(m_settings.aimWallBlockEnabled && m_aimBlockedByWall) && !dead && m_reviveGuard <= 0.0f
-                 && !(m_settings.sprintPoseEnabled && m_settings.sprintBlocksAim && m_feel.sprinting);
+                 && !(m_settings.sprintPoseEnabled && m_settings.sprintBlocksAim && m_feel.sprinting)
+                 && !(m_settings.aimBlockReload && m_wsReloading)
+                 && !(m_settings.aimBlockSwitch && m_wsSwitching);
     }
     else
     {
@@ -1355,6 +1381,8 @@ void ModMain::UpdateBlendStates(float dt)
         m_currentWeaponClass.clear();
         m_feel.sprinting = false;
         m_feel.zeroG = false;
+        m_wsReloading = m_wsUnequipping = m_wsSwitching = false;
+        m_wsReady = true;
     }
 
     if (!aiming && m_settings.aimToggle && (IsHardwareCursorVisible() || !pPlayer))
@@ -1367,8 +1395,10 @@ void ModMain::UpdateBlendStates(float dt)
 
     MoveTowards(m_crouchBlend, crouching ? 1.0f : 0.0f, m_settings.crouchTime, dt);
     MoveTowards(m_aimBlend, aiming ? 1.0f : 0.0f, m_settings.aimTime, dt);
+    MoveTowards(m_reloadFade, (m_settings.reloadFadesOffsets && m_wsReloading && Active()) ? 1.0f : 0.0f, m_settings.reloadFadeTime, dt);
     if (!Finite(m_crouchBlend)) { m_crouchBlend = 0.0f; m_nanRecoveries++; }
     if (!Finite(m_aimBlend)) { m_aimBlend = 0.0f; m_nanRecoveries++; }
+    if (!Finite(m_reloadFade)) { m_reloadFade = 0.0f; m_nanRecoveries++; }
 }
 
 //---------------------------------------------------------------------------------
@@ -1545,7 +1575,7 @@ void ModMain::SanitizeSettings()
     const ViewmodelSettings def;
     int fixed = 0;
     auto fixF = [&](float& v, float d) { if (!Finite(v)) { v = d; fixed++; } };
-    fixF(s.crouchTime, def.crouchTime); fixF(s.aimBobAmount, def.aimBobAmount); fixF(s.aimBobTau, def.aimBobTau);
+    fixF(s.crouchTime, def.crouchTime); fixF(s.reloadFadeTime, def.reloadFadeTime); fixF(s.aimBobAmount, def.aimBobAmount); fixF(s.aimBobTau, def.aimBobTau);
     fixF(s.aimAnimRecoil, def.aimAnimRecoil); fixF(s.aimAnimSway, def.aimAnimSway); fixF(s.aimSensScale, def.aimSensScale);
     fixF(s.aimTime, def.aimTime); fixF(s.aimFov, def.aimFov); fixF(s.aimCameraZoomFactor, def.aimCameraZoomFactor);
     fixF(s.nudgePosSpeed, def.nudgePosSpeed); fixF(s.nudgeRotSpeed, def.nudgeRotSpeed); fixF(s.reticleY, def.reticleY);
@@ -2359,6 +2389,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_converge_smooth", &s.convergeSmoothTime, s.convergeSmoothTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence smoothing time constant in seconds");
     REGISTER_CVAR2("vm_converge_max_dist", &s.convergeMaxDist, s.convergeMaxDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: convergence raycast distance in meters (no hit = parallel)");
     REGISTER_CVAR2("vm_aim_wall_block", &s.aimWallBlockEnabled, s.aimWallBlockEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: prevent aiming while the weapon would poke into a wall (0/1)");
+    REGISTER_CVAR2("vm_aim_block_reload", &s.aimBlockReload, s.aimBlockReload, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no aiming down sights while the weapon reloads (0/1)");
+    REGISTER_CVAR2("vm_aim_block_switch", &s.aimBlockSwitch, s.aimBlockSwitch, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no aiming down sights while a weapon is holstered / drawn (0/1)");
+    REGISTER_CVAR2("vm_reload_fade", &s.reloadFadesOffsets, s.reloadFadesOffsets, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fade the hip offsets out while reloading so the support hand meets the weapon (0/1)");
+    REGISTER_CVAR2("vm_reload_fade_time", &s.reloadFadeTime, s.reloadFadeTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reload fade in/out time in seconds");
     REGISTER_CVAR2("vm_aim_wall_block_scale", &s.aimWallBlockScale, s.aimWallBlockScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: tolerance multiplier on the aim-block distance");
     REGISTER_CVAR2("vm_wall_push", &s.wallPushEnabled, s.wallPushEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: pull the weapon back towards the camera near walls (0/1); amount is per weapon");
     REGISTER_CVAR2("vm_wall_push_start", &s.wallPushStartDist, s.wallPushStartDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: distance (m) at which the wall pull-back starts");
@@ -2876,6 +2910,17 @@ void ModMain::DrawWindow()
                     DrawPoseSliders(s.crouch, "crouch", 30.0f, 45.0f);
                     ImGui::EndDisabled();
                 }
+                if (ImGui::CollapsingHeader("Reloading", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    CheckboxInt("Fade the offsets out while reloading", s.reloadFadesOffsets,
+                        "Reload animations move the support hand to where the weapon is in the STOCK pose (shells, magazines), so a\n"
+                        "shifted weapon leaves a gap between hand and shell. With this on, every hip-side change (pose, convergence,\n"
+                        "wall pull-back, sprint pose, drag) eases out when a reload starts and back in when it ends.");
+                    ImGui::BeginDisabled(!s.reloadFadesOffsets);
+                    ImGui::SliderFloat("Fade time", &s.reloadFadeTime, 0.05f, 0.6f, "%.2f s");
+                    ImGui::ProgressBar(SmoothStep01(m_reloadFade), ImVec2(-1, 0), m_wsReloading ? "reloading" : "not reloading");
+                    ImGui::EndDisabled();
+                }
                 if (ImGui::CollapsingHeader("Weapon convergence (hip fire)"))
                 {
                     CheckboxInt("Point the weapon at the crosshair's impact point", s.convergeEnabled,
@@ -3187,6 +3232,13 @@ void ModMain::DrawWindow()
                 ImGui::ProgressBar(SmoothStep01(m_aimBlend), ImVec2(-1, 0), m_isAiming ? "aiming" : "hip");
                 CheckboxInt("Ignore crouch offset while aiming", s.aimIgnoresCrouch,
                     "Fades the crouch offset out as the aim pose blends in, so the sights line up in any stance.");
+                CheckboxInt("No aiming while reloading", s.aimBlockReload,
+                    "Reload animations are authored for the stock pose; locking the weapon to the sights during one distorts the hands.\n"
+                    "The sights drop when a reload starts and come back when it ends (the aim key can stay held).");
+                CheckboxInt("No aiming while switching weapons", s.aimBlockSwitch,
+                    "Same for the holster / draw animations: aiming waits until the new weapon is ready.");
+                ImGui::TextDisabled("Weapon: %s%s%s%s", m_wsReloading ? "reloading " : "", m_wsUnequipping ? "holstering/drawing " : "",
+                    m_wsReady ? "" : "action in progress ", (!m_wsReloading && !m_wsUnequipping && m_wsReady) ? "idle" : "");
 
                 ImGui::Spacing();
                 CheckboxInt("Zoom camera while aiming", s.aimCameraZoom, "Lowers the world FOV while aiming (the weapon gets bigger with it, like real ADS).");
