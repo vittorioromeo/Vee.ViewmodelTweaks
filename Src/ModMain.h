@@ -362,6 +362,22 @@ struct PipelineDiag
     }
 };
 
+//! One per-update record of the hip-fire pipeline, for the pop tracer (see MainUpdate / SaveTrace).
+struct TraceSample
+{
+    float t = 0.0f;            //!< async seconds
+    float dt = 0.0f;           //!< filter step
+    float cYaw = 0.0f, cYawT = 0.0f, cPitch = 0.0f, cPitchT = 0.0f; //!< convergence smoothed / target (deg)
+    float wall = 0.0f, wallT = 0.0f;                                //!< wall pull-back smoothed / target (m)
+    float dist = 0.0f;         //!< ray hit distance
+    float mYaw = 0.0f, mPitch = 0.0f, mRoll = 0.0f;                 //!< measured weapon orientation rel. camera (deg)
+    float mX = 0.0f, mY = 0.0f, mZ = 0.0f;                          //!< measured weapon position rel. camera (m)
+    float lookYaw = 0.0f;      //!< the game's look offset yaw (deg)
+    float aimBlend = 0.0f, sprintBlend = 0.0f, dragYaw = 0.0f;
+    int pwa = 0, ctx = 0, cam = 0; //!< pipeline calls in the previous frame
+    bool attachValid = false;
+};
+
 class ModMain final : public ChairloaderModBase, public IInputEventListener
 {
 public:
@@ -553,6 +569,17 @@ private:
     void LoadWeapons();
     void SaveWeapons();
     fs::path GetWeaponsPath() const;
+
+    // Pop tracer
+    std::vector<TraceSample> m_trace;   //!< ring buffer
+    size_t m_traceHead = 0;
+    size_t m_traceCount = 0;
+    float m_traceLastSave = -100.0f;
+    int m_traceSaves = 0;
+    bool m_traceAuto = true;
+    std::string m_traceStatus;
+    void RecordTrace();
+    void SaveTrace(const char* reason);
 
     //! Applies the world FOV / sprint sensitivity overrides.
     void UpdateCameraInputOverrides();

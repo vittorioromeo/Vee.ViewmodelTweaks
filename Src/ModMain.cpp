@@ -143,6 +143,44 @@ static_assert(offsetof(ArkPlayerCamera, m_rotation) == 0x150, "ArkPlayerCamera l
 static_assert(offsetof(ArkPlayerInput, m_sprintCameraRotationRateScale) == 0x98, "ArkPlayerInput layout mismatch");
 static_assert(offsetof(SViewParams, rotation) == 0x0C, "SViewParams layout mismatch");
 
+// --- Structures the GAME fills in for us ---------------------------------------------------------
+// Prey's physics is not stock CryEngine, and the SDK's physinterface.h is. pe_status_living in Prey is
+// 152 bytes (an extra Vec3 after velGround: groundSurfaceIdx sits at +0x64 where the header says +0x58);
+// the header's 136-byte version therefore made CLivingEntity::GetStatus write 16 bytes past our local -
+// straight over the saved xmm6 in the caller's frame, i.e. over MainUpdate's `dt`. That garbage step was
+// what made every smoothed value (convergence, wall pull-back) either freeze or snap. So: our own layout
+// for the fields we read, and generous padding after everything the game writes into.
+struct PreyStatusLiving : pe_status
+{
+    enum entype { type_id = ePE_status_living };
+    PreyStatusLiving() { type = type_id; }
+    int              bFlying;            // +0x04
+    float            timeFlying;         // +0x08
+    Vec3             camOffset;          // +0x0C
+    Vec3             vel;                // +0x18 (confirmed against the game's readers)
+    Vec3             velUnconstrained;   // +0x24
+    Vec3             velRequested;       // +0x30
+    Vec3             velGround;          // +0x3C
+    Vec3             preyExtra;          // +0x48 Prey-only field
+    float            groundHeight;       // +0x54
+    Vec3             groundSlope;        // +0x58
+    int              groundSurfaceIdx;   // +0x64 (confirmed)
+    int              groundSurfaceIdxAux;// +0x68
+    IPhysicalEntity* pGroundCollider;    // +0x70
+    int              iGroundColliderPart;// +0x78
+    float            timeSinceStanceChange; // +0x7C
+    int              bStuck;             // +0x80
+    volatile int*    pLockStep;          // +0x88
+    int              iCurTime;           // +0x90
+    int              bSquashed;          // +0x94
+    char             pad[128];           // the game may write further still; nothing of ours lives here
+};
+static_assert(offsetof(PreyStatusLiving, vel) == 0x18 && offsetof(PreyStatusLiving, groundSurfaceIdx) == 0x64, "PreyStatusLiving layout");
+struct PaddedRayHit : ray_hit
+{
+    char pad[128];
+};
+
 template <typename R, typename... Args>
 static inline R VCall(void* pObj, size_t slot, Args... args)
 {
@@ -1153,7 +1191,7 @@ void ModMain::UpdateConvergence(float dt)
     const Vec3 dir = cam.GetColumn1().GetNormalized(); // CryEngine forward = +Y
 
     const float maxDist = clamp_tpl(s.convergeMaxDist, 1.0f, 200.0f);
-    ray_hit hit;
+    PaddedRayHit hit; // padded: the game's ray_hit may be larger than the SDK's
     const int n = gEnv->pPhysicalWorld->RayWorldIntersection(camPos, dir * maxDist, ent_all,
         rwi_stop_at_pierceable | rwi_colltype_any(geom_colltype_ray | geom_colltype0 | geom_colltype_player), &hit, 1, pSkip);
     m_convergeHit = (n > 0);
@@ -1364,7 +1402,7 @@ void ModMain::UpdateFeel(float dt, ArkPlayer* pPlayer)
     f.speed = 0.0f;
     if (IPhysicalEntity* pPhys = pEnt->GetPhysics())
     {
-        pe_status_living living;
+        PreyStatusLiving living; // NOT pe_status_living: see the struct's comment
         if (pPhys->GetStatus(&living) && Finite(living.vel))
             f.speed = Vec2(living.vel.x, living.vel.y).GetLength();
     }
@@ -2061,6 +2099,83 @@ void ModMain::UpdateReticle()
 }
 
 //---------------------------------------------------------------------------------
+// Pop tracer: what the filters output vs. what the weapon actually does, per update
+//---------------------------------------------------------------------------------
+void ModMain::RecordTrace()
+{
+    constexpr size_t N = 1500; // ~30 s at 50 updates/s
+    if (m_trace.size() != N)
+    {
+        m_trace.assign(N, TraceSample());
+        m_traceHead = 0;
+        m_traceCount = 0;
+    }
+    TraceSample smp;
+    smp.t = (gEnv && gEnv->pTimer) ? (float)(gEnv->pTimer->GetAsyncTime().GetValue() % 100000000000LL) * 1e-5f : 0.0f;
+    smp.dt = m_dtUsed;
+    smp.cYaw = m_convergeYaw; smp.cYawT = m_convergeTargetYaw;
+    smp.cPitch = m_convergePitch; smp.cPitchT = m_convergeTargetPitch;
+    smp.wall = m_wallPush; smp.wallT = m_wallPushTarget;
+    smp.dist = m_convergeDist;
+    smp.attachValid = m_render.attachValid;
+    if (m_render.attachValid && SaneQuatT(m_render.weaponRelCam, 5.0f))
+    {
+        const Ang3 a = SafeAng3(m_render.weaponRelCam.q);
+        smp.mPitch = RAD2DEG(a.x); smp.mRoll = RAD2DEG(a.y); smp.mYaw = RAD2DEG(a.z);
+        smp.mX = m_render.weaponRelCam.t.x; smp.mY = m_render.weaponRelCam.t.y; smp.mZ = m_render.weaponRelCam.t.z;
+    }
+    smp.lookYaw = RAD2DEG(SafeAng3(m_gameOffsets[0].q).z);
+    smp.aimBlend = m_aimBlend;
+    smp.sprintBlend = m_feel.sprintBlend;
+    smp.dragYaw = m_feel.dragHipOut.yaw;
+    smp.pwa = m_diag.pwaUpdatesLastFrame; smp.ctx = m_diag.ctxUpdatesLastFrame; smp.cam = m_render.callsLastFrame;
+
+    // Pop detector: the weapon turned by a lot in one update while the smoothed value barely moved.
+    const TraceSample& prev = m_trace[(m_traceHead + N - 1) % N];
+    if (m_traceAuto && m_traceCount > 10 && prev.attachValid && smp.attachValid)
+    {
+        const float dMeasured = fabsf(smp.mYaw - prev.mYaw) + fabsf(smp.mPitch - prev.mPitch);
+        const float dFilter = fabsf(smp.cYaw - prev.cYaw) + fabsf(smp.cPitch - prev.cPitch);
+        const float dLook = fabsf(smp.lookYaw - prev.lookYaw);
+        if (dMeasured > 3.0f && dFilter < 0.25f * dMeasured && dLook < 0.25f * dMeasured && smp.t - m_traceLastSave > 20.0f)
+            m_traceStatus = "pop!"; // saved below, after this sample is in the buffer
+    }
+    m_trace[m_traceHead] = smp;
+    m_traceHead = (m_traceHead + 1) % N;
+    if (m_traceCount < N) m_traceCount++;
+    if (m_traceStatus == "pop!")
+        SaveTrace("auto (weapon jumped while the filter did not)");
+}
+
+void ModMain::SaveTrace(const char* reason)
+{
+    const fs::path path = GetWeaponsPath().parent_path() / "Vee.ViewmodelTweaks.trace.csv";
+    FILE* f = fopen(path.u8string().c_str(), "w");
+    if (!f)
+    {
+        m_traceStatus = "could not write " + path.u8string();
+        return;
+    }
+    fprintf(f, "# %s | smoothing converge=%.3f wall=%.3f | %d samples, newest last\n", reason, m_settings.convergeSmoothTime, m_settings.wallPushSmoothTime, (int)m_traceCount);
+    fprintf(f, "t,dt_ms,conv_yaw,conv_yaw_target,conv_pitch,conv_pitch_target,wall_cm,wall_target_cm,ray_dist,meas_yaw,meas_pitch,meas_roll,meas_x,meas_y,meas_z,look_yaw,aim_blend,sprint_blend,drag_yaw,pwa,ctx,cam,attach\n");
+    const size_t N = m_trace.size();
+    for (size_t i = 0; i < m_traceCount; i++)
+    {
+        const TraceSample& x = m_trace[(m_traceHead + N - m_traceCount + i) % N];
+        fprintf(f, "%.4f,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d\n",
+            x.t, x.dt * 1000.0f, x.cYaw, x.cYawT, x.cPitch, x.cPitchT, x.wall * 100.0f, x.wallT * 100.0f, x.dist,
+            x.mYaw, x.mPitch, x.mRoll, x.mX, x.mY, x.mZ, x.lookYaw, x.aimBlend, x.sprintBlend, x.dragYaw, x.pwa, x.ctx, x.cam, x.attachValid ? 1 : 0);
+    }
+    fclose(f);
+    m_traceSaves++;
+    m_traceLastSave = m_traceCount ? m_trace[(m_traceHead + N - 1) % N].t : 0.0f;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "trace #%d saved (%s)", m_traceSaves, reason);
+    m_traceStatus = buf;
+    CryLog("ViewmodelTweaks: {} -> {}", buf, path.u8string());
+}
+
+//---------------------------------------------------------------------------------
 // Per-weapon persistence
 //---------------------------------------------------------------------------------
 fs::path ModMain::GetWeaponsPath() const
@@ -2419,6 +2534,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     SanitizeFeel();
     UpdateNudge(dt);
     UpdateConvergence(dt);
+    RecordTrace();
 
     if (m_weaponsDirty)
     {
@@ -2777,6 +2893,18 @@ void ModMain::DrawWindow()
                         const float k = (tau > 0.0005f) ? (1.0f - expf(-m_dtUsed / tau)) : 1.0f;
                         ImGui::TextDisabled("Filter step %.2f ms (game frame time %.2f ms) | %.0f updates/s | %.1f %% of the gap closed per update",
                             m_dtUsed * 1000.0f, m_dtGame * 1000.0f, m_updateHz, k * 100.0f);
+                    }
+                    if (ImGui::Button("Save trace CSV"))
+                        SaveTrace("manual");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Writes the last ~30 s of per-update values (filter output vs. the weapon's measured orientation) to\n"
+                            "Mods/config/Vee.ViewmodelTweaks.trace.csv. Also written automatically when the weapon jumps while the filter did not.");
+                    ImGui::SameLine();
+                    ImGui::Checkbox("auto on pop", &m_traceAuto);
+                    if (!m_traceStatus.empty())
+                    {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%s", m_traceStatus.c_str());
                     }
                     ImGui::EndDisabled();
                     ImGui::Spacing();

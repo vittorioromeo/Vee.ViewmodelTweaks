@@ -147,10 +147,22 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
 * Mod cvars are unregistered in `ShutdownSystem`: the console keeps raw pointers to the names and storage,
   which vanish with the DLL, and touches them again at engine shutdown (crash on exit otherwise).
 
-## Two ABI traps that cost a crash each
+## Three ABI traps
 
 1. Member functions returning a struct larger than 8 bytes (`QuatT`, `std::vector`, `std::pair`) take the
    hidden return pointer AFTER `this`. Never hook or call them through an SDK declaration that returns the
    struct directly; declare `R* (T* _this, R* _ret, args...)`.
 2. `PreyFunction` instances are rebased when the DLL initialises; a function-local `static` one is
    constructed too late and calls the raw RVA.
+3. **The SDK's `physinterface.h` is stock CryEngine; Prey's physics structs are not.** `pe_status_living`
+   is 152 bytes in Prey (an extra `Vec3` after `velGround`; `groundSurfaceIdx` at +0x64, not +0x58), the
+   header's is 136. `GetStatus(&living)` on a header-sized local wrote 16 bytes past it - exactly onto the
+   caller's saved xmm6 in `UpdateFeel`'s frame, which `MainUpdate` was using for `dt`. The corrupted step
+   made every exponential filter downstream (convergence, wall pull-back) either freeze (tiny/negative dt ->
+   k = 0) or snap (large dt -> k = 1), and which one depended on the frame layout of each build. No crash,
+   no NaN, just wrong smoothing - found by tracing filter value vs. target per update. Rule: every struct the
+   *game* fills in (`pe_status_*`, `ray_hit`, ...) is declared with Prey's layout when known and always with
+   a generous pad after it (`PreyStatusLiving`, `PaddedRayHit` in ModMain.cpp). Symptom to remember: a
+   smoothed value that tracks its target instantly or not at all while the code is provably right means
+   the *step* is garbage, and a garbage step in a value that was fine a call earlier means a callee
+   trashed a callee-saved register - look for a stack struct the callee writes into.
