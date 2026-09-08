@@ -1359,10 +1359,25 @@ void ModMain::UpdateBlendStates(float dt)
             if (pWeapon && pWeapon->GetOwnerId() != pPlayer->GetEntity()->GetId())
                 pWeapon = nullptr;
             m_wsReloading = pWeapon && pWeapon->m_bIsReloading;
+            // "Ready to attack" is cleared for select, reload AND every fire action (pump / bolt / beam cycle),
+            // so it cannot be used on its own; it only tells us when a freshly drawn weapon has finished coming up.
             m_wsReady = !pWeapon || pWeapon->m_bIsReadyToAttack;
             m_wsUnequipping = (pWeapon && pWeapon->m_bIsUnequipping) || wc.m_bIsUnequipping
                 || (wc.m_toBeEquippedWeaponId != 0 && wc.m_toBeEquippedWeaponId != wc.m_equippedWeaponId);
-            m_wsSwitching = m_wsUnequipping || (!m_wsReady && !m_wsReloading);
+            const unsigned curId = pWeapon ? wc.m_equippedWeaponId : 0u;
+            if (curId != m_wsLastWeaponId)
+            {
+                m_wsLastWeaponId = curId;
+                m_wsDrawing = curId != 0; // a new weapon: its draw animation is playing until it reports ready
+                m_wsDrawTimer = 0.0f;
+            }
+            if (m_wsDrawing)
+            {
+                m_wsDrawTimer += dt;
+                if (m_wsReady || m_wsDrawTimer > 3.0f)
+                    m_wsDrawing = false;
+            }
+            m_wsSwitching = m_wsUnequipping || m_wsDrawing;
         }
 
         // Aim key held/toggled, weapon allows aiming, and the player is actually controlling the
@@ -1381,8 +1396,9 @@ void ModMain::UpdateBlendStates(float dt)
         m_currentWeaponClass.clear();
         m_feel.sprinting = false;
         m_feel.zeroG = false;
-        m_wsReloading = m_wsUnequipping = m_wsSwitching = false;
+        m_wsReloading = m_wsUnequipping = m_wsSwitching = m_wsDrawing = false;
         m_wsReady = true;
+        m_wsLastWeaponId = 0;
     }
 
     if (!aiming && m_settings.aimToggle && (IsHardwareCursorVisible() || !pPlayer))
@@ -3237,8 +3253,9 @@ void ModMain::DrawWindow()
                     "The sights drop when a reload starts and come back when it ends (the aim key can stay held).");
                 CheckboxInt("No aiming while switching weapons", s.aimBlockSwitch,
                     "Same for the holster / draw animations: aiming waits until the new weapon is ready.");
-                ImGui::TextDisabled("Weapon: %s%s%s%s", m_wsReloading ? "reloading " : "", m_wsUnequipping ? "holstering/drawing " : "",
-                    m_wsReady ? "" : "action in progress ", (!m_wsReloading && !m_wsUnequipping && m_wsReady) ? "idle" : "");
+                ImGui::TextDisabled("Weapon: %s%s%s%s%s", m_wsReloading ? "reloading " : "", m_wsUnequipping ? "holstering " : "",
+                    m_wsDrawing ? "drawing " : "", m_wsReady ? "" : "(busy) ",
+                    (!m_wsReloading && !m_wsUnequipping && !m_wsDrawing) ? "idle" : "");
 
                 ImGui::Spacing();
                 CheckboxInt("Zoom camera while aiming", s.aimCameraZoom, "Lowers the world FOV while aiming (the weapon gets bigger with it, like real ADS).");

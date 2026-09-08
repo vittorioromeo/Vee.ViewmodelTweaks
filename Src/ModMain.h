@@ -473,6 +473,9 @@ private:
     float m_reloadFade = 0.0f;          //!< 0 = offsets fully applied, 1 = fully faded (reload in progress).
     // Weapon state as read from the game each update (debug + gates).
     bool m_wsReloading = false, m_wsUnequipping = false, m_wsSwitching = false, m_wsReady = true;
+    bool m_wsDrawing = false;           //!< a weapon was just equipped and has not reported ready yet (draw animation)
+    unsigned m_wsLastWeaponId = 0;
+    float m_wsDrawTimer = 0.0f;
     bool m_isCrouching = false;
     bool m_isAiming = false;
     bool m_aimKeyHeld = false;          //!< Raw state of the aim key (hold mode) or the toggle state.
