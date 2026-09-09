@@ -1282,6 +1282,17 @@ void ModMain::UpdateConvergence(float dt)
                 blend = SmoothStep01((frac - start) / (full - start)) * clamp_tpl(pW ? pW->wallPoseAmount : 1.0f, 0.0f, 1.0f);
             }
         }
+        // Looking steeply up or down the pose stops making sense (the wall is no longer where the muzzle would
+        // go); give way to the plain pull-back with the camera pitch.
+        m_camPitchDeg = RAD2DEG(asinf(clamp_tpl(dir.z, -1.0f, 1.0f)));
+        {
+            const float a0 = clamp_tpl(s.wallPosePitchStart, 0.0f, 89.0f);
+            const float a1 = clamp_tpl(s.wallPosePitchFull, a0 + 0.5f, 90.0f);
+            const float t = SmoothStep01((fabsf(m_camPitchDeg) - a0) / (a1 - a0));
+            m_wallPitchFade = 1.0f - t * clamp_tpl(s.wallPosePitchStrength, 0.0f, 1.0f);
+            if (!Finite(m_wallPitchFade)) m_wallPitchFade = 1.0f;
+        }
+        blend *= m_wallPitchFade;
         m_wallBlend = Finite(blend) ? blend : 0.0f;
     }
 
@@ -1630,6 +1641,7 @@ void ModMain::SanitizeSettings()
     fixF(s.aimWallBlockScale, def.aimWallBlockScale); fixF(s.wallPushStartDist, def.wallPushStartDist);
     fixF(s.wallPushFullDist, def.wallPushFullDist); fixF(s.wallPushSmoothTime, def.wallPushSmoothTime);
     fixF(s.wallPoseStart, def.wallPoseStart); fixF(s.wallPoseFull, def.wallPoseFull); fixF(s.wallPoseConvergeFade, def.wallPoseConvergeFade);
+    fixF(s.wallPosePitchStart, def.wallPosePitchStart); fixF(s.wallPosePitchFull, def.wallPosePitchFull); fixF(s.wallPosePitchStrength, def.wallPosePitchStrength);
     fixF(s.sprintBlendIn, def.sprintBlendIn); fixF(s.sprintBlendOut, def.sprintBlendOut);
     fixF(s.sprintSwayPos, def.sprintSwayPos); fixF(s.sprintSwayRot, def.sprintSwayRot); fixF(s.sprintSwayFreq, def.sprintSwayFreq);
     fixF(s.aimSwayPos, def.aimSwayPos); fixF(s.aimSwayRot, def.aimSwayRot); fixF(s.aimSwayFreq, def.aimSwayFreq);
@@ -2462,6 +2474,9 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_wall_pose_start", &s.wallPoseStart, s.wallPoseStart, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fraction of the full pull-back (0..1) where the near-wall pose starts blending in");
     REGISTER_CVAR2("vm_wall_pose_full", &s.wallPoseFull, s.wallPoseFull, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fraction of the full pull-back (0..1) where the near-wall pose is fully applied");
     REGISTER_CVAR2("vm_wall_pose_converge_fade", &s.wallPoseConvergeFade, s.wallPoseConvergeFade, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how much the hip convergence fades out as the near-wall pose comes in (0..1)");
+    REGISTER_CVAR2("vm_wall_pose_pitch_start", &s.wallPosePitchStart, s.wallPosePitchStart, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera pitch (deg up or down) where the near-wall pose starts giving way to the plain pull-back");
+    REGISTER_CVAR2("vm_wall_pose_pitch_full", &s.wallPosePitchFull, s.wallPosePitchFull, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera pitch (deg) where that fade is complete");
+    REGISTER_CVAR2("vm_wall_pose_pitch_strength", &s.wallPosePitchStrength, s.wallPosePitchStrength, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how much of the near-wall pose is removed at full pitch (0 = pitch fade off, 1 = all of it)");
     REGISTER_CVAR2("vm_reticle_mode", &s.reticleMode, s.reticleMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle position. 0 = game default, 1 = centered, 2 = custom (vm_reticle_y)");
     REGISTER_CVAR2("vm_reticle_y", &s.reticleY, s.reticleY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: custom g_reticleYPercentage (0 = top, 1 = bottom)");
     REGISTER_CVAR2("vm_reticle_style", &s.reticleStyle, s.reticleStyle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle style (hud_reticleSetting). 0 = game default, 1 = default reticle, 2 = simple dot, 3 = hidden");
@@ -3070,7 +3085,18 @@ void ModMain::DrawWindow()
                     ImGui::SliderFloat("Convergence yields to the pose", &s.wallPoseConvergeFade, 0.0f, 1.0f, "x%.2f");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("The pose points the barrel away from the wall on purpose; this fades the hip convergence out in proportion.");
-                    ImGui::TextDisabled("Now: pose blend %.0f%%", m_wallBlend * 100.0f);
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Looking up / down");
+                    ImGui::SliderFloat("Pose fades from", &s.wallPosePitchStart, 0.0f, 85.0f, "%.0f deg");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Camera pitch (up or down) at which the near-wall pose starts giving way to the plain pull-back.\n"
+                                          "Looking level the pose is fully there; steeply up or down the wall is no longer where the muzzle would go.");
+                    ImGui::SliderFloat("Fully faded at", &s.wallPosePitchFull, 1.0f, 90.0f, "%.0f deg");
+                    if (s.wallPosePitchFull <= s.wallPosePitchStart + 0.5f) s.wallPosePitchFull = min(s.wallPosePitchStart + 0.5f, 90.0f);
+                    ImGui::SliderFloat("Fade strength", &s.wallPosePitchStrength, 0.0f, 1.0f, "x%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("1 = at full pitch only the plain pull-back remains; lower values keep part of the pose; 0 turns the pitch fade off.");
+                    ImGui::TextDisabled("Now: pose blend %.0f%% | camera pitch %.0f deg -> pitch factor x%.2f", m_wallBlend * 100.0f, m_camPitchDeg, m_wallPitchFade);
                     ImGui::EndDisabled();
                     ImGui::EndDisabled();
                 }

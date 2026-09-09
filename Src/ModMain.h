@@ -140,6 +140,9 @@ struct ViewmodelSettings
     float wallPoseStart = 0.10f;    //!< fraction of the weapon's full pull-back where the pose starts blending in
     float wallPoseFull = 0.85f;     //!< fraction where the pose is fully applied
     float wallPoseConvergeFade = 1.0f; //!< how much the hip convergence fades out as the wall pose comes in (0 none, 1 fully)
+    float wallPosePitchStart = 20.0f;  //!< camera pitch (deg up or down) where the pose starts giving way to the plain pull-back
+    float wallPosePitchFull = 50.0f;   //!< pitch where the fade is complete
+    float wallPosePitchStrength = 1.0f; //!< how much of the pose is removed at full pitch (1 = all, 0 = the pitch fade is off)
 
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
@@ -523,6 +526,8 @@ private:
     float m_wallPush = 0.0f;        //!< smoothed pull-back (m)
     float m_wallPushTarget = 0.0f;
     float m_wallBlend = 0.0f;       //!< 0..1 blend of the current weapon's near-wall pose (from the pull-back fraction)
+    float m_wallPitchFade = 1.0f;   //!< 1..0 multiplier from the camera pitch (looking steeply up/down -> plain pull-back)
+    float m_camPitchDeg = 0.0f;     //!< camera pitch this frame (deg, + up), debug
     int m_frameIndex = 0;
     // Frame timing as seen by MainUpdate: the smoothing filters use the measured wall-clock step between
     // updates (clamped), so a wrong game frame time or several updates per frame cannot defeat them.

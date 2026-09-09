@@ -112,6 +112,9 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
   has used its full pull-back (the weapon "length"). The pose is added to the hip pose (faded by the aim blend
   and the reload fade like everything else) and the hip convergence is scaled by `1 - blend *
   wallPoseConvergeFade`, since the pose deliberately points the barrel away from the impact point.
+* The blend is also multiplied by a camera-pitch factor `1 - strength * SmoothStep01((|pitch| - a0) / (a1 - a0))`
+  (pitch from the view ray, `asin(dir.z)`): looking steeply up or down the wall is no longer where the muzzle
+  would go, so the weapon returns to the plain pull-back.
 
 ## Feel layer (sprint pose, aim sway, view drag)
 
