@@ -102,6 +102,17 @@ For the FOV: the weapon is rendered in the "nearest" pass with its own FOV store
 game's "near FOV locked" state (used when the weapon must share the world FOV).
 
 
+## Wall pull-back and the near-wall pose
+
+* One `RayWorldIntersection` along the view ray per frame (`rwi_stop_at_pierceable`, skipping the player) gives
+  the hit distance used by convergence, the pull-back and the aim block. The pull-back target is
+  `SmoothStep01((start - dist) / (start - full)) * weapon.wallPush`, exponentially smoothed.
+* The near-wall pose reuses that state: `blend = SmoothStep01((push / weapon.wallPush - biasStart) /
+  (biasFull - biasStart)) * weapon.wallPoseAmount`, so it is 0 while the weapon is free and 1 once the weapon
+  has used its full pull-back (the weapon "length"). The pose is added to the hip pose (faded by the aim blend
+  and the reload fade like everything else) and the hip convergence is scaled by `1 - blend *
+  wallPoseConvergeFade`, since the pose deliberately points the barrel away from the impact point.
+
 ## Feel layer (sprint pose, aim sway, view drag)
 
 * Pure per-frame state (`UpdateFeel`, from `MainUpdate`) with two outputs: additive view-space offsets for the

@@ -470,8 +470,14 @@ void ModMain::ApplyOffset(QuatT& offset) const
     PoseOffset total = s.base;
     if (cb > 0.0f)
         total.AddScaled(s.crouch, cb);
-    if (const WeaponSettings* pW = FindCurrentWeapon())
-        total.AddScaled(pW->hip, 1.0f);
+    const WeaponSettings* pWeapon = FindCurrentWeapon();
+    if (pWeapon)
+        total.AddScaled(pWeapon->hip, 1.0f);
+    // Near-wall pose: the weapon's own "against a wall" attitude (e.g. shotgun muzzle up), blended in as the
+    // wall pull-back builds up (m_wallBlend, see UpdateConvergence). Hip only: aiming is blocked near walls.
+    const float wb = (s.wallPoseEnabled && pWeapon && SanePose(pWeapon->wall)) ? clamp_tpl(m_wallBlend, 0.0f, 1.0f) * (1.0f - ab) : 0.0f;
+    if (wb > 0.0f)
+        total.AddScaled(pWeapon->wall, wb);
     // Feel layer (hip side): sprint pose + sprint sway, view drag. Both fade out as the sights come up;
     // the aim side has its own versions.
     if (SanePose(m_feel.sprintOut))
@@ -505,7 +511,8 @@ void ModMain::ApplyOffset(QuatT& offset) const
     // Fades out with the aim blend (the ironsight lock is on the camera ray by definition).
     if (s.convergeEnabled && (m_convergeYaw != 0.0f || m_convergePitch != 0.0f) && keep > 0.0f)
     {
-        const float k = (1.0f - ab) * keep;
+        // The wall pose deliberately points the barrel away from the impact point, so convergence yields to it.
+        const float k = (1.0f - ab) * keep * (1.0f - wb * clamp_tpl(s.wallPoseConvergeFade, 0.0f, 1.0f));
         const Quat conv = Quat::CreateRotationXYZ(Ang3(DEG2RAD(m_convergePitch * k), 0.0f, DEG2RAD(m_convergeYaw * k)));
         offset.q = conv * offset.q;
     }
@@ -1185,6 +1192,7 @@ void ModMain::UpdateConvergence(float dt)
         m_convergeTargetYaw = m_convergeTargetPitch = 0.0f;
         m_convergeYaw = m_convergePitch = 0.0f;
         m_wallPush = m_wallPushTarget = 0.0f;
+        m_wallBlend = 0.0f;
         m_convergeHit = false;
         m_aimBlockedByWall = false;
         return;
@@ -1256,6 +1264,25 @@ void ModMain::UpdateConvergence(float dt)
             m_wallPush = 0.0f;
             m_nanRecoveries++;
         }
+    }
+
+    // --- Near-wall pose blend: how much of its full pull-back the weapon has used (0 = free, 1 = against the
+    // wall), remapped through the start/full biases and eased. Inherits the pull-back smoothing.
+    {
+        float blend = 0.0f;
+        if (wantWall && s.wallPoseEnabled)
+        {
+            const WeaponSettings* pW = FindCurrentWeapon();
+            const float amount = clamp_tpl(pW ? pW->wallPush : WeaponSettings().wallPush, 0.0f, 0.5f);
+            if (amount > 0.001f)
+            {
+                const float frac = clamp_tpl(m_wallPush / amount, 0.0f, 1.0f);
+                const float start = clamp_tpl(s.wallPoseStart, 0.0f, 0.99f);
+                const float full = clamp_tpl(s.wallPoseFull, start + 0.01f, 1.0f);
+                blend = SmoothStep01((frac - start) / (full - start)) * clamp_tpl(pW ? pW->wallPoseAmount : 1.0f, 0.0f, 1.0f);
+            }
+        }
+        m_wallBlend = Finite(blend) ? blend : 0.0f;
     }
 
     // --- Aim block: no ironsights while the weapon would be poking into the wall -----------------
@@ -1602,6 +1629,7 @@ void ModMain::SanitizeSettings()
     fixF(s.convergeSmoothTime, def.convergeSmoothTime); fixF(s.convergeMaxDist, def.convergeMaxDist);
     fixF(s.aimWallBlockScale, def.aimWallBlockScale); fixF(s.wallPushStartDist, def.wallPushStartDist);
     fixF(s.wallPushFullDist, def.wallPushFullDist); fixF(s.wallPushSmoothTime, def.wallPushSmoothTime);
+    fixF(s.wallPoseStart, def.wallPoseStart); fixF(s.wallPoseFull, def.wallPoseFull); fixF(s.wallPoseConvergeFade, def.wallPoseConvergeFade);
     fixF(s.sprintBlendIn, def.sprintBlendIn); fixF(s.sprintBlendOut, def.sprintBlendOut);
     fixF(s.sprintSwayPos, def.sprintSwayPos); fixF(s.sprintSwayRot, def.sprintSwayRot); fixF(s.sprintSwayFreq, def.sprintSwayFreq);
     fixF(s.aimSwayPos, def.aimSwayPos); fixF(s.aimSwayRot, def.aimSwayRot); fixF(s.aimSwayFreq, def.aimSwayFreq);
@@ -1622,7 +1650,8 @@ void ModMain::SanitizeSettings()
         if (pB) d = *pB; else d.aim = WeaponSettings::DefaultAim();
         if (w.hip.Sanitize(d.hip)) fixed++;
         if (w.aim.Sanitize(d.aim)) fixed++;
-        fixF(w.wallPush, d.wallPush); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
+        if (w.wall.Sanitize(d.wall)) fixed++;
+        fixF(w.wallPush, d.wallPush); fixF(w.wallPoseAmount, d.wallPoseAmount); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
         fixF(w.aimRecoilScale, d.aimRecoilScale); fixF(w.aimKickScale, d.aimKickScale); fixF(w.aimSpreadMult, d.aimSpreadMult); fixF(w.hipSpreadMult, d.hipSpreadMult);
     }
     if (fixed > 0)
@@ -1708,6 +1737,7 @@ namespace
         float aimSpread, hipSpread;
         PoseOffset hip;
         PoseOffset aim;
+        PoseOffset wall;    //!< near-wall pose (blended in with the pull-back)
     };
     PoseOffset P(float x, float y, float z, float pitch = 0.0f, float yaw = 0.0f, float roll = 0.0f)
     {
@@ -1719,19 +1749,19 @@ namespace
     {
         // Aim pose = weapon attachment relative to the camera (m / deg), x = 0 means centered on the crosshair.
         static const BuiltInWeapon table[] = {
-            //  class                          aim    wall   fireC fireT recoil kick  aimSp hipSp  hip offset                                   aim pose
-            { "ArkWeaponPistol",               true,  0.066f, 1.0f, 0.40f, 3.0f, 0.30f, 0.45f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1327f, 0.04f) },
-            { "ArkWeaponShotgun",              true,  0.134f, 1.0f, 0.75f, 1.0f, 0.15f, 0.45f, 1.0f, P(0, 0, -0.0323f, 3.23f),                    P(0.0f, 0.0575f, -0.0956f, 0.73f) },
-            { "ArkWeaponGooGun",               true,  0.157f, 0.35f, 0.30f, 1.0f, 0.20f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1707f) },
-            { "ArkWeaponStunGun",              true,  0.060f, 0.35f, 0.30f, 1.0f, 0.25f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1487f) },
-            { "ArkWeaponToyGun",               true,  0.129f, 0.35f, 0.30f, 1.0f, 0.30f, 1.0f, 1.0f, P(0, -0.014f, -0.0403f, 4.84f, 5.44f),       P(0.0f, 0.0564f, -0.0954f) },
-            { "ArkWeaponInstalaser",           true,  0.216f, 0.35f, 0.30f, 1.0f, 0.35f, 1.0f, 1.0f, P(0, 0, -0.0362f, 5.13f, 2.58f),             P(0.165f, -0.2295f, 0.0511f, 0.0f, 0.01f) },
-            { "ArkWeaponWrench",               false, 0.026f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(-0.0177f, 0.0242f, 0.0398f, 4.83f, 0.0f, -5.99f), P(0, 0.25f, -0.06f) },
-            { "ArkWeaponEMPGrenade",           false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponLureGrenade",          false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponRecyclerGrenade",      false, 0.000f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponNullwaveTransmitter",  false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
-            { "ArkWeaponExplosiveGrenade",     false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f) },
+            //  class                          aim    wall   fireC fireT recoil kick  aimSp hipSp  hip offset                                   aim pose                                      near-wall pose
+            { "ArkWeaponPistol",               true,  0.066f, 1.0f, 0.40f, 3.0f, 0.30f, 0.45f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1327f, 0.04f), P(0, -0.02f, 0, 12.0f) },
+            { "ArkWeaponShotgun",              true,  0.134f, 1.0f, 0.75f, 1.0f, 0.15f, 0.45f, 1.0f, P(0, 0, -0.0323f, 3.23f),                    P(0.0f, 0.0575f, -0.0956f, 0.73f), P(0.01f, -0.05f, -0.02f, 42.0f, -4.0f, 6.0f) },
+            { "ArkWeaponGooGun",               true,  0.157f, 0.35f, 0.30f, 1.0f, 0.20f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1707f), P(0, -0.04f, -0.01f, 28.0f, -3.0f) },
+            { "ArkWeaponStunGun",              true,  0.060f, 0.35f, 0.30f, 1.0f, 0.25f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0.0f, 0.250f, -0.1487f), P(0, -0.02f, 0, 12.0f) },
+            { "ArkWeaponToyGun",               true,  0.129f, 0.35f, 0.30f, 1.0f, 0.30f, 1.0f, 1.0f, P(0, -0.014f, -0.0403f, 4.84f, 5.44f),       P(0.0f, 0.0564f, -0.0954f), P(0, -0.04f, -0.01f, 26.0f, -3.0f) },
+            { "ArkWeaponInstalaser",           true,  0.216f, 0.35f, 0.30f, 1.0f, 0.35f, 1.0f, 1.0f, P(0, 0, -0.0362f, 5.13f, 2.58f),             P(0.165f, -0.2295f, 0.0511f, 0.0f, 0.01f), P(0, -0.05f, -0.02f, 30.0f, -6.0f, 4.0f) },
+            { "ArkWeaponWrench",               false, 0.026f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(-0.0177f, 0.0242f, 0.0398f, 4.83f, 0.0f, -5.99f), P(0, 0.25f, -0.06f), P(0, 0, 0) },
+            { "ArkWeaponEMPGrenade",           false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f), P(0, 0, 0) },
+            { "ArkWeaponLureGrenade",          false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f), P(0, 0, 0) },
+            { "ArkWeaponRecyclerGrenade",      false, 0.000f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f), P(0, 0, 0) },
+            { "ArkWeaponNullwaveTransmitter",  false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f), P(0, 0, 0) },
+            { "ArkWeaponExplosiveGrenade",     false, 0.060f, 0.35f, 0.30f, 1.0f, 1.0f, 1.0f, 1.0f, P(0, 0, 0),                                  P(0, 0.25f, -0.06f), P(0, 0, 0) },
         };
         count = sizeof(table) / sizeof(table[0]);
         return table;
@@ -1763,6 +1793,7 @@ const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
         w.hipSpreadMult = t[i].hipSpread;
         w.hip = t[i].hip;
         w.aim = t[i].aim;
+        w.wall = t[i].wall;
         w.valid = false; // built-in: not written to the XML until the user changes it
         return &s_cache.emplace(weaponClass, w).first->second;
     }
@@ -2280,6 +2311,12 @@ void ModMain::LoadWeapons()
         w.hipSpreadMult = n.attribute("hip_spread_mult").as_float(WeaponSettings().hipSpreadMult);
         ReadPose(n, "hip_", w.hip, PoseOffset());
         ReadPose(n, "aim_", w.aim, WeaponSettings::DefaultAim());
+        {
+            // Files written before the near-wall pose existed keep the built-in pose for that weapon.
+            const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
+            ReadPose(n, "wall_", w.wall, pB ? pB->wall : PoseOffset());
+            w.wallPoseAmount = n.attribute("wall_pose_amount").as_float(pB ? pB->wallPoseAmount : 1.0f);
+        }
         // Backwards compatibility with 1.3.0 files (aim pose stored as x/y/z/pitch/yaw/roll)
         if (n.attribute("x") && !n.attribute("aim_x"))
             ReadPose(n, "", w.aim, WeaponSettings::DefaultAim());
@@ -2294,7 +2331,7 @@ void ModMain::SaveWeapons()
 {
     pugi::xml_document doc;
     pugi::xml_node root = doc.append_child("Weapons");
-    root.append_attribute("comment") = "Per-weapon settings. hip_*: additive offset while not aiming. aim_*: weapon relative to camera while aiming. wall_push: pull-back (m) against walls. Meters (x right, y forward, z up), degrees.";
+    root.append_attribute("comment") = "Per-weapon settings. hip_*: additive offset while not aiming. aim_*: weapon relative to camera while aiming. wall_push: pull-back (m) against walls. wall_*: near-wall pose blended in with the pull-back, wall_pose_amount its multiplier. Meters (x right, y forward, z up), degrees.";
     for (auto& kv : m_weapons)
     {
         if (!kv.second.valid)
@@ -2311,6 +2348,8 @@ void ModMain::SaveWeapons()
         n.append_attribute("hip_spread_mult") = kv.second.hipSpreadMult;
         WritePose(n, "hip_", kv.second.hip);
         WritePose(n, "aim_", kv.second.aim);
+        WritePose(n, "wall_", kv.second.wall);
+        n.append_attribute("wall_pose_amount") = kv.second.wallPoseAmount;
     }
     const fs::path path = GetWeaponsPath();
     if (!doc.save_file(path.c_str()))
@@ -2419,6 +2458,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_wall_push_full", &s.wallPushFullDist, s.wallPushFullDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: distance (m) at which the full per-weapon pull-back is reached");
     REGISTER_CVAR2("vm_wall_push_smooth", &s.wallPushSmoothTime, s.wallPushSmoothTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: wall pull-back smoothing time constant in seconds");
     REGISTER_CVAR2("vm_wall_push_aiming", &s.wallPushWhileAiming, s.wallPushWhileAiming, VF_DUMPTOCHAIR, "Viewmodel Tweaks: keep the wall pull-back while aiming (0/1)");
+    REGISTER_CVAR2("vm_wall_pose", &s.wallPoseEnabled, s.wallPoseEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: blend each weapon's near-wall pose in as the pull-back builds up (0/1); the pose is per weapon");
+    REGISTER_CVAR2("vm_wall_pose_start", &s.wallPoseStart, s.wallPoseStart, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fraction of the full pull-back (0..1) where the near-wall pose starts blending in");
+    REGISTER_CVAR2("vm_wall_pose_full", &s.wallPoseFull, s.wallPoseFull, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fraction of the full pull-back (0..1) where the near-wall pose is fully applied");
+    REGISTER_CVAR2("vm_wall_pose_converge_fade", &s.wallPoseConvergeFade, s.wallPoseConvergeFade, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how much the hip convergence fades out as the near-wall pose comes in (0..1)");
     REGISTER_CVAR2("vm_reticle_mode", &s.reticleMode, s.reticleMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle position. 0 = game default, 1 = centered, 2 = custom (vm_reticle_y)");
     REGISTER_CVAR2("vm_reticle_y", &s.reticleY, s.reticleY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: custom g_reticleYPercentage (0 = top, 1 = bottom)");
     REGISTER_CVAR2("vm_reticle_style", &s.reticleStyle, s.reticleStyle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reticle style (hud_reticleSetting). 0 = game default, 1 = default reticle, 2 = simple dot, 3 = hidden");
@@ -3005,6 +3048,30 @@ void ModMain::DrawWindow()
                         ImGui::TextDisabled("Now: %.1f cm back (target %.1f cm) | this weapon's max: %.1f cm | wall at %.2f m",
                             m_wallPush * 100, m_wallPushTarget * 100, (pW ? pW->wallPush : WeaponSettings().wallPush) * 100, m_convergeDist);
                     }
+                    ImGui::Separator();
+                    CheckboxInt("Near-wall pose", s.wallPoseEnabled,
+                        "Each weapon has a second hip pose for when it is against a wall (Weapon tab > Near-wall pose; the shotgun\n"
+                        "goes muzzle-up by default). It blends in with the pull-back: 0 while the weapon is free, 1 when it has\n"
+                        "used its full pull-back, i.e. is pressed against the wall.");
+                    ImGui::BeginDisabled(!s.wallPoseEnabled);
+                    {
+                        float pct = s.wallPoseStart * 100.0f;
+                        if (ImGui::SliderFloat("Pose starts at", &pct, 0.0f, 95.0f, "%.0f%% of the pull-back")) s.wallPoseStart = pct / 100.0f;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Bias: fraction of the weapon's full pull-back at which the pose starts blending in.");
+                    {
+                        float pct = s.wallPoseFull * 100.0f;
+                        if (ImGui::SliderFloat("Pose fully applied at", &pct, 5.0f, 100.0f, "%.0f%% of the pull-back")) s.wallPoseFull = pct / 100.0f;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Bias: fraction of the full pull-back at which the pose is complete. Must be above 'starts at'.");
+                    if (s.wallPoseFull <= s.wallPoseStart + 0.01f) s.wallPoseFull = min(s.wallPoseStart + 0.01f, 1.0f);
+                    ImGui::SliderFloat("Convergence yields to the pose", &s.wallPoseConvergeFade, 0.0f, 1.0f, "x%.2f");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("The pose points the barrel away from the wall on purpose; this fades the hip convergence out in proportion.");
+                    ImGui::TextDisabled("Now: pose blend %.0f%%", m_wallBlend * 100.0f);
+                    ImGui::EndDisabled();
                     ImGui::EndDisabled();
                 }
                 ImGui::EndDisabled();
@@ -3147,6 +3214,21 @@ void ModMain::DrawWindow()
                     {
                         ImGui::TextWrapped("Added on top of the global standing/crouch offsets while this weapon is equipped.");
                         ch |= DrawPoseSliders(w.hip, "whip", 30.0f, 45.0f);
+                    }
+                    if (ImGui::CollapsingHeader("Near-wall pose"))
+                    {
+                        ImGui::TextWrapped("Blended in on top of the hip offset as this weapon's wall pull-back builds up (0 = free, 1 = pressed "
+                                           "against the wall; Global tab > Wall pull-back sets the biases). Pitch + = muzzle up.");
+                        ch |= DrawPoseSliders(w.wall, "wwall", 30.0f, 90.0f);
+                        float amt = w.wallPoseAmount;
+                        if (ImGui::SliderFloat("Amount##wallpose", &amt, 0.0f, 1.0f, "x%.2f"))
+                        {
+                            w.wallPoseAmount = amt;
+                            ch = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Multiplier on the blend for this weapon; 0 disables the pose for it.");
+                        ImGui::TextDisabled("Now: %.0f%%", m_wallBlend * 100.0f);
                     }
                     if (ImGui::CollapsingHeader("Aim pose (ironsights)", ImGuiTreeNodeFlags_DefaultOpen))
                     {

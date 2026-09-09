@@ -136,6 +136,10 @@ struct ViewmodelSettings
     float wallPushFullDist = 0.45f; //!< meters where the full per-weapon pull-back is reached
     float wallPushSmoothTime = 0.15f; //!< seconds (exponential smoothing)
     int   wallPushWhileAiming = 0;  //!< keep pulling back while aiming (the sights stay on the view axis)
+    int   wallPoseEnabled = 1;      //!< blend each weapon's "near wall" pose in as the pull-back builds up
+    float wallPoseStart = 0.10f;    //!< fraction of the weapon's full pull-back where the pose starts blending in
+    float wallPoseFull = 0.85f;     //!< fraction where the pose is fully applied
+    float wallPoseConvergeFade = 1.0f; //!< how much the hip convergence fades out as the wall pose comes in (0 none, 1 fully)
 
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
@@ -239,6 +243,8 @@ struct WeaponSettings
     PoseOffset aim;         //!< Ironsight pose: weapon (attachment) relative to the camera while aiming.
     bool aimAllowed = true; //!< Whether the aim key does anything with this weapon.
     float wallPush = 0.06f; //!< How far (m) this weapon moves back towards the camera against a wall (longer weapon = more).
+    PoseOffset wall;        //!< "Near wall" pose, blended in on top of the hip offset as the pull-back builds up (e.g. muzzle up).
+    float wallPoseAmount = 1.0f;    //!< Multiplier on the wall pose blend for this weapon (0 = never).
     float fireCoupling = 0.35f;     //!< Head-bob coupling right after a shot (lets the fire kick show while aiming).
     float fireCouplingTime = 0.30f; //!< Seconds the fire coupling decays over.
     float aimRecoilScale = 1.0f;    //!< Multiplier on the game's procedural recoil/bump offsets while aiming.
@@ -516,6 +522,7 @@ private:
     float m_aimBlockDist = 0.0f;    //!< current blocking distance (m)
     float m_wallPush = 0.0f;        //!< smoothed pull-back (m)
     float m_wallPushTarget = 0.0f;
+    float m_wallBlend = 0.0f;       //!< 0..1 blend of the current weapon's near-wall pose (from the pull-back fraction)
     int m_frameIndex = 0;
     // Frame timing as seen by MainUpdate: the smoothing filters use the measured wall-clock step between
     // updates (clamped), so a wrong game frame time or several updates per frame cannot defeat them.

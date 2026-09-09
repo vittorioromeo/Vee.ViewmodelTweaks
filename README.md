@@ -18,8 +18,9 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
 * **Viewmodel.** Global standing and crouch offsets, per-weapon hip offsets, weapon FOV (the stock 55 is
   fixed in vanilla), world FOV, sprint look-sensitivity.
 * **Hip fire helpers.** Weapon convergence (the barrel points at what the crosshair is over), wall pull-back
-  (the weapon slides towards you near walls, more for longer weapons), no aiming while the muzzle would be
-  in a wall, while reloading or while switching weapons; the offsets ease out during reloads so the support
+  (the weapon slides towards you near walls, more for longer weapons) with a per-weapon **near-wall pose**
+  that blends in as the weapon is pressed against the wall (the shotgun goes muzzle-up), no aiming while the
+  muzzle would be in a wall, while reloading or while switching weapons; the offsets ease out during reloads so the support
   hand meets the shells.
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
@@ -51,7 +52,7 @@ frozen so you can drag sliders with the game running; press F1 again to play.
 * **Quick Settings** - the essentials: offsets on/off, weapon FOV, world FOV, sprint sensitivity, aiming
   (key, hold/toggle, ironsights FOV, camera zoom, sensitivity), convergence, wall pull-back, reticle.
 * **Global** - standing / crouch offsets for all weapons, convergence and wall pull-back tuning.
-* **Weapon** - the equipped weapon: hip offset, aim pose, allow aiming, wall pull-back distance, firing
+* **Weapon** - the equipped weapon: hip offset, near-wall pose, aim pose, allow aiming, wall pull-back distance, firing
   feel, bullet spread. Built-in defaults exist for every stock weapon; "Reset to built-in" gets them back.
 * **Feel** - sprint pose, sway & settle while aiming (with the hold-breath key), view drag.
 * **Aim** - key binding, transition time, zoom, ironsight motion (head-bob coupling, recoil, sway), sensitivity.
