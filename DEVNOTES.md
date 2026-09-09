@@ -116,6 +116,41 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
   (pitch from the view ray, `asin(dir.z)`): looking steeply up or down the wall is no longer where the muzzle
   would go, so the weapon returns to the plain pull-back.
 
+## Bullet spread (shotgun and pistol share `CArkWeaponShotgun`)
+
+Two independent terms, and for the shotgun only the first one is normally alive:
+
+* **The pellet cone.** `SpawnPellets` reads `ShotgunSpreadConeDegrees` through `CArkWeapon::GetStatFloat`,
+  lays `nNumberOfPelletRows` x `nNumberOfPelletColumns` pellets on a grid spanning that cone at the aim point,
+  and aims each pellet from the muzzle through its grid point. Shotgun archetype: 8 deg, 3x3 pellets.
+* **Dispersion**, i.e. where the cone is *centred*. `ComputeAimPoint` only randomises the aim point when
+  `cone == 0 && !combatFocus` (that is the pistol) **or when the "accurate shot" roll fails**. The shotgun
+  archetype has `fAccurateShotChance = 1`, so its roll never fails and its whole `<Dispersion>` block (all
+  values 15, all rates 0) is dead data. `ArkRegularOutcome m_accuracyOutcome` (weapon +0x4D0) holds that roll;
+  `UpdateAccuracy` (0x167DDA0) fills it from `ShotgunBaseAccuracy` + player `BaseAccuracy` +
+  `CombatFocusAccuracyBonus` and is called from `OnStatChange` for exactly those three stats. **If that
+  outcome ever stops saying 100 %, the shotgun starts using its 15 deg dispersion and the pattern roughly
+  triples** (tan15 + tan8 vs tan8) - the failure mode to look for when shotgun spread is much too wide.
+* `GetDispersionMinimum` / `GetDispersionMaximum` (0x167A6B0 / 0x167A5B0) **cache their result** in
+  `m_minDispersion` / `m_maxDispersion` (+0x4E4 / +0x4E8) before returning, and `UpdateDispersion` (0x167DFF0,
+  virtual slot +0x188, called every frame from the player movement update) compares that cache with a fresh
+  call to detect a stance/stat change, then remaps `m_weaponDispersion` (+0x4E0) from the old range into the
+  new one. A hook that scales only the return value makes that test true forever, so the remap runs every
+  frame and multiplies the current dispersion by the factor each time. Write the scaled value back into the
+  cache.
+* No shotgun weapon mod touches spread: Power/Damage 1-5 are pure damage signal scales (x1.1 ... x1.11),
+  Recoil changes `recoilPitch/Yaw`, and the others clip size / reload speed. `shotgunSpreadConeDegrees` is in
+  `Ark/WeaponMods/Config.xml`'s moddable list but no `ArkWeaponModifier` in the game data references it, so an
+  upgraded shotgun has exactly the vanilla pattern. Stat modifiers are **additive** on the base value:
+  `ArkStats::AddModifier` recomputes `final = base + sum(modifiers)` into the entry (+0x1C) and
+  `GetStatFloat` returns that.
+* `CArkWeapon::GetStatFloat` (0x1667570) is a 12-byte thunk (`add rcx, 0x1A8; jmp ArkStats::GetStatFloat`);
+  `GetStatInt` (0x16675C0) and `GetStatFloatPlayer` (0x1667580, uses the player's stats at ArkPlayer+0x7C0)
+  reach the same implementation *without* going through it, so hooking the thunk only sees float reads of the
+  weapon's own stats.
+* `vm_spread_debug 1` logs one line per shot with all of the above, including the angle between the camera
+  axis and the aim point (~0 = the shot was straight, so the pattern is the cone alone).
+
 ## Feel layer (sprint pose, aim sway, view drag)
 
 * Pure per-frame state (`UpdateFeel`, from `MainUpdate`) with two outputs: additive view-space offsets for the

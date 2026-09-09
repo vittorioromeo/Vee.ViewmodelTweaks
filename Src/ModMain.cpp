@@ -299,20 +299,46 @@ static float ArkPlayerZoomManager_GetHFOVDependentMultiplier_Hook(const ArkPlaye
 
 // Shotgun spread: the game interpolates the current dispersion between a minimum and a maximum that come
 // from stats (chipsets scale them the same way). Scaling both ends scales the whole cone.
+//
+// IMPORTANT: both getters *cache* their result in the weapon (m_minDispersion / m_maxDispersion) before
+// returning, and CArkWeaponShotgun::UpdateDispersion - called every frame from the player's movement update -
+// compares that cache against a fresh call to decide "did the range change?", then remaps the current
+// dispersion from the old range into the new one. If we scale only the returned value the cache never matches
+// what we return, that test is true every frame, and the remap multiplies the current dispersion by our factor
+// on every single frame (pinning it to the minimum, or to the maximum for factors above 1). So write our value
+// back into the cache and leave the game's own change detection intact.
+static float s_dbgDispMinOrig = 0.0f, s_dbgDispMinOut = 0.0f;
+static float s_dbgDispMaxOrig = 0.0f, s_dbgDispMaxOut = 0.0f;
+static float s_dbgConeOrig = 0.0f, s_dbgConeOut = 0.0f;
+
+static inline bool DbgFinite(float v) { return v == v && fabsf(v) < 1e30f; }
+
 static auto s_hookDispMin = CArkWeaponShotgun::FGetDispersionMinimum.MakeHook();
 static auto s_hookDispMax = CArkWeaponShotgun::FGetDispersionMaximum.MakeHook();
 static float CArkWeaponShotgun_GetDispersionMinimum_Hook(CArkWeaponShotgun const* const _this)
 {
     float v = s_hookDispMin.InvokeOrig(_this);
+    s_dbgDispMinOrig = v;
     if (gMod)
+    {
         v *= gMod->GetSpreadMultiplier(_this);
+        if (DbgFinite(v) && _this)
+            const_cast<CArkWeaponShotgun*>(_this)->m_minDispersion = v; // keep the game's cache consistent
+    }
+    s_dbgDispMinOut = v;
     return v;
 }
 static float CArkWeaponShotgun_GetDispersionMaximum_Hook(CArkWeaponShotgun const* const _this)
 {
     float v = s_hookDispMax.InvokeOrig(_this);
+    s_dbgDispMaxOrig = v;
     if (gMod)
+    {
         v *= gMod->GetSpreadMultiplier(_this);
+        if (DbgFinite(v) && _this)
+            const_cast<CArkWeaponShotgun*>(_this)->m_maxDispersion = v;
+    }
+    s_dbgDispMaxOut = v;
     return v;
 }
 // The shotgun's pellets are laid out in a cone whose angle is the weapon stat "ShotgunSpreadConeDegrees",
@@ -323,8 +349,22 @@ static float CArkWeapon_GetStatFloat_Hook(const CArkWeapon* const _this, const C
 {
     float v = s_hookGetStatFloat.InvokeOrig(_this, _statName);
     if (gMod && _statName.c_str() && strcmp(_statName.c_str(), "ShotgunSpreadConeDegrees") == 0)
+    {
+        s_dbgConeOrig = v;
         v *= gMod->GetSpreadMultiplier(_this);
+        s_dbgConeOut = v;
+    }
     return v;
+}
+
+// Diagnostics only: the pellet cone is built around this aim point, so its angle off the camera axis tells us
+// whether the game applied its dispersion to this shot at all (see OnSpawnPellets).
+static auto s_hookSpawnPellets = CArkWeaponShotgun::FSpawnPellets.MakeHook();
+static void CArkWeaponShotgun_SpawnPellets_Hook(CArkWeaponShotgun* const _this, Vec3 const& _position, Quat const& _rotation, Vec3 const& _aimPoint, const bool _bIsCritical, const bool _bShootStraight, const unsigned _groupId)
+{
+    if (gMod)
+        gMod->OnSpawnPellets(_this, _position, _aimPoint, _bShootStraight);
+    s_hookSpawnPellets.InvokeOrig(_this, _position, _rotation, _aimPoint, _bIsCritical, _bShootStraight, _groupId);
 }
 
 // Every shot of every weapon goes through CArkWeapon::FireWeapon - the reliable shot event (the pistol's
@@ -1355,6 +1395,36 @@ float ModMain::GetSpreadMultiplier(const CArkItem* pWeapon)
     const float ads = clamp_tpl(pW->aimSpreadMult, 0.0f, 5.0f);
     const float m = LERP(hip, ads, ab);
     return Finite(m) ? clamp_tpl(m, 0.0f, 5.0f) : 1.0f;
+}
+
+//! One log line per shot with everything that decides the pellet pattern. The shotgun and the pistol share
+//! CArkWeaponShotgun: pellets are laid out in a grid spanning the "ShotgunSpreadConeDegrees" cone around an
+//! aim point, and that aim point is either the exact camera target ("accurate shot", which the shotgun's
+//! fAccurateShotChance=1 normally guarantees) or a random point inside the current dispersion. "aim off-axis"
+//! is the angle between the camera axis and the aim point: ~0 means the shot was straight and the pattern is
+//! the cone alone; anything larger means the dispersion is live and adds to the pattern.
+void ModMain::OnSpawnPellets(const void* pWeapon, const Vec3& position, const Vec3& aimPoint, bool bShootStraight)
+{
+    if (!m_settings.spreadDebug || !pWeapon || !gEnv || !gEnv->pSystem)
+        return;
+    const CArkWeaponShotgun* w = static_cast<const CArkWeaponShotgun*>(pWeapon);
+    const Matrix34 cam = gEnv->pSystem->GetViewCamera().GetMatrix();
+    const Vec3 camPos = cam.GetTranslation();
+    const Vec3 fwd = cam.GetColumn1().GetNormalized();
+    const Vec3 toAim = aimPoint - camPos;
+    const float dist = toAim.GetLength();
+    const float offDeg = (dist > 0.001f) ? RAD2DEG(acosf(clamp_tpl(fwd.Dot(toAim / dist), -1.0f, 1.0f))) : 0.0f;
+    const unsigned outcome = *reinterpret_cast<const unsigned*>(reinterpret_cast<const char*>(pWeapon) + 0x4D0);
+    CryLog("ViewmodelTweaks[spread] {}: cone {:.3f}->{:.3f} deg | disp min {:.3f}->{:.3f} max {:.3f}->{:.3f} | "
+           "cur {:.3f} cached [{:.3f}, {:.3f}] | accuracy outcome 0x{:08X} | aim off-axis {:.3f} deg at {:.2f} m | "
+           "straight {} | mult {:.3f} (hip/ads blend {:.2f}) | muzzle-cam {:.3f} m",
+        m_currentWeaponClass, s_dbgConeOrig, s_dbgConeOut,
+        s_dbgDispMinOrig, s_dbgDispMinOut, s_dbgDispMaxOrig, s_dbgDispMaxOut,
+        w->m_weaponDispersion, w->m_minDispersion, w->m_maxDispersion,
+        outcome, offDeg, dist, (int)bShootStraight,
+        GetSpreadMultiplier(reinterpret_cast<const CArkItem*>(pWeapon)),
+        m_settings.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f,
+        (position - camPos).GetLength());
 }
 
 //---------------------------------------------------------------------------------
@@ -2392,6 +2462,7 @@ void ModMain::InitHooks()
     s_hookDispMin.SetHookFunc(&CArkWeaponShotgun_GetDispersionMinimum_Hook);
     s_hookDispMax.SetHookFunc(&CArkWeaponShotgun_GetDispersionMaximum_Hook);
     s_hookGetStatFloat.SetHookFunc(&CArkWeapon_GetStatFloat_Hook);
+    s_hookSpawnPellets.SetHookFunc(&CArkWeaponShotgun_SpawnPellets_Hook);
     s_hookFireWeapon.SetHookFunc(&CArkWeapon_FireWeapon_Hook);
 }
 
@@ -2529,6 +2600,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_fov", &s.fov, s.fov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: weapon FOV in degrees (game default 55)");
     REGISTER_CVAR2("vm_gui_mouse", &s.guiMouse, s.guiMouse, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show cursor and block look input while the settings window is open (0/1)");
     REGISTER_CVAR2("vm_show_window", &s.showWindow, s.showWindow, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show the settings window in the Chairloader GUI (0/1)");
+    REGISTER_CVAR2("vm_spread_debug", &s.spreadDebug, s.spreadDebug, VF_DUMPTOCHAIR, "Viewmodel Tweaks: log the full spread picture (cone, dispersion, aim offset) on every shotgun/pistol shot (0/1)");
     REGISTER_CVAR2("vm_show_advanced", &s.showAdvanced, s.showAdvanced, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show diagnostics, self-tests and experimental features in the window (0/1)");
 }
 

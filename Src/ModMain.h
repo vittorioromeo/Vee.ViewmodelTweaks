@@ -195,6 +195,7 @@ struct ViewmodelSettings
     float fov = 55.0f;          //!< Weapon FOV in degrees. Stock game uses 55.
 
     int   showWindow = 1;       //!< Whether the ImGui window is open when the Chairloader GUI is visible.
+    int   spreadDebug = 0;      //!< Log the full spread picture (cone, dispersion, aim offset) on every shotgun/pistol shot.
     int   showAdvanced = 0;     //!< Show diagnostics, self-tests and experimental features (Death tab).
     int   guiMouse = 1;         //!< Show the cursor / block player look input while the window is open (game keeps running).
 
@@ -615,6 +616,10 @@ private:
     void RegisterCVars();
     void DrawWindow();
     bool DrawPoseSliders(PoseOffset& pose, const char* id, float posRangeCm, float rotRangeDeg);
+public:
+    //! Diagnostics for the shotgun/pistol pellet spread (vm_spread_debug), called from the SpawnPellets hook.
+    void OnSpawnPellets(const void* pWeapon, const Vec3& position, const Vec3& aimPoint, bool bShootStraight);
+private:
 };
 
 extern ModMain* gMod;
