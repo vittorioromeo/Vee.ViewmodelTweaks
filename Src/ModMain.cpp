@@ -357,14 +357,25 @@ static float CArkWeapon_GetStatFloat_Hook(const CArkWeapon* const _this, const C
     return v;
 }
 
+// Diagnostics only: rows and columns are read back to back at the top of SpawnPellets.
+static int s_dbgStatInt[2] = { 0, 0 };
+static auto s_hookGetStatInt = CArkWeapon::FGetStatInt.MakeHook();
+static int CArkWeapon_GetStatInt_Hook(const CArkWeapon* const _this, const CCryName& _statName)
+{
+    const int v = s_hookGetStatInt.InvokeOrig(_this, _statName);
+    s_dbgStatInt[0] = s_dbgStatInt[1];
+    s_dbgStatInt[1] = v;
+    return v;
+}
+
 // Diagnostics only: the pellet cone is built around this aim point, so its angle off the camera axis tells us
 // whether the game applied its dispersion to this shot at all (see OnSpawnPellets).
 static auto s_hookSpawnPellets = CArkWeaponShotgun::FSpawnPellets.MakeHook();
 static void CArkWeaponShotgun_SpawnPellets_Hook(CArkWeaponShotgun* const _this, Vec3 const& _position, Quat const& _rotation, Vec3 const& _aimPoint, const bool _bIsCritical, const bool _bShootStraight, const unsigned _groupId)
 {
-    if (gMod)
-        gMod->OnSpawnPellets(_this, _position, _aimPoint, _bShootStraight);
     s_hookSpawnPellets.InvokeOrig(_this, _position, _rotation, _aimPoint, _bIsCritical, _bShootStraight, _groupId);
+    if (gMod) // after the original: the stat reads it makes are this shot's values
+        gMod->OnSpawnPellets(_this, _position, _aimPoint, _bShootStraight);
 }
 
 // Every shot of every weapon goes through CArkWeapon::FireWeapon - the reliable shot event (the pistol's
@@ -1415,16 +1426,19 @@ void ModMain::OnSpawnPellets(const void* pWeapon, const Vec3& position, const Ve
     const float dist = toAim.GetLength();
     const float offDeg = (dist > 0.001f) ? RAD2DEG(acosf(clamp_tpl(fwd.Dot(toAim / dist), -1.0f, 1.0f))) : 0.0f;
     const unsigned outcome = *reinterpret_cast<const unsigned*>(reinterpret_cast<const char*>(pWeapon) + 0x4D0);
-    CryLog("ViewmodelTweaks[spread] {}: cone {:.3f}->{:.3f} deg | disp min {:.3f}->{:.3f} max {:.3f}->{:.3f} | "
-           "cur {:.3f} cached [{:.3f}, {:.3f}] | accuracy outcome 0x{:08X} | aim off-axis {:.3f} deg at {:.2f} m | "
-           "straight {} | mult {:.3f} (hip/ads blend {:.2f}) | muzzle-cam {:.3f} m",
+    // ArkStats lives at weapon+0x1A8 as { uint ownerId; uint nextModifierId; ... }; the second word counts every
+    // stat modifier ever applied to this weapon, so it shows at a glance whether a weapon mod's modifiers have
+    // been applied more than once (they are additive and appended to a list, so re-application stacks).
+    const unsigned statMods = *reinterpret_cast<const unsigned*>(reinterpret_cast<const char*>(pWeapon) + 0x1AC);
+    CryLog("ViewmodelTweaks[spread] {}: cone {:.3f}->{:.3f} deg | pellets {}x{} | stat modifiers applied {} | "
+           "disp min {:.3f}->{:.3f} max {:.3f}->{:.3f} cur {:.3f} | accuracy outcome 0x{:08X} | "
+           "target off-axis {:.3f} deg at {:.2f} m | straight {} | mult {:.3f} (aim blend {:.2f})",
         m_currentWeaponClass, s_dbgConeOrig, s_dbgConeOut,
-        s_dbgDispMinOrig, s_dbgDispMinOut, s_dbgDispMaxOrig, s_dbgDispMaxOut,
-        w->m_weaponDispersion, w->m_minDispersion, w->m_maxDispersion,
+        s_dbgStatInt[0], s_dbgStatInt[1], statMods,
+        s_dbgDispMinOrig, s_dbgDispMinOut, s_dbgDispMaxOrig, s_dbgDispMaxOut, w->m_weaponDispersion,
         outcome, offDeg, dist, (int)bShootStraight,
         GetSpreadMultiplier(reinterpret_cast<const CArkItem*>(pWeapon)),
-        m_settings.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f,
-        (position - camPos).GetLength());
+        m_settings.aimEnabled ? SmoothStep01(m_aimBlend) : 0.0f);
 }
 
 //---------------------------------------------------------------------------------
@@ -2463,6 +2477,7 @@ void ModMain::InitHooks()
     s_hookDispMax.SetHookFunc(&CArkWeaponShotgun_GetDispersionMaximum_Hook);
     s_hookGetStatFloat.SetHookFunc(&CArkWeapon_GetStatFloat_Hook);
     s_hookSpawnPellets.SetHookFunc(&CArkWeaponShotgun_SpawnPellets_Hook);
+    s_hookGetStatInt.SetHookFunc(&CArkWeapon_GetStatInt_Hook);
     s_hookFireWeapon.SetHookFunc(&CArkWeapon_FireWeapon_Hook);
 }
 

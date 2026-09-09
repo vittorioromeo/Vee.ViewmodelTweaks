@@ -148,6 +148,10 @@ Two independent terms, and for the shotgun only the first one is normally alive:
   `GetStatInt` (0x16675C0) and `GetStatFloatPlayer` (0x1667580, uses the player's stats at ArkPlayer+0x7C0)
   reach the same implementation *without* going through it, so hooking the thunk only sees float reads of the
   weapon's own stats.
+* Stat modifiers are appended to a per-stat list and `final = base + sum(list)`; the running counter of
+  modifiers ever applied to a weapon is `ArkStats::m_nextModifierId` at **weapon+0x1AC** (the stats object is
+  at +0x1A8: `{uint ownerId; uint nextModifierId; map}`). Re-applying a weapon mod's modifiers therefore
+  *stacks* them - useful sanity check when a modded stat looks far too large.
 * `vm_spread_debug 1` logs one line per shot with all of the above, including the angle between the camera
   axis and the aim point (~0 = the shot was straight, so the pattern is the cone alone).
 
