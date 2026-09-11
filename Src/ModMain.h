@@ -184,16 +184,11 @@ struct ViewmodelSettings
     int   interactExamination = 1;  //!< Also animate clicks on in-world screens / keypads (examination mode), towards the cursor.
     int   interactExamKey = 0x100;  //!< EKeyId that counts as a click on a screen (default eKI_Mouse1)
     int   interactExamKey2 = 0x11;  //!< second one (default eKI_E)
-    int   interactExamFlipY = 1;    //!< the cursor's y runs from the top of the screen
-    int   interactExamCursorSource = 0; //!< where a screen click aims: 0 = the OS mouse cursor (client position), 1 = centre of the view, 2 = HUD reticle, 3 = engine hardware-mouse position
-    int   interactExamFollow = 0;   //!< TEST: while on a screen, the hand tracks the cursor continuously (no click needed)
     PoseOffset examCorr;            //!< extra hand correction applied only while on a screen (m, deg) - big ranges, for tuning
-    float interactExamArmExtend = 0.0f; //!< on screens: push the left shoulder forward by this much (m) so the arm reaches further
     float interactExamBodyX = 0.0f, interactExamBodyY = 0.0f, interactExamBodyZ = 0.0f; //!< on screens: move the whole arms/torso relative to the camera (view space, m) - brings the shoulder within reach
     int   interactExamAutoBody = 1; //!< on screens: bring the body forward automatically when the wrist would be beyond the arm's length
     float interactExamArmLength = 0.55f; //!< shoulder-to-wrist distance the auto body offset keeps (m)
     float interactExamMinTargetDist = 0.35f; //!< on screens: targets closer than this to the camera (keypads you are nose-to-nose with) are not reached for
-    int   interactExamShiftMode = 1; //!< how the arms are brought to the examination camera: 1 = skeleton, root joint pushed (additive; travels down to every joint), 0 = every joint (each child gets it again - wrong), 2 = render side (old, inconsistent with the read-back)
     int   interactExamFovMode = 0;  //!< camera FOV while on a screen: 0 = the game's zoom, 1 = no zoom (regular cl_hfov), 2 = custom (interactExamFov)
     float interactExamFov = 70.0f;  //!< custom horizontal FOV on screens (deg)
     int   interactDebugMarker = 0;  //!< draw the reach target (red) and the asked hand position (green) in the world
@@ -219,8 +214,6 @@ struct ViewmodelSettings
     int   interactNoZoomWorkstation = 0; //!< ... workstations (ui_examine_workstation)
     int   interactExamGentle = 1;        //!< on screens the press uses its own, gentler style (pressExam)
     int   interactShowArms = 1;     //!< Un-hide the arms while a reach plays in a state where the game hides them (unarmed, screens).
-    int   interactOwnQueue = 0;     //!< Experimental fallback: drive the skeleton with our own pose modifier when the game's weapon context skipped a frame. Off: it crashed (3.8.2) and the context runs without a weapon anyway.
-    int   interactHideRightArm = 0; //!< ... and move the right arm (and whatever it holds) out of view for the duration (shows a stump on some rigs).
     int   interactWristMode = 2;    //!< how a pose's wrist orientation is applied: 0 = on the IK target joint, 1 = on the hand joint (relative to the forearm), 2 = both
     int   interactEaseIn = 2;       //!< reach easing: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 ease in-out
     int   interactEaseOut = 4;      //!< return easing (same list)
@@ -423,18 +416,16 @@ struct InteractState
     bool armsForced = false;        //!< we set the arms slot's render flag
     unsigned savedSlotFlags = 0;    //!< what it was before
     int armsForcedWhile = 0;        //!< 1 = the arms were hidden by a screen (examination) when we forced them on, 2 = by being unarmed
-    bool hideRightArm = false;      //!< this reach relocates the right arm out of view
     bool examining = false;         //!< in-world UI examination mode (screens, keypads) this frame
     bool unarmed = false;           //!< no weapon out this frame
-    bool ownQueueUsed = false;      //!< the game's procedural context did not run: our own pose modifier carried the pushes
-    int ownQueuePushes = 0;
-    Vec3 examCursorWorld = Vec3(ZERO); //!< where the screen cursor ray hit (debug)
+    Vec3 examCursorWorld = Vec3(ZERO); //!< where the last screen click's centre ray hit (debug)
     bool examCursorValid = false;
     float markerTimer = 0.0f;       //!< seconds left to draw the debug markers after a click
     unsigned slotFlagsNow = 0;      //!< debug
-    // Examination mode moves the camera away from the head while the arms stay with the body: the reach is
-    // computed against a camera at the head (same rotation) and the final pose is shifted to the real camera
-    // on the render side, so the arms appear where the view is.
+    // Examination mode moves the camera away from the head while the arms stay with the body: the body is
+    // brought along with a root-joint additive (bodyShift, see PushInteractReach).
+    Vec3 bodyShift = Vec3(ZERO);    //!< this frame's root push (model space), for the read-outs
+    bool bodyShiftActive = false;
     float restBlend = 0.0f;         //!< 0..1: the hand is held at the resting spot (in-world screens, or hovering over something usable)
     bool restActive = false;
     bool hoverActive = false;       //!< the resting hand is up because of something usable in front of us (not a screen)
@@ -450,12 +441,6 @@ struct InteractState
     Vec3 swayPos = Vec3(ZERO);      //!< this frame's drift (view space, m)
     Quat swayRot = Quat(IDENTITY);  //!< this frame's drift (view space)
     Vec3 lastReach = Vec3(ZERO);    //!< last frame's reach part of the additive (without the body shift), model space
-    Vec2 cursorReticle = Vec2(ZERO), cursorHardware = Vec2(ZERO); //!< debug: both cursor sources, 0..1 of the screen
-    Vec2 cursorOs = Vec2(ZERO);     //!< the OS cursor in the game window's client area, 0..1 (y from the top)
-    bool cursorOsValid = false;
-    Vec3 renderShift = Vec3(ZERO);          //!< applied to every joint this frame (model space)
-    Vec3 renderShiftApplied = Vec3(ZERO);   //!< what the previous frame's final pose carries (subtract when reading it)
-    bool renderShiftActive = false;
 
     // Debug
     int lastType = -1, lastMode = -1;
@@ -609,7 +594,6 @@ struct RenderLockState
     std::vector<std::string> leftSubtreeNames;  //!< parallel to leftSubtree
     std::vector<int> leftSubtreeParent;         //!< parallel to leftSubtree (parent joint id)
     std::vector<Quat> leftSubtreeDefaultRel;    //!< parallel to leftSubtree: bind-pose rotation relative to the parent
-    std::vector<int> rightArmChain;             //!< right hand, its two ancestors (forearm, upper arm) and everything under the hand
     int leftUpperArm = -1;                      //!< the left hand's grandparent (the joint at the shoulder)
     bool defaultPoseValid = false;              //!< the bind pose accessors were found and verified on this skeleton
     int defaultRelSlot = -1, defaultAbsSlot = -1;
@@ -896,22 +880,12 @@ private:
     void FireDeferredInteract();        //!< makes the stored Interact call (UpdateBeforeSystem)
     //! Skeleton-side: pushes the additive offset of the support hand's IK target for this frame.
     void PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& camAbs);
-    //! Moves the right arm (and what it holds) out of view for this frame (screens / unarmed).
-    void PushHideRightArm(void* pModifier, const QuatT& camAbs);
     //! Best model-space camera for the frame being animated (see OnProceduralContextUpdated).
     bool PredictCamera(ArkPlayer* pPlayer, QuatT& camAbs) const;
-    //! When the game's procedural weapon context did not run this frame (no weapon), carry the pushes with our own queue.
-    void PushWithOwnQueue();
     void UpdateArmsVisibility();
     bool ExaminingWorldUI() const;
-    //! World point under the screen cursor (examination mode), from the reticle position through the view camera.
+    //! World point a screen click aims at (examination mode): the centre ray of the view camera.
     bool CursorWorldPoint(Vec3& out);
-    //! The OS mouse cursor relative to the game window's client area (0..1, y from the top). False if unavailable.
-    static bool OsCursorNormalized(Vec2& out);
-    void* m_ownQueue = nullptr;         //!< IAnimationOperatorQueue* (owned via the shared_ptr below)
-    void* m_ownQueueCtrl = nullptr;     //!< its std::shared_ptr control block
-    void* m_ownQueuePM = nullptr;       //!< the same object as IAnimationPoseModifier* (QueryInterface), what PushPoseModifier takes
-    bool m_ownQueueTried = false;
     int m_waitingForExamKey = 0;        //!< UI "bind": the next key becomes screen click key 1 / 2
     int m_examZoomHandle = 0;           //!< our zoom-manager entry overriding the screen zoom (0 = none)
     float m_examZoomHfov = 0.0f;

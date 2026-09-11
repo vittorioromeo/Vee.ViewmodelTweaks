@@ -3,6 +3,33 @@
 Reverse-engineering notes for `PreyDll.dll` (the EGS 2021-08-18 build Chairloader patches Steam to).
 All offsets are RVAs into that DLL. Read alongside `Src/ModMain.cpp`.
 
+## Contents
+
+1. [Building from source](#building-from-source)
+2. [The weapon / camera pipeline](#the-weapon--camera-pipeline) - offsets, aim lock (skeleton + render side), FOV
+3. [Fire animation while locked](#fire-animation-while-locked)
+4. [Feel layer](#feel-layer-sprint-pose-aim-sway-view-drag) - sprint pose, aim sway, view drag
+5. [Wall pull-back and the near-wall pose](#wall-pull-back-and-the-near-wall-pose)
+6. [Bullet spread](#bullet-spread-shotgun-and-pistol-share-carkweaponshotgun)
+7. [Reticle and the in-world screen cursor](#reticle-and-the-in-world-screen-cursor)
+8. [Interaction animation](#interaction-animation-support-hand-reach) - the rig, hooks, poses, the closed-loop rules,
+   examination mode, what does not work, diagnostics
+9. [Robustness](#robustness)
+10. [Three ABI traps](#three-abi-traps)
+
+## Where things are in `Src/ModMain.cpp`
+
+One file, roughly in this order: hooks, RVAs and vtable slots (top); numeric sanity helpers; the offset hook
+(`OnProceduralContextUpdated`, skeleton side of the aim lock, `PushAimLock`); the skeleton cache
+(`UpdateSkeletonCache`); the render side (`OnCameraUpdated`); the interaction reach (`OnInteract`,
+`StartReach`, `UpdateHover`, `ApplyExamineCVars`, `UpdateInteract`, `FireDeferredInteract`,
+`PushInteractReach`, `PushHandPose`, `CursorWorldPoint`, `UpdateExamZoom`, `UpdateArmsVisibility`, poses
+file); convergence, spread, blend states, feel, sanitizing, camera zoom; weapons lookup, nudge keys, input
+(`OnInputEvent`), weapon FOV, reticle, trace, weapons file; `RegisterCVars`, init / shutdown; the per-frame
+entry points (`UpdateBeforeSystem`, `MainUpdate`, `LateUpdate`); the ImGui tabs (`Draw*`). `ModMain.h` holds
+the settings struct (`ViewmodelSettings`, one cvar each), the per-weapon struct (`WeaponSettings`) and the
+runtime state structs (`InteractState`, `RenderLockState`, ...).
+
 ## Building from source
 
 Standard Chairloader DLL-mod workflow (Visual Studio 2022 + CMake + vcpkg), see
@@ -102,6 +129,29 @@ For the FOV: the weapon is rendered in the "nearest" pass with its own FOV store
 game's "near FOV locked" state (used when the weapon must share the world FOV).
 
 
+## Fire animation while locked
+
+* The skeleton-side push drives the right IK joint through the game's own `IAnimationOperatorQueue`. With
+  `eOp_Override` the fire *animation* (the pistol's kick is animated, the shotgun's is mostly the procedural
+  `CWeaponRecoilOffset`) is wiped out. The push is therefore `eOp_Additive` (3, what the game uses for its
+  offsets: position added, orientation pre-multiplied in model space): `final = animated (+) add`. Knowing
+  `add` of the previous frame gives the animated hand of the previous frame; its deviation from a slow
+  reference (frozen while a shot plays) is the kick, fed into the aim pose (weapon-local, per-weapon
+  `aim_kick_scale`, gated to the shot window). The one frame of animation velocity the additive lets through
+  is corrected exactly by the render-side placement.
+* `CArkWeapon::FireWeapon` (`+0x16659B0`) is the shot event for every weapon.
+
+## Feel layer (sprint pose, aim sway, view drag)
+
+* Pure per-frame state (`UpdateFeel`, from `MainUpdate`) with two outputs: additive view-space offsets for the
+  hip path (`ApplyOffset`, faded out by the aim blend) and a weapon-local post-multiplied transform for the aim
+  path (`ComputeAimLocal`, applied as `extra * aimPose * local * kick` on both the skeleton and the render side).
+* Sprint: `ArkPlayerMovementFSM::IsSprinting()` (`+0x1570580`); speed from `pe_status_living::vel`.
+* View drag: turn rate from `ArkPlayerCamera::m_rotation` (yaw = Ang3.z, pitch = Ang3.x), a damped spring
+  (sub-stepped at 8 ms) towards the rate; the offset is proportional to the spring state, clamped.
+* Aim sway rotates the weapon about its own pivot (post-multiplied), so the sights leave the crosshair while the
+  shot still follows the camera - which is what makes it matter with the reticle hidden.
+
 ## Wall pull-back and the near-wall pose
 
 * One `RayWorldIntersection` along the view ray per frame (`rwi_stop_at_pierceable`, skipping the player) gives
@@ -115,6 +165,57 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
 * The blend is also multiplied by a camera-pitch factor `1 - strength * SmoothStep01((|pitch| - a0) / (a1 - a0))`
   (pitch from the view ray, `asin(dir.z)`): looking steeply up or down the wall is no longer where the muzzle
   would go, so the weapon returns to the plain pull-back.
+
+## Bullet spread (shotgun and pistol share `CArkWeaponShotgun`)
+
+Two independent terms, and for the shotgun only the first one is normally alive:
+
+* **The pellet cone.** `SpawnPellets` reads `ShotgunSpreadConeDegrees` through `CArkWeapon::GetStatFloat`,
+  lays `nNumberOfPelletRows` x `nNumberOfPelletColumns` pellets on a grid spanning that cone at the aim point,
+  and aims each pellet from the muzzle through its grid point. Shotgun archetype: 8 deg, 3x3 pellets.
+* **Dispersion**, i.e. where the cone is *centred*. `ComputeAimPoint` only randomises the aim point when
+  `cone == 0 && !combatFocus` (that is the pistol) **or when the "accurate shot" roll fails**. The shotgun
+  archetype has `fAccurateShotChance = 1`, so its roll never fails and its whole `<Dispersion>` block (all
+  values 15, all rates 0) is dead data. `ArkRegularOutcome m_accuracyOutcome` (weapon +0x4D0) holds that roll;
+  `UpdateAccuracy` (0x167DDA0) fills it from `ShotgunBaseAccuracy` + player `BaseAccuracy` +
+  `CombatFocusAccuracyBonus` and is called from `OnStatChange` for exactly those three stats. **If that
+  outcome ever stops saying 100 %, the shotgun starts using its 15 deg dispersion and the pattern roughly
+  triples** (tan15 + tan8 vs tan8) - the failure mode to look for when shotgun spread is much too wide.
+* `GetDispersionMinimum` / `GetDispersionMaximum` (0x167A6B0 / 0x167A5B0) **cache their result** in
+  `m_minDispersion` / `m_maxDispersion` (+0x4E4 / +0x4E8) before returning, and `UpdateDispersion` (0x167DFF0,
+  virtual slot +0x188, called every frame from the player movement update) compares that cache with a fresh
+  call to detect a stance/stat change, then remaps `m_weaponDispersion` (+0x4E0) from the old range into the
+  new one. A hook that scales only the return value makes that test true forever, so the remap runs every
+  frame and multiplies the current dispersion by the factor each time. Write the scaled value back into the
+  cache.
+* No shotgun weapon mod touches spread: Power/Damage 1-5 are pure damage signal scales (x1.1 ... x1.11),
+  Recoil changes `recoilPitch/Yaw`, and the others clip size / reload speed. `shotgunSpreadConeDegrees` is in
+  `Ark/WeaponMods/Config.xml`'s moddable list but no `ArkWeaponModifier` in the game data references it, so an
+  upgraded shotgun has exactly the vanilla pattern. Stat modifiers are **additive** on the base value:
+  `ArkStats::AddModifier` recomputes `final = base + sum(modifiers)` into the entry (+0x1C) and
+  `GetStatFloat` returns that.
+* `CArkWeapon::GetStatFloat` (0x1667570) is a 12-byte thunk (`add rcx, 0x1A8; jmp ArkStats::GetStatFloat`);
+  `GetStatInt` (0x16675C0) and `GetStatFloatPlayer` (0x1667580, uses the player's stats at ArkPlayer+0x7C0)
+  reach the same implementation *without* going through it, so hooking the thunk only sees float reads of the
+  weapon's own stats.
+* Stat modifiers are appended to a per-stat list and `final = base + sum(list)`; the running counter of
+  modifiers ever applied to a weapon is `ArkStats::m_nextModifierId` at **weapon+0x1AC** (the stats object is
+  at +0x1A8: `{uint ownerId; uint nextModifierId; map}`). Re-applying a weapon mod's modifiers therefore
+  *stacks* them - useful sanity check when a modded stat looks far too large.
+* `vm_spread_debug 1` logs one line per shot with all of the above, including the angle between the camera
+  axis and the aim point (~0 = the shot was straight, so the pattern is the cone alone).
+
+## Reticle and the in-world screen cursor
+
+* `hud_reticleSetting` (SCVars+0x930; 0 off, 1 default, 2 dot) is exactly what the options menu writes
+  (`gameOptions.xml`, Action="hud_reticleSetting"). Its only readers are in `CArkUIHUD` (4 sites); at 0 the
+  HUD is sent `reticleDisplay("none")` *and* `interactIconDisplay("none")`.
+* On in-world screens the cursor is the HUD reticle: `ArkExaminationMode::UpdateReticlePos` (`+0x157EBA0`)
+  moves `m_reticlePos` (+0x60) and sends `reticlePosition` to the HUD, so a hidden reticle means no cursor.
+  The mod therefore un-hides the reticle while `ArkPlayer::m_examinationMode.m_examinationState != inactive`
+  with `m_examinationType == worldUI`, and only ever writes the cvar when its own target value changes.
+  Note that with a mouse `m_reticlePos` stays at the centre and the *camera* turns instead (see the
+  interaction section): the reticle is a fixed centre marker there, not a moving cursor.
 
 ## Interaction animation (support-hand reach)
 
@@ -332,6 +433,10 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.10.2 cleanup, no behaviour change: removed the dead ends as options (every-joint / render-side shift,
+  own operator queue, right-arm hide, arm extension, cursor source / flip-y / follow test - the click is the
+  centre ray, full stop) and their code; the Interact tab regrouped (Reach / Screens and keypads / Resting
+  hand / Hand pose / Test / Advanced). Persisted cvars of the removed options are simply ignored.
 * 3.10.1 IK weight ramp for one-handed weapons, resting spot per mode (outside / on screens,
   `vm_interact_rest_exam_*`) plus a per-weapon offset (`interact_rest_*` in the weapons file), hover off while
   aiming unless `vm_interact_hover_aiming`.
@@ -341,80 +446,6 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
 
 Open: a Chairloader `ShutdownGame` crash was seen once when quitting the game while a screen was up (not
 reproduced, not investigated).
-
-## Bullet spread (shotgun and pistol share `CArkWeaponShotgun`)
-
-Two independent terms, and for the shotgun only the first one is normally alive:
-
-* **The pellet cone.** `SpawnPellets` reads `ShotgunSpreadConeDegrees` through `CArkWeapon::GetStatFloat`,
-  lays `nNumberOfPelletRows` x `nNumberOfPelletColumns` pellets on a grid spanning that cone at the aim point,
-  and aims each pellet from the muzzle through its grid point. Shotgun archetype: 8 deg, 3x3 pellets.
-* **Dispersion**, i.e. where the cone is *centred*. `ComputeAimPoint` only randomises the aim point when
-  `cone == 0 && !combatFocus` (that is the pistol) **or when the "accurate shot" roll fails**. The shotgun
-  archetype has `fAccurateShotChance = 1`, so its roll never fails and its whole `<Dispersion>` block (all
-  values 15, all rates 0) is dead data. `ArkRegularOutcome m_accuracyOutcome` (weapon +0x4D0) holds that roll;
-  `UpdateAccuracy` (0x167DDA0) fills it from `ShotgunBaseAccuracy` + player `BaseAccuracy` +
-  `CombatFocusAccuracyBonus` and is called from `OnStatChange` for exactly those three stats. **If that
-  outcome ever stops saying 100 %, the shotgun starts using its 15 deg dispersion and the pattern roughly
-  triples** (tan15 + tan8 vs tan8) - the failure mode to look for when shotgun spread is much too wide.
-* `GetDispersionMinimum` / `GetDispersionMaximum` (0x167A6B0 / 0x167A5B0) **cache their result** in
-  `m_minDispersion` / `m_maxDispersion` (+0x4E4 / +0x4E8) before returning, and `UpdateDispersion` (0x167DFF0,
-  virtual slot +0x188, called every frame from the player movement update) compares that cache with a fresh
-  call to detect a stance/stat change, then remaps `m_weaponDispersion` (+0x4E0) from the old range into the
-  new one. A hook that scales only the return value makes that test true forever, so the remap runs every
-  frame and multiplies the current dispersion by the factor each time. Write the scaled value back into the
-  cache.
-* No shotgun weapon mod touches spread: Power/Damage 1-5 are pure damage signal scales (x1.1 ... x1.11),
-  Recoil changes `recoilPitch/Yaw`, and the others clip size / reload speed. `shotgunSpreadConeDegrees` is in
-  `Ark/WeaponMods/Config.xml`'s moddable list but no `ArkWeaponModifier` in the game data references it, so an
-  upgraded shotgun has exactly the vanilla pattern. Stat modifiers are **additive** on the base value:
-  `ArkStats::AddModifier` recomputes `final = base + sum(modifiers)` into the entry (+0x1C) and
-  `GetStatFloat` returns that.
-* `CArkWeapon::GetStatFloat` (0x1667570) is a 12-byte thunk (`add rcx, 0x1A8; jmp ArkStats::GetStatFloat`);
-  `GetStatInt` (0x16675C0) and `GetStatFloatPlayer` (0x1667580, uses the player's stats at ArkPlayer+0x7C0)
-  reach the same implementation *without* going through it, so hooking the thunk only sees float reads of the
-  weapon's own stats.
-* Stat modifiers are appended to a per-stat list and `final = base + sum(list)`; the running counter of
-  modifiers ever applied to a weapon is `ArkStats::m_nextModifierId` at **weapon+0x1AC** (the stats object is
-  at +0x1A8: `{uint ownerId; uint nextModifierId; map}`). Re-applying a weapon mod's modifiers therefore
-  *stacks* them - useful sanity check when a modded stat looks far too large.
-* `vm_spread_debug 1` logs one line per shot with all of the above, including the angle between the camera
-  axis and the aim point (~0 = the shot was straight, so the pattern is the cone alone).
-
-## Feel layer (sprint pose, aim sway, view drag)
-
-* Pure per-frame state (`UpdateFeel`, from `MainUpdate`) with two outputs: additive view-space offsets for the
-  hip path (`ApplyOffset`, faded out by the aim blend) and a weapon-local post-multiplied transform for the aim
-  path (`ComputeAimLocal`, applied as `extra * aimPose * local * kick` on both the skeleton and the render side).
-* Sprint: `ArkPlayerMovementFSM::IsSprinting()` (`+0x1570580`); speed from `pe_status_living::vel`.
-* View drag: turn rate from `ArkPlayerCamera::m_rotation` (yaw = Ang3.z, pitch = Ang3.x), a damped spring
-  (sub-stepped at 8 ms) towards the rate; the offset is proportional to the spring state, clamped.
-* Aim sway rotates the weapon about its own pivot (post-multiplied), so the sights leave the crosshair while the
-  shot still follows the camera - which is what makes it matter with the reticle hidden.
-
-## Fire animation while locked
-
-* The skeleton-side push drives the right IK joint through the game's own `IAnimationOperatorQueue`. With
-  `eOp_Override` the fire *animation* (the pistol's kick is animated, the shotgun's is mostly the procedural
-  `CWeaponRecoilOffset`) is wiped out. The push is therefore `eOp_Additive` (3, what the game uses for its
-  offsets: position added, orientation pre-multiplied in model space): `final = animated (+) add`. Knowing
-  `add` of the previous frame gives the animated hand of the previous frame; its deviation from a slow
-  reference (frozen while a shot plays) is the kick, fed into the aim pose (weapon-local, per-weapon
-  `aim_kick_scale`, gated to the shot window). The one frame of animation velocity the additive lets through
-  is corrected exactly by the render-side placement.
-* `CArkWeapon::FireWeapon` (`+0x16659B0`) is the shot event for every weapon.
-
-## Reticle and the in-world screen cursor
-
-* `hud_reticleSetting` (SCVars+0x930; 0 off, 1 default, 2 dot) is exactly what the options menu writes
-  (`gameOptions.xml`, Action="hud_reticleSetting"). Its only readers are in `CArkUIHUD` (4 sites); at 0 the
-  HUD is sent `reticleDisplay("none")` *and* `interactIconDisplay("none")`.
-* On in-world screens the cursor is the HUD reticle: `ArkExaminationMode::UpdateReticlePos` (`+0x157EBA0`)
-  moves `m_reticlePos` (+0x60) and sends `reticlePosition` to the HUD, so a hidden reticle means no cursor.
-  The mod therefore un-hides the reticle while `ArkPlayer::m_examinationMode.m_examinationState != inactive`
-  with `m_examinationType == worldUI`, and only ever writes the cvar when its own target value changes.
-  Note that with a mouse `m_reticlePos` stays at the centre and the *camera* turns instead (see the
-  interaction section): the reticle is a fixed centre marker there, not a moving cursor.
 
 ## Robustness
 
@@ -450,3 +481,4 @@ Two independent terms, and for the shotgun only the first one is normally alive:
    smoothed value that tracks its target instantly or not at all while the code is provably right means
    the *step* is garbage, and a garbage step in a value that was fine a call earlier means a callee
    trashed a callee-saved register - look for a stack struct the callee writes into.
+

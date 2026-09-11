@@ -456,20 +456,6 @@ static inline float SmoothStep01(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
-//! 2D text through the aux geom (800x600 virtual space). IRenderAuxGeom::Draw2dLabel is an inline variadic
-//! wrapper that miscompiles here (va_list to the argument instead of its slot), so a hand-made one-entry va_list.
-static void DrawText2D(IRenderAuxGeom* pAux, float x, float y, float size, const ColorF& c, bool center, const char* text)
-{
-    if (!pAux || !text)
-        return;
-    SDrawTextInfo ti;
-    ti.xscale = ti.yscale = size;
-    ti.flags = eDrawText_2D | eDrawText_800x600 | (center ? eDrawText_Center : 0);
-    ti.color[0] = c.r; ti.color[1] = c.g; ti.color[2] = c.b; ti.color[3] = c.a;
-    const char* arg = text;
-    pAux->RenderText(Vec3(x, y, 0.5f), ti, "%s", reinterpret_cast<va_list>(&arg));
-}
-
 // --- Numeric sanity -------------------------------------------------------------------------------
 // Cheap checks used at the boundaries of the pipeline (what we read from the game, what we write back)
 // and on every accumulated state. A NaN compares false with everything, so "!(x < limit)" catches it.
@@ -1081,18 +1067,6 @@ void ModMain::UpdateSkeletonCache(void* pCharInst, void* pAttachment)
         if (inRight[i]) R.rightSubtree.push_back(i);
         if (inLeft[i] && !inRight[i]) R.leftSubtree.push_back(i);
     }
-    R.rightArmChain.clear();
-    {
-        // hand + forearm + upper arm, then everything under the hand (so no joint of the arm is left where it was)
-        int j = R.rightHand;
-        for (int k = 0; k < 3 && j >= 0; k++)
-        {
-            R.rightArmChain.push_back(j);
-            j = parentOf(j);
-        }
-        for (int id : R.rightSubtree)
-            if (id != R.rightHand) R.rightArmChain.push_back(id);
-    }
     R.leftUpperArm = -1;
     if (R.leftHand >= 0)
     {
@@ -1287,39 +1261,6 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     ICharacterInstance* pCharInst = pEnt->GetCharacter(0);
     if (pCharInst)
         UpdateSkeletonCache(pCharInst, pAttachment); // hand subtrees are needed with no weapon too (interaction reach)
-
-    // Examination mode: the camera left the head, the arms did not. Shift the whole final pose by that
-    // difference so the arms render where the view is (the reach was computed against a camera at the head).
-    {
-        InteractState& I = m_interact;
-        I.renderShiftApplied = Vec3(ZERO);
-        if (s.interactExamShiftMode == 2)
-            I.renderShiftActive = false;
-        const bool reachActive = (I.phase != InteractState::Idle && I.curve > 0.001f) || I.restBlend > 0.001f;
-        if (s.interactExamShiftMode == 2 && I.examining && reachActive && pCharInst && R.jointCount > 0 && R.jointCount < 4096)
-        {
-            const QuatT camBone = pPlayer->GetBoneTransform(BONE_CAMERA);
-            // + a user body offset: the whole arms/torso moved relative to the camera (view space) so the shoulder is
-            // within reach of the screen; the reach's virtual camera (PushInteractReach) moves by the same amount.
-            const Vec3 bodyOff = camModel.q * Vec3(s.interactExamBodyX, s.interactExamBodyY + I.autoBodyY, s.interactExamBodyZ);
-            const Vec3 shift = camModel.t - camBone.t + (Finite(bodyOff) ? bodyOff : Vec3(ZERO));
-            if (Finite(shift) && shift.GetLengthSquared() < 10.0f * 10.0f && shift.GetLengthSquared() > 1e-8f)
-            {
-                if (void* pSkelPose = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose))
-                {
-                    for (int j = 0; j < R.jointCount; j++)
-                    {
-                        QuatT* p = const_cast<QuatT*>(VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, j));
-                        if (p && SaneQuatT(*p, 50.0f))
-                            p->t += shift;
-                    }
-                    I.renderShift = shift;
-                    I.renderShiftApplied = shift;
-                    I.renderShiftActive = true;
-                }
-            }
-        }
-    }
 
     if (!pAttachment || !pCharInst)
     {
@@ -1766,7 +1707,7 @@ void ModMain::UpdateInteract(float dt)
             if (I.phase != InteractState::Hold && s.interactDebugMarker)
                 CryLog("ViewmodelTweaks: reach at target - view target ({:.2f} {:.2f} {:.2f}){} asked ({:.2f} {:.2f} {:.2f}) anim hand ({:.2f} {:.2f} {:.2f}) corr ({:.2f} {:.2f} {:.2f}) rest {:.2f} examining {} shift ({:.2f} {:.2f} {:.2f}) poseAbsPos {} hasWorldTarget {}",
                     I.targetView.x, I.targetView.y, I.targetView.z, I.clamped ? " CLAMPED" : "", I.desiredView.x, I.desiredView.y, I.desiredView.z,
-                    I.handView.x, I.handView.y, I.handView.z, I.corr.x, I.corr.y, I.corr.z, I.restBlend, I.examining, I.renderShift.x, I.renderShift.y, I.renderShift.z,
+                    I.handView.x, I.handView.y, I.handView.z, I.corr.x, I.corr.y, I.corr.z, I.restBlend, I.examining, I.bodyShift.x, I.bodyShift.y, I.bodyShift.z,
                     I.poseAbsolutePos, I.hasWorldTarget);
             I.phase = InteractState::Hold;
             I.curve = 1.0f;
@@ -1856,39 +1797,6 @@ void ModMain::UpdateInteract(float dt)
         if (!Finite(I.swayPos)) I.swayPos = Vec3(ZERO);
         if (!SaneQuat(I.swayRot)) I.swayRot = Quat(IDENTITY);
     }
-    if (I.examining && gEnv && gEnv->pSystem)
-    {
-        // Cursor readouts (both candidate sources) for the diagnostics, every frame.
-        if (ArkPlayer* pP = ArkPlayer::GetInstancePtr())
-            I.cursorReticle = pP->m_examinationMode.m_reticlePos;
-        const CCamera& cam = gEnv->pSystem->GetViewCamera();
-        if (gEnv->pHardwareMouse && cam.GetViewSurfaceX() > 0 && cam.GetViewSurfaceZ() > 0)
-        {
-            const CHardwareMouse* pHw = static_cast<const CHardwareMouse*>(gEnv->pHardwareMouse);
-            I.cursorHardware = Vec2(pHw->m_fCursorX / (float)cam.GetViewSurfaceX(), pHw->m_fCursorY / (float)cam.GetViewSurfaceZ());
-        }
-        I.cursorOsValid = OsCursorNormalized(I.cursorOs);
-        // TEST mode: the hand tracks the cursor every frame while a screen is up.
-        if (s.interactExamFollow && Active() && s.interactEnabled && s.interactExamination && I.holdMode == 0 && !m_playerDead)
-        {
-            Vec3 p;
-            if (CursorWorldPoint(p))
-            {
-                I.hasWorldTarget = true;
-                I.targetWorld = p;
-                I.style = 0;
-                if (I.phase == InteractState::Idle)
-                    I.time = 0.0f;
-                const ReachStyle& st = s.press;
-                // keep it parked in the hold phase (fully reached), the timeline never runs out
-                I.phase = InteractState::Hold;
-                I.curve = 1.0f;
-                I.arc = 0.0f;
-                I.returning = false;
-                I.time = max(st.reachTime, 0.0f) + max(st.holdTime, 0.0f) * 0.5f;
-            }
-        }
-    }
     UpdateArmsVisibility();
     UpdateExamZoom();
 }
@@ -1957,11 +1865,9 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     }
 
     // Examination mode: the real camera is away from the head while the arms stay with the body (plus a user /
-    // automatic body offset). The whole skeleton is moved over to the camera HERE, in the pose modifier
-    // (additive position on every joint, or on the root), so that everything read back next frame - the hand
-    // for the closed loop, the IK target for the additive chain - is the moved skeleton. (Doing this on the
-    // render side, 3.8.1-3.9.2, gave a pose the next frame's read-back did not contain: the loop then chased a
-    // hand that was not where it saw it, saturated, and drove the wrist 40 cm past the target.)
+    // automatic body offset). The whole skeleton is moved over to the camera HERE, in the pose modifier (an
+    // additive position on the root joint), so that everything read back next frame - the hand for the closed
+    // loop, the IK target for the additive chain - is the moved skeleton (DEVNOTES, "rules" 1-5).
     QuatT camReach = camAbs; // everything in the REAL camera's frame
     Vec3 bodyShift(ZERO);
     // Frames without a reach push: the chain still has to know about the shift (pushed above) or the next reach
@@ -1978,7 +1884,8 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
             I.addValid = false;
     };
     const float examBlend = clamp_tpl(I.examBlend, 0.0f, 1.0f);
-    if (examBlend > 0.0f && s.interactExamShiftMode != 2)
+    I.bodyShiftActive = false;
+    if (examBlend > 0.0f)
     {
         if (ArkPlayer* pP = ArkPlayer::GetInstancePtr())
         {
@@ -1988,18 +1895,14 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
             if (Finite(camBone.t) && Finite(shift) && shift.GetLengthSquared() < 10.0f * 10.0f)
             {
                 bodyShift = shift;
-                if (s.interactExamShiftMode == 1)
-                    VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, 0, OP_ADDITIVE, &bodyShift);
-                else
-                    for (int j = 0; j < R.jointCount && j < 4096; j++)
-                        VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, j, OP_ADDITIVE, &bodyShift);
-                I.renderShift = bodyShift;
-                I.renderShiftActive = true;
+                // On the root joint only: a position pushed on a joint travels down to its children, so this moves the
+                // whole body once (pushing it on every joint moved the hand once per ancestor).
+                VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, 0, OP_ADDITIVE, &bodyShift);
+                I.bodyShift = bodyShift;
+                I.bodyShiftActive = true;
             }
         }
     }
-    else if (s.interactExamShiftMode != 2)
-        I.renderShiftActive = false;
     // Animated (pre-modifier) target joint of last frame = last frame's final joint minus what we added (the
     // body shift of last frame is part of "what we added": lastAdd carries it). An additive push is applied
     // exactly, so this is not a guess - the only things that can go wrong are a skeleton that did not update
@@ -2009,7 +1912,6 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     // "applied / skipped" test could pick wrong and then never recover: a wrong baseline produces a wrong push,
     // which produces a read-back that fits the wrong hypothesis again, and the hand flails.
     QuatT anim = *pAbs;
-    anim.t -= I.renderShiftApplied; // render-side variant only (zero otherwise)
     bool chainReset = false;
     const bool skeletonUpdated = !I.finalPrevValid || (anim.t - I.finalPrev).GetLengthSquared() > 1e-8f;
     I.finalPrev = anim.t;
@@ -2030,7 +1932,6 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
                 I.chainResets++;
                 chainReset = true;
                 anim = *pAbs; // best available: only the shift is known to be in there (pushed again below, alone)
-                anim.t -= I.renderShiftApplied;
                 anim.t -= bodyShift;
             }
         }
@@ -2072,8 +1973,6 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     // Fingers / hand orientation: same progress as the reach (posing mode 1 = pose only, the hand stays where
     // the animation has it). While resting on a screen the pose is held at the rest blend.
     PushHandPose(pModifier, pSkelPose, camReach, max(curve, rest));
-    if (I.hideRightArm)
-        PushHideRightArm(pModifier, camReach);
     if (I.holdMode == 1)
     {
         noReachThisFrame();
@@ -2245,13 +2144,6 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         return;
     }
     VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, joint, OP_ADDITIVE, &add.t);
-    // Screens sit further away than the arm is long: push the shoulder forward with the reach (additive on the
-    // upper-arm joint; the limb IK then solves the arm from there).
-    if (examBlend > 0.0f && s.interactExamArmExtend > 0.0f && R.leftUpperArm >= 0)
-    {
-        const Vec3 ext = camReach.q * Vec3(0.0f, clamp_tpl(s.interactExamArmExtend, 0.0f, 0.6f) * curve * examBlend, 0.0f);
-        VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, R.leftUpperArm, OP_ADDITIVE, &ext);
-    }
     if (!poseOwnsIkRot)
         VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, joint, OP_ADDITIVE, &add.q);
     if (s.interactForceLeftIk && I.weightJoint >= 0)
@@ -2507,79 +2399,17 @@ bool ModMain::ExaminingWorldUI() const
         && em.m_examinationType == ArkExaminationMode::EArkExaminationType::worldUI;
 }
 
-// Win32, declared by hand (windows.h clashes with the engine headers here). All in user32, always present.
-struct VmPoint { long x, y; };
-struct VmRect { long left, top, right, bottom; };
-extern "C" __declspec(dllimport) int __stdcall GetCursorPos(VmPoint* p);
-extern "C" __declspec(dllimport) void* __stdcall GetForegroundWindow();
-extern "C" __declspec(dllimport) int __stdcall ScreenToClient(void* hwnd, VmPoint* p);
-extern "C" __declspec(dllimport) int __stdcall GetClientRect(void* hwnd, VmRect* r);
-
-bool ModMain::OsCursorNormalized(Vec2& out)
-{
-    VmPoint pt;
-    if (!GetCursorPos(&pt))
-        return false;
-    void* hwnd = GetForegroundWindow();
-    VmRect rc;
-    if (!hwnd || !GetClientRect(hwnd, &rc) || !ScreenToClient(hwnd, &pt))
-        return false;
-    const float w = (float)(rc.right - rc.left), h = (float)(rc.bottom - rc.top);
-    if (w < 8.0f || h < 8.0f)
-        return false;
-    out = Vec2((float)pt.x / w, (float)pt.y / h);
-    return true;
-}
-
 bool ModMain::CursorWorldPoint(Vec3& out)
 {
-    // The screen cursor is the HUD reticle, driven by ArkExaminationMode::m_reticlePos in 0..1 of the screen
-    // (x right, y down). A ray through that point from the view camera hits the screen.
+    // In examination mode the mouse turns the camera (ArkExaminationMode::UpdateView accumulates
+    // ArkPlayerInput::GetRotation into m_localRotation) and the HUD reticle sits at the centre: what you click is
+    // what the centre of the view is on. A ray from the view camera along its axis hits the screen.
     ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
     if (!pPlayer || !gEnv || !gEnv->pSystem || !gEnv->pPhysicalWorld)
         return false;
     const CCamera& cam = gEnv->pSystem->GetViewCamera();
-    const float w = (float)cam.GetViewSurfaceX(), h = (float)cam.GetViewSurfaceZ();
-    if (w < 8.0f || h < 8.0f)
-        return false;
-    // Two candidates for the cursor: the examination mode's reticle (0..1, what the HUD is told) and the
-    // hardware cursor (client pixels) when the game has one up.
-    InteractState& I = m_interact;
-    I.cursorReticle = pPlayer->m_examinationMode.m_reticlePos;
-    bool hwActive = false;
-    if (gEnv->pHardwareMouse)
-    {
-        const CHardwareMouse* pHw = static_cast<const CHardwareMouse*>(gEnv->pHardwareMouse);
-        hwActive = pHw->m_iReferenceCounter > 0;
-        I.cursorHardware = Vec2(pHw->m_fCursorX / w, pHw->m_fCursorY / h);
-    }
-    I.cursorOsValid = OsCursorNormalized(I.cursorOs);
     const Vec3 camPos = cam.GetPosition();
     Vec3 dir = cam.GetMatrix().GetColumn1();
-    if (m_settings.interactExamCursorSource != 1)
-    {
-        // A cursor somewhere on the screen: unproject it. (CCamera::Unproject takes viewport pixels, y up.)
-        Vec2 r;
-        switch (m_settings.interactExamCursorSource)
-        {
-        case 2: r = I.cursorReticle; break;
-        case 3: r = I.cursorHardware; break;
-        default:
-            if (!I.cursorOsValid)
-                return false;
-            r = I.cursorOs;
-            break;
-        }
-        if (!Finite(Vec3(r.x, r.y, 0.0f)))
-            return false;
-        Vec3 far;
-        const float ry = clamp_tpl(r.y, 0.0f, 1.0f);
-        if (!cam.Unproject(Vec3(clamp_tpl(r.x, 0.0f, 1.0f) * w, (m_settings.interactExamFlipY ? (1.0f - ry) : ry) * h, 1.0f), far))
-            return false;
-        dir = far - camPos;
-    }
-    // else: in examination mode the mouse turns the camera (ArkExaminationMode::UpdateView accumulates
-    // ArkPlayerInput::GetRotation into m_localRotation), so what you click is what the centre of the view is on.
     if (!Finite(dir) || dir.GetLengthSquared() < 1e-6f)
         return false;
     dir.Normalize();
@@ -2651,7 +2481,6 @@ void ModMain::UpdateArmsVisibility()
     if (!pEnt)
     {
         I.armsForced = false;
-        I.hideRightArm = false;
         return;
     }
     CEntity* pCEnt = static_cast<CEntity*>(pEnt);
@@ -2679,88 +2508,6 @@ void ModMain::UpdateArmsVisibility()
             CEntity::FSetSlotFlags(pCEnt, 0, I.savedSlotFlags);
         I.armsForced = false;
     }
-    // While the game would rather not show the arms, the right one (and what it holds) stays out of the picture.
-    I.hideRightArm = s.interactHideRightArm && hiddenState && reachActive;
-}
-
-void ModMain::PushHideRightArm(void* pModifier, const QuatT& camAbs)
-{
-    using namespace PreyInternals;
-    const RenderLockState& R = m_render;
-    if (!pModifier || R.rightArmChain.empty())
-        return;
-    // Every joint of the arm to one point behind and below the camera: with no joint left in place there is
-    // nothing to stretch to, and the weapon attachment (on the hand's prop joint) goes with it.
-    const Vec3 away = camAbs * Vec3(0.3f, -1.0f, -0.6f);
-    for (int id : R.rightArmChain)
-        VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, id, OP_OVERRIDE, &away);
-}
-
-// CryCreateClassInstance(const char* className, std::shared_ptr<T>& out) - the factory the game's own procedural
-// context uses for its operator queue ("AnimationPoseModifier_OperatorQueue", 0x17D5B88).
-static auto s_fnCryCreateClassInstance = PreyFunction<bool(const char* className, void* pSharedPtrOut)>(0x2C3530);
-// IAnimationPoseModifier IID the context passes to QueryInterface before PushPoseModifier (0x17D4E95 -> .rdata 0x1CE6508).
-static const unsigned char s_iidAnimationPoseModifier[16] = { 0x7f, 0x44, 0x42, 0x5e, 0x75, 0x47, 0xfe, 0x22, 0x49, 0xf4, 0x9a, 0xd3, 0x4e, 0x27, 0xb6, 0xba };
-
-void ModMain::PushWithOwnQueue()
-{
-    using namespace PreyInternals;
-    InteractState& I = m_interact;
-    I.ownQueueUsed = false;
-    // Off by default: the game's procedural weapon context keeps running with no weapon out, so this was only
-    // ever reached on the frame the weapon is holstered when a screen opens - and there the QueryInterface'd
-    // pointer handed to PushPoseModifier was not a valid object (read at -1 inside CryAnimation, 3.8.2).
-    if (!m_settings.interactOwnQueue)
-        return;
-    if (!Active() || !m_settings.interactEnabled || I.phase == InteractState::Idle)
-        return;
-    // Only when the game's context did not run last frame (no weapon out): otherwise it carries our pushes.
-    if (m_diag.ctxUpdatesLastFrame > 0)
-        return;
-    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
-    IEntity* pEnt = pPlayer ? pPlayer->GetEntity() : nullptr;
-    ICharacterInstance* pChar = pEnt ? pEnt->GetCharacter(0) : nullptr;
-    if (!pChar)
-        return;
-
-    if (!m_ownQueue && !m_ownQueueTried)
-    {
-        m_ownQueueTried = true;
-        struct { void* ptr; void* ctrl; } sp = { nullptr, nullptr };
-        if (s_fnCryCreateClassInstance("AnimationPoseModifier_OperatorQueue", &sp) && sp.ptr)
-        {
-            m_ownQueue = sp.ptr;
-            m_ownQueueCtrl = sp.ctrl; // kept for the life of the DLL (one small object)
-            m_ownQueuePM = VCall<void*>(m_ownQueue, 2, (const void*)s_iidAnimationPoseModifier); // QueryInterface
-            CryLog("ViewmodelTweaks: created our own AnimationPoseModifier_OperatorQueue ({}), pose-modifier interface {}", m_ownQueue, m_ownQueuePM);
-        }
-        else
-            CryLog("ViewmodelTweaks: could not create an AnimationPoseModifier_OperatorQueue - no interaction reach without a weapon");
-    }
-    if (!m_ownQueue || !m_ownQueuePM)
-        return;
-
-    // Same thing the game's context does every frame: hand the queue to the skeleton, then fill it.
-    void* pSkelAnim = VCall<void*>(pChar, 0x28 / 8);
-    void* pSkelPose = VCall<void*>(pChar, VT_ICharacterInstance_GetISkeletonPose);
-    if (!pSkelAnim || !pSkelPose)
-        return;
-    struct { void* ptr; void* ctrl; } spPM = { m_ownQueuePM, m_ownQueueCtrl };
-    VCall<void>(pSkelAnim, 0x120 / 8, 6u, (const void*)&spPM, "VmInteract"); // ISkeletonAnim::PushPoseModifier(layer, ptr, name)
-
-    // The context's joint ids are what the pushes address; without the context they come from the skeleton by name.
-    if (m_lock.leftIkJoint < 0)
-    {
-        void* pSkel = VCall<void*>(pChar, VT_ICharacterInstance_GetIDefaultSkeleton);
-        if (pSkel)
-            m_lock.leftIkJoint = VCall<int>(pSkel, VT_IDefaultSkeleton_GetJointIDByName, "l_hand_spine_target");
-    }
-    QuatT camAbs(IDENTITY);
-    if (!PredictCamera(pPlayer, camAbs))
-        return;
-    PushInteractReach(m_ownQueue, pSkelPose, camAbs);
-    I.ownQueueUsed = true;
-    I.ownQueuePushes++;
 }
 
 fs::path ModMain::GetPosesPath() const
@@ -3371,7 +3118,7 @@ void ModMain::SanitizeSettings()
     fixF(s.interactFireDelay, def.interactFireDelay); fixF(s.interactMaxForward, def.interactMaxForward); fixF(s.interactMinForward, def.interactMinForward);
     fixF(s.interactMaxSide, def.interactMaxSide); fixF(s.interactMaxUp, def.interactMaxUp); fixF(s.interactMaxDown, def.interactMaxDown);
     fixF(s.interactCorrGain, def.interactCorrGain); fixF(s.interactTestX, def.interactTestX); fixF(s.interactExamMaxForward, def.interactExamMaxForward);
-    fixF(s.interactExamFov, def.interactExamFov); fixF(s.interactExamArmExtend, def.interactExamArmExtend); fixF(s.interactExamArmLength, def.interactExamArmLength); fixF(s.interactExamMinTargetDist, def.interactExamMinTargetDist); fixF(s.interactExamBodyX, def.interactExamBodyX); fixF(s.interactExamBodyY, def.interactExamBodyY); fixF(s.interactExamBodyZ, def.interactExamBodyZ);
+    fixF(s.interactExamFov, def.interactExamFov); fixF(s.interactExamArmLength, def.interactExamArmLength); fixF(s.interactExamMinTargetDist, def.interactExamMinTargetDist); fixF(s.interactExamBodyX, def.interactExamBodyX); fixF(s.interactExamBodyY, def.interactExamBodyY); fixF(s.interactExamBodyZ, def.interactExamBodyZ);
     if (s.examCorr.Sanitize(def.examCorr)) fixed++;
     fixF(s.interactRestExamX, def.interactRestExamX); fixF(s.interactRestExamY, def.interactRestExamY); fixF(s.interactRestExamZ, def.interactRestExamZ);
     fixF(s.interactRestX, def.interactRestX); fixF(s.interactRestY, def.interactRestY); fixF(s.interactRestZ, def.interactRestZ); fixF(s.interactRestBlendTime, def.interactRestBlendTime); fixF(s.interactTestY, def.interactTestY); fixF(s.interactTestZ, def.interactTestZ);
@@ -3756,10 +3503,9 @@ bool ModMain::OnInputEvent(const SInputEvent& event)
                 ArkPlayer* pP = ArkPlayer::GetInstancePtr();
                 const Ang3 lr = pP ? pP->m_examinationMode.m_localRotation : Ang3(ZERO);
                 CryLog("ViewmodelTweaks: screen click - view camera pos ({:.2f} {:.2f} {:.2f}) dir ({:.2f} {:.2f} {:.2f}), hit ({:.2f} {:.2f} {:.2f}) dist {:.2f}, "
-                       "exam local rotation ({:.2f} {:.2f} {:.2f}), camModel t ({:.2f} {:.2f} {:.2f}) valid {}, source {}, reticle ({:.3f} {:.3f}), hw cursor ({:.3f} {:.3f}), view {}x{}",
+                       "exam local rotation ({:.2f} {:.2f} {:.2f}), camModel t ({:.2f} {:.2f} {:.2f}) valid {}, view {}x{}",
                     cp.x, cp.y, cp.z, cd.x, cd.y, cd.z, p.x, p.y, p.z, (p - cp).GetLength(), lr.x, lr.y, lr.z,
-                    m_render.camModel.t.x, m_render.camModel.t.y, m_render.camModel.t.z, m_render.camValid, m_settings.interactExamCursorSource,
-                    m_interact.cursorReticle.x, m_interact.cursorReticle.y, m_interact.cursorHardware.x, m_interact.cursorHardware.y,
+                    m_render.camModel.t.x, m_render.camModel.t.y, m_render.camModel.t.z, m_render.camValid,
                     vc.GetViewSurfaceX(), vc.GetViewSurfaceZ());
             }
             m_interact.lastType = (int)EArkInteractionType::scriptDefined;
@@ -4317,19 +4063,15 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_examination", &s.interactExamination, s.interactExamination, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reach for the cursor when clicking on in-world screens / keypads (0/1)");
     REGISTER_CVAR2("vm_interact_exam_key", &s.interactExamKey, s.interactExamKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: EKeyId that counts as a screen click (256 = left mouse button)");
     REGISTER_CVAR2("vm_interact_exam_key2", &s.interactExamKey2, s.interactExamKey2, VF_DUMPTOCHAIR, "Viewmodel Tweaks: second EKeyId that counts as a screen click (17 = E)");
-    REGISTER_CVAR2("vm_interact_exam_cursor", &s.interactExamCursorSource, s.interactExamCursorSource, VF_DUMPTOCHAIR, "Viewmodel Tweaks: what a screen click aims at. 0 = OS mouse cursor, 1 = centre of the view, 2 = HUD reticle, 3 = engine hardware mouse");
     RegisterPoseCVars(s.examCorr, "interact_exam_", "interaction hand correction on screens");
-    REGISTER_CVAR2("vm_interact_exam_arm_extend", &s.interactExamArmExtend, s.interactExamArmExtend, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, push the left shoulder forward by this much (m) so the arm reaches further");
     REGISTER_CVAR2("vm_interact_exam_body_x", &s.interactExamBodyX, s.interactExamBodyX, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, move the arms/torso right (m)");
     REGISTER_CVAR2("vm_interact_exam_body_y", &s.interactExamBodyY, s.interactExamBodyY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, move the arms/torso forward (m)");
     REGISTER_CVAR2("vm_interact_exam_body_z", &s.interactExamBodyZ, s.interactExamBodyZ, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, move the arms/torso up (m)");
     REGISTER_CVAR2("vm_interact_exam_auto_body", &s.interactExamAutoBody, s.interactExamAutoBody, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, bring the body forward automatically when the wrist is beyond the arm (0/1)");
     REGISTER_CVAR2("vm_interact_exam_arm_length", &s.interactExamArmLength, s.interactExamArmLength, VF_DUMPTOCHAIR, "Viewmodel Tweaks: shoulder-to-wrist distance the automatic body offset keeps (m)");
     REGISTER_CVAR2("vm_interact_exam_min_dist", &s.interactExamMinTargetDist, s.interactExamMinTargetDist, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens, no reach when the point is closer than this to the camera (m)");
-    REGISTER_CVAR2("vm_interact_exam_shift_mode", &s.interactExamShiftMode, s.interactExamShiftMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how the arms are moved to the examination camera. 1 = skeleton, root joint (default); 0 = skeleton, every joint (children shifted twice - wrong); 2 = render side (old)");
     REGISTER_CVAR2("vm_interact_exam_fov_mode", &s.interactExamFovMode, s.interactExamFovMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera FOV on screens. 0 = the game's zoom, 1 = no zoom (cl_hfov), 2 = custom (vm_interact_exam_fov)");
     REGISTER_CVAR2("vm_interact_exam_fov", &s.interactExamFov, s.interactExamFov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: custom horizontal FOV on screens (deg)");
-    REGISTER_CVAR2("vm_interact_exam_follow", &s.interactExamFollow, s.interactExamFollow, VF_DUMPTOCHAIR, "Viewmodel Tweaks: TEST - the hand tracks the screen cursor continuously while on a screen (0/1)");
     REGISTER_CVAR2("vm_interact_debug_marker", &s.interactDebugMarker, s.interactDebugMarker, VF_DUMPTOCHAIR, "Viewmodel Tweaks: draw the reach target / asked hand position and log screen clicks (0/1)");
     REGISTER_CVAR2("vm_interact_exam_rest", &s.interactExamRest, s.interactExamRest, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens keep the arms shown and the pointing hand resting in view between clicks (0/1)");
     REGISTER_CVAR2("vm_interact_rest_x", &s.interactRestX, s.interactRestX, VF_DUMPTOCHAIR, "Viewmodel Tweaks: resting spot, right (m)");
@@ -4356,10 +4098,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_nozoom_security", &s.interactNoZoomSecurity, s.interactNoZoomSecurity, VF_DUMPTOCHAIR, "Viewmodel Tweaks: the same for security stations (ui_examine_securitystation) (0/1)");
     REGISTER_CVAR2("vm_interact_nozoom_workstation", &s.interactNoZoomWorkstation, s.interactNoZoomWorkstation, VF_DUMPTOCHAIR, "Viewmodel Tweaks: the same for workstations (ui_examine_workstation) (0/1)");
     REGISTER_CVAR2("vm_interact_exam_gentle", &s.interactExamGentle, s.interactExamGentle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens the press uses its own gentler style, vm_interact_press_exam_* (0/1)");
-    REGISTER_CVAR2("vm_interact_exam_flip_y", &s.interactExamFlipY, s.interactExamFlipY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: screen cursor y is measured from the top (1) or the bottom (0)");
-    REGISTER_CVAR2("vm_interact_own_queue", &s.interactOwnQueue, s.interactOwnQueue, VF_DUMPTOCHAIR, "Viewmodel Tweaks: EXPERIMENTAL - own pose modifier when the game's weapon context skipped a frame (0/1). Known to crash; leave at 0.");
     REGISTER_CVAR2("vm_interact_show_arms", &s.interactShowArms, s.interactShowArms, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show the arms for the reach where the game hides them - unarmed, screens (0/1)");
-    REGISTER_CVAR2("vm_interact_hide_right_arm", &s.interactHideRightArm, s.interactHideRightArm, VF_DUMPTOCHAIR, "Viewmodel Tweaks: keep the right arm out of view while the arms are shown for such a reach (0/1)");
     REGISTER_CVAR2("vm_interact_correct", &s.interactCorrGain, s.interactCorrGain, VF_DUMPTOCHAIR, "Viewmodel Tweaks: closed-loop correction of the hand position per frame (0 = off, 0.5 default, 1 = full)");
     REGISTER_CVAR2("vm_interact_wrist_mode", &s.interactWristMode, s.interactWristMode, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how a hand pose's wrist orientation is applied. 0 = IK target joint, 1 = hand joint relative to the forearm, 2 = both");
     REGISTER_CVAR2("vm_interact_ease_in", &s.interactEaseIn, s.interactEaseIn, VF_DUMPTOCHAIR, "Viewmodel Tweaks: reach easing. 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 ease in-out");
@@ -4552,19 +4291,8 @@ void ModMain::DrawInteractMarkers(float dt)
         const Vec3 model = m_render.camModel * I.handActualView;
         mark(pEnt->GetWorldPos() + pEnt->GetWorldRotation() * model, "hand actual (wrist joint)", IM_COL32(60, 220, 255, 255));
     }
-    // crosshair reference and the cursor candidates (screen space, no projection involved)
+    // crosshair reference (screen space, no projection involved)
     dl->AddCircle(ImVec2(ds.x * 0.5f, ds.y * 0.5f), 4.0f, IM_COL32(255, 255, 255, 160), 12, 1.0f);
-    if (I.cursorOsValid)
-    {
-        const ImVec2 c(I.cursorOs.x * ds.x, I.cursorOs.y * ds.y);
-        dl->AddCircle(c, 14.0f, IM_COL32(80, 160, 255, 255), 24, 2.0f);
-        dl->AddText(ImVec2(c.x + 16.0f, c.y + 6.0f), IM_COL32(80, 160, 255, 255), "OS cursor");
-    }
-    {
-        const ImVec2 c(I.cursorReticle.x * ds.x, I.cursorReticle.y * ds.y);
-        dl->AddCircle(c, 6.0f, IM_COL32(255, 200, 0, 255), 12, 1.5f);
-        dl->AddText(ImVec2(c.x + 8.0f, c.y - 20.0f), IM_COL32(255, 200, 0, 255), "reticle");
-    }
     // the shoulder (left upper-arm joint), so the reach geometry can be judged
     if (pEnt && m_render.camValid && I.shoulderValid)
     {
@@ -4574,14 +4302,13 @@ void ModMain::DrawInteractMarkers(float dt)
     const float residual = (I.handActualValid && Finite(I.desiredView)) ? (I.desiredView - I.handActualView).GetLength() : -1.0f;
     const float shoulderDist = (I.shoulderValid && Finite(I.desiredView)) ? (I.desiredView - I.shoulderView).GetLength() : -1.0f;
     char buf[520];
-    snprintf(buf, sizeof(buf), "[vm debug] %s%s%s auto body fwd %.2f | target (%.2f %.2f %.2f)%s  asked (%.2f %.2f %.2f)  actual (%.2f %.2f %.2f)  residual %.2f m%s  corr %.2f%s | shoulder (%.2f %.2f %.2f) -> asked %.2f m | anim hand (%.2f %.2f %.2f) curve %.2f rest %.2f | OS cursor (%.2f %.2f)%s reticle (%.2f %.2f)",
+    snprintf(buf, sizeof(buf), "[vm debug] %s%s%s auto body fwd %.2f | target (%.2f %.2f %.2f)%s  asked (%.2f %.2f %.2f)  actual (%.2f %.2f %.2f)  residual %.2f m%s  corr %.2f%s | shoulder (%.2f %.2f %.2f) -> asked %.2f m | anim hand (%.2f %.2f %.2f) curve %.2f rest %.2f | chain resets %d",
         I.examining ? "screen" : "not on a screen", I.unarmed ? ", no weapon" : "", I.examTooClose ? " TOO CLOSE - no reach" : "", I.autoBodyY,
         I.targetView.x, I.targetView.y, I.targetView.z, I.clamped ? " CLAMPED" : "", I.desiredView.x, I.desiredView.y, I.desiredView.z,
         I.handActualView.x, I.handActualView.y, I.handActualView.z, residual, residual > 0.06f ? " (IK NOT REACHING)" : "",
         I.corr.GetLength(), I.corr.GetLength() > 0.34f ? " SATURATED" : "",
         I.shoulderView.x, I.shoulderView.y, I.shoulderView.z, shoulderDist,
-        I.handView.x, I.handView.y, I.handView.z, I.curve, I.restBlend, I.cursorOs.x, I.cursorOs.y, I.cursorOsValid ? "" : " (n/a)",
-        I.cursorReticle.x, I.cursorReticle.y);
+        I.handView.x, I.handView.y, I.handView.z, I.curve, I.restBlend, I.chainResets);
     const ImVec2 ts = ImGui::CalcTextSize(buf);
     dl->AddRectFilled(ImVec2(ds.x * 0.5f - ts.x * 0.5f - 6.0f, ds.y - 60.0f), ImVec2(ds.x * 0.5f + ts.x * 0.5f + 6.0f, ds.y - 60.0f + ts.y + 6.0f), IM_COL32(0, 0, 0, 160));
     dl->AddText(ImVec2(ds.x * 0.5f - ts.x * 0.5f, ds.y - 57.0f), IM_COL32(255, 255, 255, 255), buf);
@@ -4592,8 +4319,6 @@ void ModMain::UpdateBeforeSystem(unsigned updateFlags)
     // A deferred interaction is made here, before the game's own update, i.e. in the same window the
     // input-driven call would normally happen in.
     FireDeferredInteract();
-    // No weapon out -> the game's procedural weapon context is not running -> our own pose modifier.
-    PushWithOwnQueue();
 }
 
 void ModMain::MainUpdate(unsigned updateFlags)
@@ -5017,11 +4742,6 @@ void ModMain::DrawHandPoseEditor()
     if (SliderDeg("Hand pitch", P.handPitch, 180.0f, "Absolute, view space: + tilts the hand up (fingers up).")) m_posesDirty = true;
     if (SliderDeg("Hand yaw", P.handYaw, 180.0f, "Absolute, view space: + turns the hand left.")) m_posesDirty = true;
     if (SliderDeg("Hand roll", P.handRoll, 180.0f, "Absolute, view space: rolls around the forward axis.")) m_posesDirty = true;
-    const char* wristModes[] = { "Through the IK target joint", "Through the hand joint (relative to the forearm)", "Both" };
-    ImGui::Combo("Wrist applied", &s.interactWristMode, wristModes, 3);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Diagnostic. The arm IK runs after our overrides; which of the two routes the rig honours is being tested.\n"
-                          "If the wrist sliders do nothing in one mode, try another.");
 
     // --- fingers ------------------------------------------------------------------------------------------
     ImGui::Spacing();
@@ -5077,133 +4797,158 @@ void ModMain::DrawInteractTab()
 {
     ViewmodelSettings& s = m_settings;
     InteractState& I = m_interact;
+    const char* typeNames[] = { "scriptDefined (buttons, doors, terminals, ...)", "codeDefined", "pickup", "consume", "carry", "hack", "repair", "fortify", "examine", "equip", "hoover (GLOO/Recycler charges)" };
+    const int typeBits[] = { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    auto typeMaskEditor = [&](int& mask, const char* id) {
+        ImGui::PushID(id);
+        for (int i = 0; i < 11; i++)
+        {
+            bool on = (mask >> typeBits[i]) & 1;
+            if (ImGui::Checkbox(typeNames[i], &on))
+                mask = on ? (mask | (1 << typeBits[i])) : (mask & ~(1 << typeBits[i]));
+        }
+        ImGui::PopID();
+    };
 
-    ImGui::TextWrapped("Reaches out with the support hand when you interact: a poke for buttons, switches, terminals and hacking, "
-                       "a grab for pickups, loot, consumables and things you carry. Procedural - a tween on the hand's IK target on top of the "
-                       "live animation - so it works with every weapon that has both hands on it. Needs a weapon out (the arms are only "
-                       "animated this way with a weapon).");
+    ImGui::TextWrapped("The support hand reaches out when you interact: a press for buttons, switches, terminals and hacking, a grab for "
+                       "pickups, loot, consumables and things you carry - with any weapon, with none, and on in-world screens and keypads.");
     ImGui::Spacing();
     CheckboxInt("Enable interaction animation", s.interactEnabled);
     ImGui::SameLine();
     CheckboxInt("Also while aiming", s.interactWhileAiming, "By default the sights win: no reach while aiming down sights.");
+    ImGui::SameLine();
+    CheckboxInt("With no weapon out", s.interactUnarmed, "The game hides the arms with no weapon out; they are shown for the reach.");
 
-    CheckboxInt("Defer the interaction until the hand arrives", s.interactDefer,
-        "The game's side of the interaction (item vanishes, button clicks, door opens) is delayed so it happens when the hand gets there.\n"
-        "The key press is answered immediately; only the effect waits. Carrying is never deferred: the game delays that itself.");
-    if (s.interactDefer)
+    // --- the reach itself -----------------------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Reach", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Indent();
-        ImGui::SliderFloat("Interaction fires after", &s.interactFireDelay, 0.0f, 0.6f, "%.2f s");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Seconds from the key press to the actual interaction. Roughly the reach time of the style, or a bit less.");
-        CheckboxInt("Cancel if the crosshair moved to another object", s.interactCancelRetarget,
-            "Off: the interaction happens on whatever is under the crosshair when the delay ends (never loses an input).\n"
-            "On: it is dropped when the target changed in between.");
-        ImGui::Unindent();
-    }
-    const char* targetModes[] = { "Crosshair hit point on the object", "Object centre", "Fixed point ahead (test point)" };
-    ImGui::Combo("Hand goes to", &s.interactTargetMode, targetModes, 3);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the hand reaches. The hit point is where the crosshair ray meets the object (a button's face); falls back to the object centre.");
-    const char* eases[] = { "Linear", "Smooth", "Ease out (fast start)", "Ease in (slow start)", "Ease in-out" };
-    ImGui::Combo("Reach easing", &s.interactEaseIn, eases, 5);
-    ImGui::Combo("Return easing", &s.interactEaseOut, eases, 5);
-
-    if (ImGui::CollapsingHeader("Reach envelope", ImGuiTreeNodeFlags_None))
-    {
-        ImGui::TextWrapped("The hand target is clamped to this box around the eye (view space). Keeps the arm from stretching to things out of reach.");
-        SliderCm("Furthest forward", s.interactMaxForward, 100.0f, "The wrist never goes further forward than this; a farther target is approached along the line of sight.");
-        SliderCm("Furthest forward on screens", s.interactExamMaxForward, 100.0f, "The same limit while a screen / keypad is up (the arms are moved to the examination camera there, so the arm has its full length).");
-        SliderCm("Nearest", s.interactMinForward, 50.0f, "The hand never comes closer to the camera than this.");
-        SliderCm("Left / right", s.interactMaxSide, 80.0f, "Sideways limit either way.");
-        SliderCm("Above the eye", s.interactMaxUp, 80.0f, nullptr);
-        SliderCm("Below the eye", s.interactMaxDown, 100.0f, nullptr);
-    }
-    if (ImGui::CollapsingHeader("Press (buttons, switches, terminals, hack, repair)", ImGuiTreeNodeFlags_DefaultOpen))
-        DrawReachStyle(s.press, "press");
-    if (ImGui::CollapsingHeader("Grab (pickups, loot, consume, carry, equip, examine)", ImGuiTreeNodeFlags_DefaultOpen))
-        DrawReachStyle(s.grab, "grab");
-    if (ImGui::CollapsingHeader("Without a weapon and on screens (experimental)", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        ImGui::TextWrapped("The game hides the arms with no weapon out and while you use an in-world screen or keypad. For those the mod "
-                           "shows the arms for the duration of the reach, keeps the right arm out of view, and - with no weapon - drives the "
-                           "skeleton with its own pose modifier, since the game's weapon animation context is not running.");
-        CheckboxInt("Reach with no weapon out", s.interactUnarmed);
-        CheckboxInt("Reach for the cursor when clicking on a screen / keypad", s.interactExamination);
-        ImGui::Indent();
-        ImGui::Text("Click keys: %s and %s", GetKeyName(s.interactExamKey), GetKeyName(s.interactExamKey2));
-        ImGui::SameLine();
-        if (m_waitingForExamKey == 0)
+        CheckboxInt("Defer the interaction until the hand arrives", s.interactDefer,
+            "The game's side of the interaction (item vanishes, button clicks, door opens) is delayed so it happens when the hand gets there.\n"
+            "The key press is answered immediately; only the effect waits. Carrying is never deferred: the game delays that itself.");
+        if (s.interactDefer)
         {
-            if (ImGui::SmallButton("Bind 1st")) m_waitingForExamKey = 1;
+            ImGui::Indent();
+            ImGui::SliderFloat("Interaction fires after", &s.interactFireDelay, 0.0f, 0.6f, "%.2f s");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Seconds from the key press to the actual interaction. Roughly the reach time of the style, or a bit less.");
+            CheckboxInt("Cancel if the crosshair moved to another object", s.interactCancelRetarget,
+                "Off: the interaction happens on whatever is under the crosshair when the delay ends (never loses an input).\n"
+                "On: it is dropped when the target changed in between.");
+            ImGui::Unindent();
+        }
+        const char* targetModes[] = { "Crosshair hit point on the object", "Object centre", "Fixed point ahead (test point)" };
+        ImGui::Combo("Hand goes to", &s.interactTargetMode, targetModes, 3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the hand reaches. The hit point is where the crosshair ray meets the object (a button's face); falls back to the object centre.");
+        const char* eases[] = { "Linear", "Smooth", "Ease out (fast start)", "Ease in (slow start)", "Ease in-out" };
+        ImGui::Combo("Reach easing", &s.interactEaseIn, eases, 5);
+        ImGui::Combo("Return easing", &s.interactEaseOut, eases, 5);
+        if (ImGui::TreeNode("Press timing and path (buttons, switches, terminals, hack, repair)"))
+        {
+            DrawReachStyle(s.press, "press");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Grab timing and path (pickups, loot, consume, carry, equip, examine)"))
+        {
+            DrawReachStyle(s.grab, "grab");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("How far the hand may go (envelope)"))
+        {
+            ImGui::TextWrapped("The wrist is kept inside this box around the eye (view space); a farther target is approached along the line of sight.");
+            SliderCm("Furthest forward", s.interactMaxForward, 100.0f, nullptr);
+            SliderCm("Furthest forward on screens", s.interactExamMaxForward, 100.0f, "While a screen / keypad is up the arms are brought to the camera, so the arm has its full length.");
+            SliderCm("Nearest", s.interactMinForward, 50.0f, "The hand never comes closer to the camera than this.");
+            SliderCm("Left / right", s.interactMaxSide, 80.0f, "Sideways limit either way.");
+            SliderCm("Above the eye", s.interactMaxUp, 80.0f, nullptr);
+            SliderCm("Below the eye", s.interactMaxDown, 100.0f, nullptr);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Which interactions animate"))
+        {
+            typeMaskEditor(s.interactTypeMask, "types");
+            CheckboxInt("Remote manipulation (psi) mode", s.interactRemoteMode);
+            ImGui::TreePop();
+        }
+    }
+
+    // --- screens and keypads ----------------------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Screens and keypads", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        CheckboxInt("Press where you click on a screen / keypad (zoomed-in view)", s.interactExamination,
+            "While a screen is up the arms are brought to the zoomed-in camera and the hand presses where the centre of the view is when you click.");
+        if (s.interactExamination)
+        {
+            ImGui::Indent();
+            ImGui::Text("Click keys: %s and %s", GetKeyName(s.interactExamKey), GetKeyName(s.interactExamKey2));
             ImGui::SameLine();
-            if (ImGui::SmallButton("Bind 2nd")) m_waitingForExamKey = 2;
-        }
-        else
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "press the key to use as a screen click (Esc cancels)");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Set these to the mouse button / key you click screens with (your use key, e.g. F).");
-        CheckboxInt("Cursor y runs from the top of the screen", s.interactExamFlipY, "Untick if the hand goes to the mirrored spot vertically.");
-        const char* cursorSources[] = { "OS mouse cursor (window position)", "Centre of the view", "HUD reticle position", "Engine hardware-mouse position" };
-        ImGui::Combo("Screen click aims at", &s.interactExamCursorSource, cursorSources, 4);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the click ray goes through the screen. Turn the debug overlay on: the blue circle is the OS cursor, the yellow one the HUD reticle - whichever sits on the cursor you see is the right source.");
-        if (ImGui::TreeNodeEx("Hand correction on screens only (big ranges)", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            ImGui::TextWrapped("Added on top of the pose and the per-weapon correction only while a screen / keypad is up. Blended in with the reach.");
-            SliderCm("Hand right / left##ex", s.examCorr.posX, 100.0f, "Screens only.");
-            SliderCm("Hand forward / back##ex", s.examCorr.posY, 100.0f, "Screens only. Positive = further from the camera.");
-            SliderCm("Hand up / down##ex", s.examCorr.posZ, 100.0f, "Screens only.");
-            SliderDeg("Wrist pitch##ex", s.examCorr.pitch, 180.0f, "Screens only.");
-            SliderDeg("Wrist yaw##ex", s.examCorr.yaw, 180.0f, "Screens only.");
-            SliderDeg("Wrist roll##ex", s.examCorr.roll, 180.0f, "Screens only.");
-            SliderCm("Arm reach extension", s.interactExamArmExtend, 60.0f, "Pushes the left shoulder forward with the reach so the arm can get to screens further away than it is long. 0 = off.");
-            ImGui::Spacing();
-            ImGui::TextWrapped("Body position on screens: moves the whole arms / torso relative to the camera (the hand target stays where it is). "
-                               "If the overlay says the IK cannot reach, bring the body forward / up until it can.");
-            SliderCm("Body right / left##bd", s.interactExamBodyX, 100.0f, "Screens only.");
-            SliderCm("Body forward / back##bd", s.interactExamBodyY, 100.0f, "Screens only. Positive brings the shoulders closer to the screen.");
-            SliderCm("Body up / down##bd", s.interactExamBodyZ, 100.0f, "Screens only.");
-            CheckboxInt("Bring the body forward automatically when the wrist is beyond the arm", s.interactExamAutoBody,
-                "Uses the shoulder position it sees and the arm length below; the manual sliders add on top.");
-            if (s.interactExamAutoBody)
+            if (m_waitingForExamKey == 0)
             {
-                SliderCm("Arm length (shoulder to wrist)", s.interactExamArmLength, 80.0f, "The distance the automatic offset keeps between shoulder and wrist.");
-                ImGui::TextDisabled("automatic body forward right now: %.0f cm", m_interact.autoBodyY * 100.0f);
+                if (ImGui::SmallButton("Bind 1st")) m_waitingForExamKey = 1;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Bind 2nd")) m_waitingForExamKey = 2;
             }
-            SliderCm("No reach when the point is closer than", s.interactExamMinTargetDist, 100.0f,
-                "Keypads put the camera 20-30 cm from the surface; a hand touching them would sit on the lens. Closer than this: the hand stays put.");
-            if (ImGui::Button("Reset screen correction")) { s.examCorr.Reset(); s.interactExamArmExtend = 0.0f; s.interactExamBodyX = s.interactExamBodyY = s.interactExamBodyZ = 0.0f; m_interact.autoBodyY = 0.0f; }
-            ImGui::TreePop();
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "press the key to use as a screen click (Esc cancels)");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Set these to the mouse button / key you click screens with (your use key, e.g. F).");
+            CheckboxInt("Gentler press on screens", s.interactExamGentle,
+                "The press while a screen is up uses its own timings (slower in and out, shorter way): you are close to it and the hand starts from its resting spot.");
+            if (s.interactExamGentle && ImGui::TreeNode("Press on screens: timing and path"))
+            {
+                DrawReachStyle(s.pressExam, "pressExam");
+                ImGui::TreePop();
+            }
+            ImGui::SliderFloat("Leaving a screen: fade-out time", &s.interactExamLeaveTime, 0.05f, 1.5f, "%.2f s");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything that only applies on screens (the body brought to the camera, the screen corrections, the longer reach) fades over this after you leave one, instead of snapping to the weapon.");
+            const char* fovModes[] = { "The game's zoom", "No zoom (regular FOV)", "Custom" };
+            ImGui::Combo("Camera FOV on screens", &s.interactExamFovMode, fovModes, 3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overrides the zoom the game applies while a screen / keypad is up. The camera still moves to the screen, and the screen itself keeps its size (it is drawn with the arms).");
+            if (s.interactExamFovMode == 2)
+                ImGui::SliderFloat("Screen FOV", &s.interactExamFov, 30.0f, 120.0f, "%.0f deg");
+            if (ImGui::TreeNode("Fitting the arm to the screen (advanced)"))
+            {
+                ImGui::TextWrapped("Only while a screen is up. Turn the debug overlay on (Advanced) to see the target, the asked and the actual hand and the shoulder.");
+                SliderCm("No reach when the point is closer than", s.interactExamMinTargetDist, 100.0f,
+                    "Keypads put the camera 20-30 cm from the surface; a hand touching them would sit on the lens. Closer than this: the hand stays put.");
+                CheckboxInt("Bring the body forward automatically when the wrist is beyond the arm", s.interactExamAutoBody,
+                    "Slides the body toward the screen until shoulder-to-wrist equals the arm length below (monitors are farther than the arm is long).");
+                if (s.interactExamAutoBody)
+                {
+                    SliderCm("Arm length (shoulder to wrist)", s.interactExamArmLength, 80.0f, nullptr);
+                    ImGui::TextDisabled("automatic body forward right now: %.0f cm", I.autoBodyY * 100.0f);
+                }
+                ImGui::Text("Body offset (the whole arms / torso relative to the camera)");
+                SliderCm("Body right / left##bd", s.interactExamBodyX, 100.0f, nullptr);
+                SliderCm("Body forward / back##bd", s.interactExamBodyY, 100.0f, "Positive brings the shoulders closer to the screen.");
+                SliderCm("Body up / down##bd", s.interactExamBodyZ, 100.0f, nullptr);
+                ImGui::Text("Hand correction on screens (on top of the pose and the per-weapon correction)");
+                SliderCm("Hand right / left##ex", s.examCorr.posX, 100.0f, nullptr);
+                SliderCm("Hand forward / back##ex", s.examCorr.posY, 100.0f, "Positive = further from the camera.");
+                SliderCm("Hand up / down##ex", s.examCorr.posZ, 100.0f, nullptr);
+                SliderDeg("Wrist pitch##ex", s.examCorr.pitch, 180.0f, nullptr);
+                SliderDeg("Wrist yaw##ex", s.examCorr.yaw, 180.0f, nullptr);
+                SliderDeg("Wrist roll##ex", s.examCorr.roll, 180.0f, nullptr);
+                if (ImGui::Button("Reset all of the above")) { s.examCorr.Reset(); s.interactExamBodyX = s.interactExamBodyY = s.interactExamBodyZ = 0.0f; I.autoBodyY = 0.0f; }
+                ImGui::TreePop();
+            }
+            ImGui::Unindent();
         }
-        CheckboxInt("TEST: hand tracks the cursor continuously while on a screen", s.interactExamFollow,
-            "No click needed: while a screen / keypad is up the hand is held at the cursor's point on the screen and follows it. For checking the aim.");
-        CheckboxInt("Debug overlay (cursor candidates, target and hand markers, numbers) + click log", s.interactDebugMarker,
-            "Drawn with ImGui every frame while on: blue circle = OS cursor, yellow = HUD reticle, red = reach target, green = where the wrist is asked to be, cyan = where the wrist joint really is;\n"
-            "a line of numbers at the bottom. If you see none of it, the overlay path itself is not working - tell me.");
-        ImGui::TextDisabled("reticle (%.2f %.2f)   hardware cursor (%.2f %.2f)", I.cursorReticle.x, I.cursorReticle.y, I.cursorHardware.x, I.cursorHardware.y);
-        const char* shiftModes[] = { "Skeleton: every joint (wrong - children get it twice)", "Skeleton: root joint (default)", "Render side (old)" };
-        ImGui::Combo("Arms brought to the camera via", &s.interactExamShiftMode, shiftModes, 3);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the whole arms/torso are moved from the body to the examination camera. A position pushed on a joint travels down to its children, so the root alone moves everything;\npushing every joint moves the hand by the shift once per ancestor (the flailing). Render side is kept for comparison only.");
-        ImGui::TextDisabled("chain resets: %d (frames where the read-back did not fit and the reach was skipped once)", I.chainResets);
-        const char* fovModes[] = { "The game's zoom", "No zoom (regular FOV)", "Custom" };
-        ImGui::Combo("Camera FOV on screens", &s.interactExamFovMode, fovModes, 3);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overrides the zoom the game applies while a screen / keypad is up (its zoom entry is out-prioritised). The camera still moves to the screen.");
-        if (s.interactExamFovMode == 2)
-            ImGui::SliderFloat("Screen FOV", &s.interactExamFov, 30.0f, 120.0f, "%.0f deg");
-        CheckboxInt("Keep the pointing hand resting in view on screens", s.interactExamRest,
-            "While a screen / keypad is up the arms stay shown and the hand waits at the resting spot; each click reaches from there to the cursor and back.");
-        ImGui::SliderFloat("Leaving a screen: fade-out time", &s.interactExamLeaveTime, 0.05f, 1.5f, "%.2f s");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything that only applies on screens (the body moved to the camera, the screen corrections, the longer reach) fades over this after you leave one, instead of snapping to the weapon.");
-        CheckboxInt("Gentler press on screens", s.interactExamGentle, "The press while a screen / keypad is up uses its own timings below (slower in and out, shorter way) - you are close to it and the hand starts from its resting spot.");
-        if (s.interactExamGentle && ImGui::TreeNode("Press on screens (timings)"))
-        {
-            DrawReachStyle(s.pressExam, "pressExam");
-            ImGui::TreePop();
-        }
-        ImGui::Unindent();
+        ImGui::Spacing();
+        ImGui::Text("Use from where you stand (no automatic zoom-in)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The game zooms you into some screen types as soon as you press use on them. Off, the press goes straight to the button under the\n"
+                              "crosshair - like kiosks and keycard readers already work - and the hand presses it from where you stand. The examine key still zooms in.");
+        CheckboxInt("Keypads", s.interactNoZoomKeypad);
+        ImGui::SameLine(); CheckboxInt("Fabricators", s.interactNoZoomFabricator);
+        ImGui::SameLine(); CheckboxInt("Security stations", s.interactNoZoomSecurity);
+        ImGui::SameLine(); CheckboxInt("Workstations", s.interactNoZoomWorkstation);
     }
+
+    // --- resting hand -------------------------------------------------------------------------------------------
     if (ImGui::CollapsingHeader("Resting hand", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::TextWrapped("The pointing hand held up in view: between clicks on a screen, and - optionally - whenever something usable is in front of you.");
+        ImGui::TextWrapped("The pointing hand held up in view: between clicks on a screen, and - optionally - whenever something usable is in front of you. "
+                           "Its pose is chosen under 'Hand pose' (\"Resting hand uses pose\").");
         CheckboxInt("On screens (between clicks)", s.interactExamRest,
-            "While a screen / keypad is up the arms stay shown and the hand waits at the resting spot; each click reaches from there to the cursor and back.");
+            "While a screen / keypad is up the arms stay shown and the hand waits at the resting spot; each click reaches from there and back.");
         CheckboxInt("Hovering over usable things (outside screens)", s.interactHoverRest,
             "While the game shows its use prompt for something within the distance below - a button, a keypad, an item, a container - the hand comes up and waits, then presses / grabs from there.");
         if (s.interactHoverRest)
@@ -5212,9 +4957,8 @@ void ModMain::DrawInteractTab()
             CheckboxInt("with a weapon out (the support hand leaves the grip)", s.interactHoverWeapon);
             if (s.interactHoverWeapon)
             {
-                ImGui::Indent();
-                CheckboxInt("also while aiming down sights", s.interactHoverWhileAiming, "Off: while aiming the support hand stays on the gun and nothing hovers.");
-                ImGui::Unindent();
+                ImGui::SameLine();
+                CheckboxInt("also while aiming", s.interactHoverWhileAiming, "Off: while aiming down sights the support hand stays on the gun.");
             }
             CheckboxInt("with no weapon out", s.interactHoverUnarmed);
             SliderCm("Only when closer than", s.interactHoverMaxDist, 300.0f, "Camera to the thing's point.");
@@ -5222,155 +4966,136 @@ void ModMain::DrawInteractTab()
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = the hand waits at the plain resting spot, 1 = it hovers right at the thing (fingertip on it).");
             if (ImGui::TreeNode("Which things"))
             {
-                const char* typeNames[] = { "scriptDefined (buttons, doors, terminals, ...)", "codeDefined", "pickup", "consume", "carry", "hack", "repair", "fortify", "examine", "equip", "hoover (GLOO/Recycler charges)" };
-                const int typeBits[] = { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-                for (int i = 0; i < 11; i++)
-                {
-                    bool on = (s.interactHoverTypeMask >> typeBits[i]) & 1;
-                    if (ImGui::Checkbox(typeNames[i], &on))
-                        s.interactHoverTypeMask = on ? (s.interactHoverTypeMask | (1 << typeBits[i])) : (s.interactHoverTypeMask & ~(1 << typeBits[i]));
-                }
+                typeMaskEditor(s.interactHoverTypeMask, "hovertypes");
                 ImGui::TreePop();
             }
             ImGui::TextDisabled("now: %s%s (type %s, %.2f m)", I.hoverActive ? "hovering" : "not hovering", I.hoverType >= 0 && !I.hoverActive ? " - usable thing seen but not taken" : "",
                 InteractionTypeName(I.hoverType), I.hoverDist);
             ImGui::Unindent();
         }
-        ImGui::Text("Resting spot outside screens (hovering)");
-        SliderCm("Right / left##rn", s.interactRestX, 50.0f, "View space, relative to the camera.");
-        SliderCm("Forward##rn", s.interactRestY, 80.0f, nullptr);
-        SliderCm("Up / down##rn", s.interactRestZ, 50.0f, nullptr);
+        ImGui::SliderFloat("Settle time", &s.interactRestBlendTime, 0.05f, 1.5f, "%.2f s");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Seconds for the hand to come up to the spot and to go back.");
+        if (ImGui::TreeNodeEx("Resting spot outside screens", ImGuiTreeNodeFlags_DefaultOpen))
         {
+            SliderCm("Right / left##rn", s.interactRestX, 50.0f, "View space, relative to the camera.");
+            SliderCm("Forward##rn", s.interactRestY, 80.0f, nullptr);
+            SliderCm("Up / down##rn", s.interactRestZ, 50.0f, nullptr);
             WeaponSettings& w = GetCurrentWeapon();
             bool ch = false;
             ImGui::PushID("interact_rest_weapon");
-            ImGui::Text("... plus, for %s:", m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
-            ch |= SliderCm("Right / left##rw", w.interactRest.posX, 30.0f, "This weapon only: where its resting hand waits, relative to the spot above (e.g. clear of a one-handed weapon).");
+            ImGui::TextDisabled("plus, for %s only:", m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
+            ch |= SliderCm("Right / left##rw", w.interactRest.posX, 30.0f, "This weapon only: where its resting hand waits, relative to the spot above (e.g. clear of a one-handed weapon). Saved with the weapon.");
             ch |= SliderCm("Forward##rw", w.interactRest.posY, 30.0f, nullptr);
             ch |= SliderCm("Up / down##rw", w.interactRest.posZ, 30.0f, nullptr);
             if (ImGui::Button("Reset this weapon's spot")) { w.interactRest.Reset(); ch = true; }
             ImGui::PopID();
             if (ch) { w.valid = true; m_weaponsDirty = true; }
+            ImGui::TreePop();
         }
-        ImGui::Text("Resting spot on screens (between clicks)");
-        SliderCm("Right / left##re", s.interactRestExamX, 50.0f, "View space, relative to the examination camera.");
-        SliderCm("Forward##re", s.interactRestExamY, 80.0f, nullptr);
-        SliderCm("Up / down##re", s.interactRestExamZ, 50.0f, nullptr);
-        if (ImGui::Button("Copy the outside spot to the screen spot")) { s.interactRestExamX = s.interactRestX; s.interactRestExamY = s.interactRestY; s.interactRestExamZ = s.interactRestZ; }
-        ImGui::SliderFloat("Settle time", &s.interactRestBlendTime, 0.05f, 1.5f, "%.2f s");
-        CheckboxInt("Blend the arm's IK in with the hand (instead of switching it on)", s.interactIkWeightRamp,
-            "One-handed weapons (wrench, grenades) keep the support arm's IK off and the hand off screen; switching the IK on snaps the hand to its target in one frame. "
-            "Blending the IK weight in with the reach / rest brings the hand in along with it.");
-        if (I.weightJoint >= 0)
-            ImGui::TextDisabled("IK weight now: pushed %.2f, animated %.2f%s", I.ikWeightPushed, I.animIkWeight, I.animIkWeightValid ? "" : " (not captured)");
-        ImGui::Text("Drift (slow figure-eight while resting; fades out during a press)");
-        SliderCm("Drift amount", s.interactRestSwayPos, 5.0f, "Side to side; the vertical part is 60 %% of it, forward 30 %%.");
-        ImGui::SliderFloat("Drift rotation", &s.interactRestSwayRot, 0.0f, 10.0f, "%.1f deg");
-        ImGui::SliderFloat("Drift speed", &s.interactRestSwayFreq, 0.05f, 1.5f, "%.2f Hz");
-        ImGui::TextDisabled("The resting hand's pose is chosen under 'Hand pose' below (\"Resting hand uses pose\").");
+        if (ImGui::TreeNodeEx("Resting spot on screens", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            SliderCm("Right / left##re", s.interactRestExamX, 50.0f, "View space, relative to the zoomed-in camera.");
+            SliderCm("Forward##re", s.interactRestExamY, 80.0f, nullptr);
+            SliderCm("Up / down##re", s.interactRestExamZ, 50.0f, nullptr);
+            if (ImGui::Button("Copy the outside spot here")) { s.interactRestExamX = s.interactRestX; s.interactRestExamY = s.interactRestY; s.interactRestExamZ = s.interactRestZ; }
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Drift (slow figure-eight while resting; fades out during a press)"))
+        {
+            SliderCm("Drift amount", s.interactRestSwayPos, 5.0f, "Side to side; the vertical part is 60 %% of it, forward 30 %%.");
+            ImGui::SliderFloat("Drift rotation", &s.interactRestSwayRot, 0.0f, 10.0f, "%.1f deg");
+            ImGui::SliderFloat("Drift speed", &s.interactRestSwayFreq, 0.05f, 1.5f, "%.2f Hz");
+            ImGui::TreePop();
+        }
     }
-    if (ImGui::CollapsingHeader("Keypads and screens without zooming in", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        ImGui::TextWrapped("The game zooms you into some screen types as soon as you press use on them (its ui_examine_* switches). Off, the press goes "
-                           "straight to the button under the crosshair, like kiosks and keycard readers already work - the hand presses it from where you stand. "
-                           "You can still zoom in yourself with the examine key.");
-        CheckboxInt("Keypads: no automatic zoom-in", s.interactNoZoomKeypad);
-        CheckboxInt("Fabricators: no automatic zoom-in", s.interactNoZoomFabricator);
-        CheckboxInt("Security stations: no automatic zoom-in", s.interactNoZoomSecurity);
-        CheckboxInt("Workstations: no automatic zoom-in", s.interactNoZoomWorkstation);
-    }
-    if (ImGui::CollapsingHeader("Arms visibility (advanced)"))
-    {
-        CheckboxInt("Show the arms for the reach", s.interactShowArms, "Sets the arms' render flag while the reach plays and gives it back afterwards.");
-        CheckboxInt("Keep the right arm out of view meanwhile", s.interactHideRightArm, "Moves every joint of the right arm (and the weapon on it) behind the camera for the duration.");
-        ImGui::TextDisabled("Now: %s%s, arms slot flags 0x%X%s, game context ran last frame: %s%s%s", I.unarmed ? "no weapon" : "weapon out",
-            I.examining ? ", examining a screen" : "", I.slotFlagsNow, I.armsForced ? " (shown by us)" : "",
-            m_diag.ctxUpdatesLastFrame > 0 ? "yes" : "no", I.ownQueueUsed ? " -> own pose modifier" : "",
-            I.renderShiftActive ? " | arms shifted to the examination camera" : "");
-        if (I.renderShiftActive)
-            ImGui::TextDisabled("camera is %.2f m from the head (%.2f %.2f %.2f)", I.renderShift.GetLength(), I.renderShift.x, I.renderShift.y, I.renderShift.z);
-        if (I.examCursorValid)
-            ImGui::TextDisabled("last screen click at world (%.2f %.2f %.2f), cursor (%.2f %.2f)", I.examCursorWorld.x, I.examCursorWorld.y, I.examCursorWorld.z,
-                ArkPlayer::GetInstancePtr() ? ArkPlayer::GetInstancePtr()->m_examinationMode.m_reticlePos.x : 0.0f,
-                ArkPlayer::GetInstancePtr() ? ArkPlayer::GetInstancePtr()->m_examinationMode.m_reticlePos.y : 0.0f);
-    }
+
+    // --- hand pose --------------------------------------------------------------------------------------------------
     if (ImGui::CollapsingHeader("Hand pose (wrist and fingers)", ImGuiTreeNodeFlags_DefaultOpen))
         DrawHandPoseEditor();
-    if (ImGui::CollapsingHeader("Which interactions animate"))
+
+    // --- test --------------------------------------------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Test the animation", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        const char* typeNames[] = { "scriptDefined (buttons, doors, terminals, ...)", "codeDefined", "pickup", "consume", "carry", "hack", "repair", "fortify", "examine", "equip", "hoover (GLOO/Recycler charges)" };
-        const int typeBits[] = { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-        for (int i = 0; i < 11; i++)
-        {
-            bool on = (s.interactTypeMask >> typeBits[i]) & 1;
-            if (ImGui::Checkbox(typeNames[i], &on))
-                s.interactTypeMask = on ? (s.interactTypeMask | (1 << typeBits[i])) : (s.interactTypeMask & ~(1 << typeBits[i]));
-        }
-        CheckboxInt("Remote manipulation (psi) mode", s.interactRemoteMode);
-    }
-    if (ImGui::CollapsingHeader("Rig options"))
-    {
-        CheckboxInt("Force the left arm's IK during the reach", s.interactForceLeftIk,
-            "Pushes the left arm's animation-driven IK weight to 1 while the hand is out, like the game does for the right arm.\n"
-            "Needed when the current stance animates the support hand off the weapon (one-handed holds).");
+        ImGui::TextWrapped("Plays the animation without interacting with anything. 'Ahead' uses the fixed test point below; 'on the crosshair' uses whatever the crosshair ray hits (walls included).");
+        const bool canTest = Active() && (!m_currentWeaponClass.empty() || s.interactUnarmed);
+        if (!canTest)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Needs the mod enabled and a weapon out (or 'With no weapon out').");
+        auto crosshairPoint = [&](Vec3& out) -> bool {
+            if (!gEnv || !gEnv->pSystem || !gEnv->pPhysicalWorld) return false;
+            ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+            IPhysicalEntity* pSkip = (pPlayer && pPlayer->GetEntity()) ? pPlayer->GetEntity()->GetPhysics() : nullptr;
+            const Matrix34 cam = gEnv->pSystem->GetViewCamera().GetMatrix();
+            PaddedRayHit hit;
+            const int n = gEnv->pPhysicalWorld->RayWorldIntersection(cam.GetTranslation(), cam.GetColumn1().GetNormalized() * 3.0f, ent_all,
+                rwi_stop_at_pierceable | rwi_colltype_any(geom_colltype_ray | geom_colltype0 | geom_colltype_player), &hit, 1, pSkip);
+            if (n > 0 && Finite(hit.pt)) { out = hit.pt; return true; }
+            return false;
+        };
+        if (ImGui::Button("Press ahead") && canTest) StartReach(0, nullptr);
         ImGui::SameLine();
-        if (I.weightJoint >= 0)
-            ImGui::TextDisabled("(weight joint: %s)", I.weightJointName.c_str());
-        else
-            ImGui::TextDisabled("(weight joint not found - option does nothing)");
-        CheckboxInt("Push the hand rotation too", s.interactRotate,
-            "Limb IK positions the hand; whether the additive rotation on the IK target reaches the hand depends on the rig. Try the sliders and see.");
+        if (ImGui::Button("Grab ahead") && canTest) StartReach(1, nullptr);
+        ImGui::SameLine();
+        if (ImGui::Button("Press on the crosshair") && canTest) { Vec3 p; if (crosshairPoint(p)) StartReach(0, &p); }
+        ImGui::SameLine();
+        if (ImGui::Button("Grab on the crosshair") && canTest) { Vec3 p; if (crosshairPoint(p)) StartReach(1, &p); }
+        SliderCm("Test point: right / left", s.interactTestX, 50.0f, "Fixed test point, view space.");
+        SliderCm("Test point: forward", s.interactTestY, 100.0f, nullptr);
+        SliderCm("Test point: up / down", s.interactTestZ, 50.0f, nullptr);
+        const char* phaseNames[] = { "idle", "reach", "hold", "return" };
+        ImGui::Text("%s  t=%.2f s  progress %.2f  style %s", phaseNames[(int)I.phase], I.time, I.curve, I.style == 1 ? "grab" : "press");
+        ImGui::ProgressBar(I.curve, ImVec2(-1, 0), I.phase == InteractState::Idle ? "idle" : "reaching");
+        if (I.pending)
+            ImGui::Text("Deferred %s interaction fires in %.2f s", InteractionModeName(I.mode), max(I.fireIn, 0.0f));
+        ImGui::Text("Last interaction: %s / %s on %s", InteractionTypeName(I.lastType), InteractionModeName(I.lastMode), I.lastEntity.empty() ? "-" : I.lastEntity.c_str());
+        if (!I.skipReason.empty())
+            ImGui::TextDisabled("Last one not animated: %s", I.skipReason.c_str());
+    }
+
+    // --- advanced -----------------------------------------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Advanced (rig, arms, diagnostics)"))
+    {
+        ImGui::TextWrapped("Nothing here needs touching for normal use. The defaults are what the rig was found to want.");
+        CheckboxInt("Debug overlay + click log", s.interactDebugMarker,
+            "Drawn every frame while on: red = reach target, green = where the wrist is asked to be, cyan = where the wrist joint really is, magenta = shoulder;\n"
+            "a line of numbers at the bottom (residual, correction, chain resets). Clicks on screens are logged to Game.log.");
+        ImGui::Text("Rig");
+        CheckboxInt("Drive the left arm's IK during the reach", s.interactForceLeftIk,
+            "Pushes the left arm's animation-driven IK weight while the hand is out, like the game does for the right arm. Off, one-handed stances ignore the target.");
+        ImGui::SameLine();
+        ImGui::TextDisabled(I.weightJoint >= 0 ? "(weight joint: %s)" : "(weight joint not found - option does nothing)", I.weightJointName.c_str());
+        if (s.interactForceLeftIk)
+        {
+            ImGui::Indent();
+            CheckboxInt("Blend the IK weight in with the hand instead of switching it on", s.interactIkWeightRamp,
+                "One-handed weapons (wrench, grenades) animate the support arm's IK weight at 0 with the hand off screen; switching it to 1 snaps the hand to its target in one frame.");
+            if (I.weightJoint >= 0)
+                ImGui::TextDisabled("IK weight now: pushed %.2f, animated %.2f%s", I.ikWeightPushed, I.animIkWeight, I.animIkWeightValid ? "" : " (not captured)");
+            ImGui::Unindent();
+        }
+        CheckboxInt("Push the style's hand rotation too", s.interactRotate, "The press / grab styles' pitch / yaw / roll, additive on the IK target (not when a pose owns the wrist).");
+        const char* wristModes[] = { "Through the IK target joint", "Through the hand joint (relative to the forearm)", "Both" };
+        ImGui::Combo("A pose's wrist orientation applied", &s.interactWristMode, wristModes, 3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The arm IK runs after our overrides; 'both' is what was found to work. Change only if the wrist sliders of a pose do nothing.");
+        ImGui::SliderFloat("Hand position correction gain", &s.interactCorrGain, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Closed loop on the hand joint: how much of last frame's hand error is fed back per frame (0 = off).");
+        CheckboxInt("Show the arms for the reach where the game hides them", s.interactShowArms, "Sets the arms' render flag while the reach / resting hand is active (no weapon, screens) and gives it back afterwards.");
         if (ImGui::Button("Log the arm / hand joint names"))
             LogHandJoints();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Writes the first-person arms' hand / arm / IK joint names to the game log (for tuning the rig options).");
-    }
-
-    ImGui::Separator();
-    ImGui::Text("Test");
-    ImGui::TextWrapped("Plays the animation without interacting with anything. 'Ahead' uses the fixed test point below; 'on the crosshair' uses whatever the crosshair ray hits (walls included).");
-    const bool canTest = Active() && (!m_currentWeaponClass.empty() || s.interactUnarmed);
-    if (!canTest)
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Needs the mod enabled and a weapon out (or 'Reach with no weapon out').");
-    auto crosshairPoint = [&](Vec3& out) -> bool {
-        if (!gEnv || !gEnv->pSystem || !gEnv->pPhysicalWorld) return false;
-        ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
-        IPhysicalEntity* pSkip = (pPlayer && pPlayer->GetEntity()) ? pPlayer->GetEntity()->GetPhysics() : nullptr;
-        const Matrix34 cam = gEnv->pSystem->GetViewCamera().GetMatrix();
-        PaddedRayHit hit;
-        const int n = gEnv->pPhysicalWorld->RayWorldIntersection(cam.GetTranslation(), cam.GetColumn1().GetNormalized() * 3.0f, ent_all,
-            rwi_stop_at_pierceable | rwi_colltype_any(geom_colltype_ray | geom_colltype0 | geom_colltype_player), &hit, 1, pSkip);
-        if (n > 0 && Finite(hit.pt)) { out = hit.pt; return true; }
-        return false;
-    };
-    if (ImGui::Button("Press ahead") && canTest) StartReach(0, nullptr);
-    ImGui::SameLine();
-    if (ImGui::Button("Grab ahead") && canTest) StartReach(1, nullptr);
-    ImGui::SameLine();
-    if (ImGui::Button("Press on the crosshair") && canTest) { Vec3 p; if (crosshairPoint(p)) StartReach(0, &p); }
-    ImGui::SameLine();
-    if (ImGui::Button("Grab on the crosshair") && canTest) { Vec3 p; if (crosshairPoint(p)) StartReach(1, &p); }
-    SliderCm("Test point: right / left", s.interactTestX, 50.0f, "Fixed test point, view space.");
-    SliderCm("Test point: forward", s.interactTestY, 100.0f, nullptr);
-    SliderCm("Test point: up / down", s.interactTestZ, 50.0f, nullptr);
-
-    ImGui::Separator();
-    ImGui::Text("State");
-    const char* phaseNames[] = { "idle", "reach", "hold", "return" };
-    ImGui::Text("%s  t=%.2f s  progress %.2f  arc %.2f  style %s", phaseNames[(int)I.phase], I.time, I.curve, I.arc, I.style == 1 ? "grab" : "press");
-    ImGui::ProgressBar(I.curve, ImVec2(-1, 0), I.phase == InteractState::Idle ? "idle" : "reaching");
-    if (I.pending)
-        ImGui::Text("Deferred %s interaction fires in %.2f s", InteractionModeName(I.mode), max(I.fireIn, 0.0f));
-    ImGui::Text("Last interaction: %s / %s on %s", InteractionTypeName(I.lastType), InteractionModeName(I.lastMode), I.lastEntity.empty() ? "-" : I.lastEntity.c_str());
-    if (!I.skipReason.empty())
-        ImGui::TextDisabled("Last one not animated: %s", I.skipReason.c_str());
-    ImGui::TextDisabled("started %d, deferred %d, fired %d, dropped %d, skipped %d", I.started, I.deferred, I.fired, I.dropped, I.skipped);
-    if (s.showAdvanced)
-    {
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Writes the first-person arms' hand / arm / IK joint names to the game log.");
+        ImGui::Text("State");
+        ImGui::TextDisabled("%s%s%s, arms slot flags 0x%X%s, game context ran last frame: %s", I.unarmed ? "no weapon" : "weapon out",
+            I.examining ? ", on a screen" : "", I.bodyShiftActive ? " (body brought to the camera)" : "", I.slotFlagsNow, I.armsForced ? " (arms shown by us)" : "",
+            m_diag.ctxUpdatesLastFrame > 0 ? "yes" : "no");
+        if (I.bodyShiftActive)
+            ImGui::TextDisabled("camera is %.2f m from the head (%.2f %.2f %.2f)", I.bodyShift.GetLength(), I.bodyShift.x, I.bodyShift.y, I.bodyShift.z);
+        if (I.examCursorValid)
+            ImGui::TextDisabled("last screen click at world (%.2f %.2f %.2f)", I.examCursorWorld.x, I.examCursorWorld.y, I.examCursorWorld.z);
+        ImGui::TextDisabled("started %d, deferred %d, fired %d, dropped %d, skipped %d", I.started, I.deferred, I.fired, I.dropped, I.skipped);
         ImGui::TextDisabled("target view (%.2f %.2f %.2f)%s  hand (%.2f %.2f %.2f)  desired (%.2f %.2f %.2f)",
             I.targetView.x, I.targetView.y, I.targetView.z, I.clamped ? " [clamped]" : "", I.handView.x, I.handView.y, I.handView.z,
             I.desiredView.x, I.desiredView.y, I.desiredView.z);
-        ImGui::TextDisabled("left IK joint %d, weight joint %d, pushes %d (not applied %d), add |t| %.3f m, hand correction (%.3f %.3f %.3f) err %.3f m",
-            m_lock.leftIkJoint, I.weightJoint, I.pushes, I.pushesNotApplied, I.lastAdd.t.GetLength(), I.corr.x, I.corr.y, I.corr.z, I.corrError);
+        ImGui::TextDisabled("left IK joint %d, weight joint %d, pushes %d, chain resets %d, add |t| %.3f m, hand correction (%.3f %.3f %.3f) err %.3f m",
+            m_lock.leftIkJoint, I.weightJoint, I.pushes, I.chainResets, I.lastAdd.t.GetLength(), I.corr.x, I.corr.y, I.corr.z, I.corrError);
     }
 }
 

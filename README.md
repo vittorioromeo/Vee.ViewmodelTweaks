@@ -22,7 +22,7 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   that blends in as the weapon is pressed against the wall (the shotgun goes muzzle-up), no aiming while the
   muzzle would be in a wall, while reloading or while switching weapons; the offsets ease out during reloads so the support
   hand meets the shells.
-* **Interaction animation** *(new, experimental)*. The support hand reaches out when you interact: a poke for
+* **Interaction animation**. The support hand reaches out when you interact: a poke for
   buttons, switches, terminals and hacking, a grab (with a sweep back towards you) for pickups, loot,
   consumables and things you carry. Purely procedural - a tween on the hand's IK target on top of the live
   animation - so it works with any two-handed weapon and every timing, offset and path is tunable in the
@@ -107,7 +107,10 @@ experimental features in the window.
   ironsights depends on the weapon FOV; adjust *Ironsights FOV* to taste.
 * Grenades, the wrench and the Nullwave transmitter have aiming disabled by default; enable per weapon if
   you want it.
-* The interaction animation needs a weapon out (the arms are only driven procedurally with a weapon).
+* On keypads you are nose-to-nose with, the pointing finger fills a good part of the view for the moment of
+  the press; below a configurable distance the hand stays put instead.
+* Hovering the resting hand with a two-handed weapon takes the support hand off the grip; switch it off per
+  case (weapon out / no weapon / while aiming) if you do not like the look.
 
 ## Building from source
 
