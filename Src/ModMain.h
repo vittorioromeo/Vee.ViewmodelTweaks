@@ -87,6 +87,10 @@ struct ReachStyle
     float along = 0.0f;         //!< moves the target along the camera -> target line (m; + = beyond the object, into it)
     float windupTime = 0.0f;    //!< a keyframe before the reach: the hand is pulled to the windup offset first (0 = none)
     float windX = 0.0f, windY = 0.0f, windZ = 0.0f; //!< where it is pulled to (m, view space, relative to where it starts from)
+    float windShX = 0.0f, windShY = 0.0f, windShZ = 0.0f;   //!< windup: the shoulder (upper-arm joint) moved (m, view space)
+    float windElX = 0.0f, windElY = 0.0f, windElZ = 0.0f;   //!< windup: the elbow (forearm joint) moved (m, view space) - the IK may re-solve it
+    float windFaPitch = 0.0f, windFaYaw = 0.0f, windFaRoll = 0.0f; //!< windup: forearm rotation (deg, about its own axes)
+    float windKeep = 0.0f;      //!< how much of the shoulder / elbow / forearm windup is kept through the strike (0..1)
 
     float Duration() const { return windupTime + reachTime + holdTime + returnTime; }
     float ApexTime() const { return max(windupTime, 0.0f) + max(reachTime, 0.0f); } //!< from the start to the hand at the target
@@ -98,6 +102,7 @@ struct ReachStyle
         r.offX = r.offY = r.offZ = 0.0f; r.arcX = 0.0f; r.arcZ = -0.02f; r.retArcX = 0.0f; r.retArcZ = -0.04f;
         r.pitch = r.yaw = r.roll = 0.0f;
         r.windupTime = 0.14f; r.windX = 0.06f; r.windY = -0.14f; r.windZ = 0.03f; // the arm loads up: back, a little out and up
+        r.windShX = 0.02f; r.windShY = -0.04f; r.windShZ = 0.0f;                 // the shoulder goes back with it
         return r;
     }
     //! The grab: a little slower, overshoots, sweeps in from the side and drops on the way back.
@@ -281,6 +286,11 @@ struct ViewmodelSettings
     float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
     int   meleeSound = 1;           //!< play a swing sound (vm_melee_sound_name) when the punch starts
     int   meleeWhileAiming = 0;     //!< allow while aiming down sights
+    int   meleeImpulseFlip = 1;     //!< flip the physics impulse the wrench hit applies (objects were pulled in instead of pushed)
+    float meleeImpulseScale = 1.0f; //!< ... and scale it
+    PoseOffset meleeLower = MeleeLowerDefault(); //!< the equipped weapon is moved / tilted by this while the punch plays (hip pose, view space m / deg)
+    static PoseOffset MeleeLowerDefault() { PoseOffset p; p.posX = 0.03f; p.posY = -0.04f; p.posZ = -0.06f; p.pitch = -12.0f; p.yaw = 6.0f; p.roll = 8.0f; return p; }
+    float meleeLowerTime = 0.12f;   //!< seconds to blend the lowering in (windup) and out (return)
     float interactCarryHoldTime = 0.15f; //!< carrying: the key has to be held this long before the grab starts (a tap does nothing)
     int   interactHiddenStart = 1;  //!< when the support hand is not on the weapon (one-handed weapons, no weapon), the hand comes up from a fixed spot below the view instead of from wherever the animation has it
     float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
@@ -507,6 +517,8 @@ struct InteractState
     float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
     bool meleeSoundWarned = false;
+    bool meleeHitInProgress = false; //!< inside our OnHit call (the impulse hook looks at this)
+    float meleeLowerBlend = 0.0f;   //!< 0..1: the equipped weapon's lowering
     bool carryPending = false;      //!< waiting for the hold time before the grab starts
     float carryStartIn = 0.0f;      //!< seconds until it does
     unsigned carryEntityId = 0;     //!< what is being picked up (looked up again when the grab starts)
@@ -955,6 +967,7 @@ public:
     //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
     void StartReach(int style, const Vec3* pWorld);
     const InteractState& GetInteract() const { return m_interact; }
+    bool MeleeHitInProgress() const { return m_interact.meleeHitInProgress; }
 private:
     InteractState m_interact;
     bool m_interactReentry = false;     //!< our own deferred Interact call is running: let it through

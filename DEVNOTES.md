@@ -463,6 +463,18 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.1: the one-handed flag was not reaching `SupportHandOffWeapon()`: the user's weapons file has an entry
+  for every weapon, and those entries read the new attribute as "auto", so the built-in answer never applied.
+  A missing attribute now takes the built-in value on load, and "auto" consults the built-in table before the
+  heuristic. Windup gained shoulder / elbow / forearm offsets (additive on the upper-arm and forearm joints,
+  forearm rotation as for the per-weapon twist; `windup_keep` carries them through the strike). The quick
+  melee's physics impulse pulled objects in: `ArkWeaponUtils::DoWeaponImpulse` (`0x1680A10`) is hooked while
+  our OnHit call is on the stack (`meleeHitInProgress`) and the direction flipped (`vm_melee_impulse_flip`) /
+  scaled, with the raw direction logged against the view forward when the overlay is on - the wrench passes
+  the player *entity's* forward rotated by the swipe angle and DoWeaponImpulse negates it before
+  DoHitImpulse; why the sign comes out wrong for a straight punch and right for the wrench's swipes is not
+  understood, the log line is there to find out. The equipped weapon is lowered during the punch through
+  the hip offset (`vm_melee_lower_*`, blend `meleeLowerBlend` in from the windup and out from the return).
 * 3.11.0: quick melee (above). One-handed weapons did not take the hidden start because their left IK weight
   is animated at 1 (only the target is off screen): `SupportHandOffWeapon()` now uses a per-weapon flag
   (`interact_hand_off`, built in for the wrench / grenades / Nullwave = off, two-handed = on, else auto from the

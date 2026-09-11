@@ -58,6 +58,7 @@
 #include <Prey/GameDll/ark/weapons/arkweaponshotgun.h>
 #include <Prey/GameDll/ark/weapons/ArkWeaponWrench.h>
 #include <Prey/GameDll/ark/weapons/ArkWrenchComponent.h>
+#include <Prey/GameDll/ark/weapons/ArkWeaponUtils.h>
 #include <Prey/Ark/ArkAudioUtil.h>
 #include <Prey/GameDll/GameCVars.h>
 #include <Prey/GameDll/weaponlookoffset.h>
@@ -600,6 +601,9 @@ void ModMain::ApplyOffset(QuatT& offset) const
         total.AddScaled(m_feel.sprintOut, 1.0f - ab);   // already faded to zero when the feature is off
     if (SanePose(m_feel.dragHipOut))
         total.AddScaled(m_feel.dragHipOut, 1.0f - ab);
+    // Quick melee: the weapon drops out of the way while the punch plays.
+    if (m_interact.meleeLowerBlend > 0.0f && SanePose(s.meleeLower))
+        total.AddScaled(s.meleeLower, SmoothStep01(m_interact.meleeLowerBlend));
 
     // Reloads: the support hand is animated in place (shells, magazines) against where the weapon is in
     // the stock pose, so everything that moves the weapon fades out for the duration and comes back after.
@@ -1631,16 +1635,46 @@ void ModMain::UpdateCarry(float dt)
         I.carryAnimating = false;
 }
 
+// The wrench hit's physics impulse (ArkWeaponUtils::DoWeaponImpulse: direction from the swipe, force from the
+// weapon's stat, per-entity scale). Only touched while our own OnHit call is on the stack: with the punch, objects
+// were pulled toward the player instead of away, so the direction can be flipped and the force scaled.
+static auto s_hookWeaponImpulse = ArkWeaponUtils::FDoWeaponImpulseOv0.MakeHook();
+static void ArkWeaponUtils_DoWeaponImpulse_Hook(IEntity* const _pHitEntity, IPhysicalEntity* const _pHitPhysics, Vec3 _hitDirection, const int _partid, CArkWeapon const* const _pWeapon, const float _impulseScale, const float _minMassScale, const float _maxMassScale)
+{
+    Vec3 dir = _hitDirection;
+    float scale = _impulseScale;
+    if (gMod && gMod->MeleeHitInProgress())
+    {
+        const ViewmodelSettings& s = gMod->GetSettings();
+        if (s.interactDebugMarker && gEnv && gEnv->pSystem)
+        {
+            const Vec3 fwd = gEnv->pSystem->GetViewCamera().GetMatrix().GetColumn1();
+            CryLog("ViewmodelTweaks: quick melee impulse - direction ({:.2f} {:.2f} {:.2f}) vs view forward ({:.2f} {:.2f} {:.2f}), scale {:.2f}, mass scale {:.2f}..{:.2f}, entity {}",
+                dir.x, dir.y, dir.z, fwd.x, fwd.y, fwd.z, scale, _minMassScale, _maxMassScale, (_pHitEntity && _pHitEntity->GetName()) ? _pHitEntity->GetName() : "?");
+        }
+        if (s.meleeImpulseFlip)
+            dir = -dir;
+        scale *= clamp_tpl(s.meleeImpulseScale, 0.0f, 10.0f);
+    }
+    s_hookWeaponImpulse.InvokeOrig(_pHitEntity, _pHitPhysics, dir, _partid, _pWeapon, scale, _minMassScale, _maxMassScale);
+}
+
 bool ModMain::SupportHandOffWeapon() const
 {
     const InteractState& I = m_interact;
     if (I.unarmed)
         return true;
     const WeaponSettings* pW = InteractWeaponEntry();
-    const int mode = pW ? pW->interactHandOff : 2;
+    int mode = pW ? pW->interactHandOff : 2;
+    if (mode == 2)
+    {
+        // auto: what is known about the weapon first (the built-in table says which are one-handed) ...
+        if (const WeaponSettings* pB = WeaponSettings::BuiltIn(m_currentWeaponClass.c_str()))
+            mode = pB->interactHandOff;
+    }
     if (mode == 0) return false;
     if (mode == 1) return true;
-    // auto: the left IK weight is animated at 0, or the animated hand is nowhere near the view
+    // ... else: the left IK weight is animated at 0, or the animated hand is nowhere near the view
     if (I.animIkWeightValid && I.animIkWeight < 0.5f)
         return true;
     const Vec3& h = I.handView;
@@ -1712,7 +1746,9 @@ void ModMain::DoMeleeHit()
     }
     ArkWeaponWrench* pWrench = static_cast<ArkWeaponWrench*>(pW);
     const float scale = clamp_tpl(m_settings.meleeDamage, 0.0f, 10.0f);
+    I.meleeHitInProgress = true;
     const ArkWrenchComponent::hitResult r = pWrench->m_wrenchComponent.OnHit(0.0f, *pW, scale, false);
+    I.meleeHitInProgress = false;
     if (r != ArkWrenchComponent::hitResult::none)
         I.meleeHits++;
     if (m_settings.interactDebugMarker)
@@ -2060,6 +2096,11 @@ void ModMain::UpdateInteract(float dt)
     {
         I.meleeKickTime += dt;
         if (I.meleeKickTime > max(s.meleeCamKickTime, 0.01f)) I.meleeKickTime = -1.0f;
+    }
+    // The equipped weapon's lowering: in from the windup, out from the return.
+    {
+        const bool lower = I.style == 2 && (I.phase == InteractState::Windup || I.phase == InteractState::Reach || I.phase == InteractState::Hold) && I.holdMode == 0;
+        MoveTowards(I.meleeLowerBlend, lower ? 1.0f : 0.0f, max(s.meleeLowerTime, 0.01f), dt);
     }
 
     I.unarmed = m_currentWeaponClass.empty();
@@ -2495,6 +2536,37 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         return;
     }
     VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, joint, OP_ADDITIVE, &add.t);
+    // The windup's shoulder / elbow / forearm: additive on the arm joints (the limb IK re-solves the arm from the
+    // moved shoulder; whether it keeps a moved elbow is the rig's call), scaled by the windup and, optionally,
+    // kept through the strike.
+    {
+        const float wk = clamp_tpl(wind + curve * clamp_tpl(st.windKeep, 0.0f, 1.0f), 0.0f, 1.0f);
+        if (wk > 0.0f)
+        {
+            if (R.leftUpperArm >= 0 && (st.windShX != 0.0f || st.windShY != 0.0f || st.windShZ != 0.0f))
+            {
+                const Vec3 off = camReach.q * (Vec3(st.windShX, st.windShY, st.windShZ) * wk);
+                if (Finite(off)) VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, R.leftUpperArm, OP_ADDITIVE, &off);
+            }
+            const int forearm = R.leftSubtreeParent.empty() ? -1 : R.leftSubtreeParent[0];
+            if (forearm >= 0 && (st.windElX != 0.0f || st.windElY != 0.0f || st.windElZ != 0.0f))
+            {
+                const Vec3 off = camReach.q * (Vec3(st.windElX, st.windElY, st.windElZ) * wk);
+                if (Finite(off)) VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, forearm, OP_ADDITIVE, &off);
+            }
+            if (forearm >= 0 && (st.windFaPitch != 0.0f || st.windFaYaw != 0.0f || st.windFaRoll != 0.0f))
+            {
+                const QuatT* pFa = VCall<const QuatT*>(pSkelPose, VT_ISkeletonPose_GetAbsJointByID, forearm);
+                if (pFa && SaneQuatT(*pFa))
+                {
+                    const Quat local = SafeNormalized(Quat::CreateRotationXYZ(Ang3(DEG2RAD(st.windFaPitch), DEG2RAD(st.windFaRoll), DEG2RAD(st.windFaYaw))));
+                    const Quat model = SafeNormalized(pFa->q * local * (!pFa->q));
+                    const Quat q = SafeNormalized(Quat::CreateNlerp(Quat(IDENTITY), model, wk));
+                    if (SaneQuat(q)) VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, forearm, OP_ADDITIVE, &q);
+                }
+            }
+        }
+    }
     if (!poseOwnsIkRot)
         VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, joint, OP_ADDITIVE, &add.q);
     if (s.interactForceLeftIk && I.weightJoint >= 0)
@@ -3580,11 +3652,15 @@ void ModMain::SanitizeSettings()
         fixF(r.retArcX, d.retArcX); fixF(r.retArcZ, d.retArcZ); fixF(r.pitch, d.pitch); fixF(r.yaw, d.yaw); fixF(r.roll, d.roll);
         fixF(r.envelopeScale, d.envelopeScale); fixF(r.along, d.along);
         fixF(r.windupTime, d.windupTime); fixF(r.windX, d.windX); fixF(r.windY, d.windY); fixF(r.windZ, d.windZ);
+        fixF(r.windShX, d.windShX); fixF(r.windShY, d.windShY); fixF(r.windShZ, d.windShZ); fixF(r.windElX, d.windElX); fixF(r.windElY, d.windElY); fixF(r.windElZ, d.windElZ);
+        fixF(r.windFaPitch, d.windFaPitch); fixF(r.windFaYaw, d.windFaYaw); fixF(r.windFaRoll, d.windFaRoll); fixF(r.windKeep, d.windKeep);
     };
     fixStyle(s.press, def.press);
     fixStyle(s.grab, def.grab);
     fixStyle(s.pressExam, def.pressExam);
     fixStyle(s.punch, def.punch);
+    if (s.meleeLower.Sanitize(def.meleeLower)) fixed++;
+    fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
     fixF(s.interactExamLeaveTime, def.interactExamLeaveTime); fixF(s.interactRestSwayPos, def.interactRestSwayPos); fixF(s.interactRestSwayRot, def.interactRestSwayRot);
@@ -4388,10 +4464,10 @@ void ModMain::LoadWeapons()
         ReadPose(n, "interact_rest_", w.interactRest, PoseOffset());
         ReadPose(n, "interact_forearm_", w.interactForearm, PoseOffset());
         ReadPose(n, "interact_start_", w.interactStart, PoseOffset());
-        w.interactHandOff = clamp_tpl(n.attribute("interact_hand_off").as_int(2), 0, 2);
         {
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
+            w.interactHandOff = clamp_tpl(n.attribute("interact_hand_off").as_int(pB ? pB->interactHandOff : 2), 0, 2);
             ReadPose(n, "wall_", w.wall, pB ? pB->wall : PoseOffset());
             w.wallPoseAmount = n.attribute("wall_pose_amount").as_float(pB ? pB->wallPoseAmount : 1.0f);
         }
@@ -4469,6 +4545,7 @@ void ModMain::InitHooks()
     s_hookInteract.SetHookFunc(&ArkPlayerInteraction_Interact_Hook);
     s_hookStartCarrying.SetHookFunc(&ArkPlayerCarry_StartCarrying_Hook);
     s_hookPerformInteraction.SetHookFunc(&ArkPlayerInteraction_PerformInteraction_Hook);
+    s_hookWeaponImpulse.SetHookFunc(&ArkWeaponUtils_DoWeaponImpulse_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -4523,6 +4600,16 @@ static void RegisterReachStyleCVars(ReachStyle& r, const char* prefix, const cha
     REGISTER_CVAR2(name("windup_x"), &r.windX, r.windX, VF_DUMPTOCHAIR, help("windup: hand pulled right (m)"));
     REGISTER_CVAR2(name("windup_y"), &r.windY, r.windY, VF_DUMPTOCHAIR, help("windup: hand pulled forward (m, negative = back)"));
     REGISTER_CVAR2(name("windup_z"), &r.windZ, r.windZ, VF_DUMPTOCHAIR, help("windup: hand pulled up (m)"));
+    REGISTER_CVAR2(name("windup_shoulder_x"), &r.windShX, r.windShX, VF_DUMPTOCHAIR, help("windup: shoulder moved right (m)"));
+    REGISTER_CVAR2(name("windup_shoulder_y"), &r.windShY, r.windShY, VF_DUMPTOCHAIR, help("windup: shoulder moved forward (m)"));
+    REGISTER_CVAR2(name("windup_shoulder_z"), &r.windShZ, r.windShZ, VF_DUMPTOCHAIR, help("windup: shoulder moved up (m)"));
+    REGISTER_CVAR2(name("windup_elbow_x"), &r.windElX, r.windElX, VF_DUMPTOCHAIR, help("windup: elbow moved right (m)"));
+    REGISTER_CVAR2(name("windup_elbow_y"), &r.windElY, r.windElY, VF_DUMPTOCHAIR, help("windup: elbow moved forward (m)"));
+    REGISTER_CVAR2(name("windup_elbow_z"), &r.windElZ, r.windElZ, VF_DUMPTOCHAIR, help("windup: elbow moved up (m)"));
+    REGISTER_CVAR2(name("windup_forearm_pitch"), &r.windFaPitch, r.windFaPitch, VF_DUMPTOCHAIR, help("windup: forearm pitch (deg)"));
+    REGISTER_CVAR2(name("windup_forearm_yaw"), &r.windFaYaw, r.windFaYaw, VF_DUMPTOCHAIR, help("windup: forearm yaw (deg)"));
+    REGISTER_CVAR2(name("windup_forearm_roll"), &r.windFaRoll, r.windFaRoll, VF_DUMPTOCHAIR, help("windup: forearm roll (deg)"));
+    REGISTER_CVAR2(name("windup_keep"), &r.windKeep, r.windKeep, VF_DUMPTOCHAIR, help("how much of the shoulder / elbow / forearm windup stays through the strike (0..1)"));
 }
 
 void ModMain::RegisterCVars()
@@ -4670,6 +4757,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_melee_cam_kick_yaw", &s.meleeCamKickYaw, s.meleeCamKickYaw, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera yaw kick (deg)");
     REGISTER_CVAR2("vm_melee_cam_kick_time", &s.meleeCamKickTime, s.meleeCamKickTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the camera kick takes");
     REGISTER_CVAR2("vm_melee_sound", &s.meleeSound, s.meleeSound, VF_DUMPTOCHAIR, "Viewmodel Tweaks: play a swing sound with the punch (0/1)");
+    REGISTER_CVAR2("vm_melee_impulse_flip", &s.meleeImpulseFlip, s.meleeImpulseFlip, VF_DUMPTOCHAIR, "Viewmodel Tweaks: flip the physics impulse of the quick melee hit (0/1)");
+    REGISTER_CVAR2("vm_melee_impulse_scale", &s.meleeImpulseScale, s.meleeImpulseScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: scale of the physics impulse of the quick melee hit");
+    REGISTER_CVAR2("vm_melee_lower_time", &s.meleeLowerTime, s.meleeLowerTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds to lower the equipped weapon for the punch and to bring it back");
+    RegisterPoseCVars(s.meleeLower, "melee_lower_", "quick melee - equipped weapon lowered while the punch plays");
     REGISTER_CVAR2("vm_melee_while_aiming", &s.meleeWhileAiming, s.meleeWhileAiming, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee while aiming down sights (0/1)");
     if (gEnv && gEnv->pConsole)
         gEnv->pConsole->RegisterString("vm_melee_sound_name", "Play_Player_Throw", VF_DUMPTOCHAIR, "Viewmodel Tweaks: audio trigger played when the punch starts (a wwise event name; Play_Player_Throw is the throw whoosh)");
@@ -5156,6 +5247,21 @@ static void DrawReachStyle(ReachStyle& r, const char* id)
         SliderCm("Pulled right / left##wind", r.windX, 40.0f, "Relative to where the hand starts from.");
         SliderCm("Pulled forward / back##wind", r.windY, 40.0f, "Negative = back towards the body (loading the arm).");
         SliderCm("Pulled up / down##wind", r.windZ, 40.0f, nullptr);
+        if (ImGui::TreeNode("Shoulder, elbow and forearm during the windup"))
+        {
+            SliderCm("Shoulder right / left##wsh", r.windShX, 30.0f, "The upper-arm joint moved (view space); the arm is re-solved from there.");
+            SliderCm("Shoulder forward / back##wsh", r.windShY, 30.0f, nullptr);
+            SliderCm("Shoulder up / down##wsh", r.windShZ, 30.0f, nullptr);
+            SliderCm("Elbow right / left##wel", r.windElX, 30.0f, "The forearm joint moved; the arm IK may re-solve it, try and see.");
+            SliderCm("Elbow forward / back##wel", r.windElY, 30.0f, nullptr);
+            SliderCm("Elbow up / down##wel", r.windElZ, 30.0f, nullptr);
+            SliderDeg("Forearm pitch##wfa", r.windFaPitch, 90.0f, "Forearm rotation about its own axes (the hand keeps its orientation).");
+            SliderDeg("Forearm yaw##wfa", r.windFaYaw, 90.0f, nullptr);
+            SliderDeg("Forearm roll##wfa", r.windFaRoll, 90.0f, nullptr);
+            ImGui::SliderFloat("Kept through the strike", &r.windKeep, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = these unwind with the windup; 1 = they stay for the whole strike.");
+            ImGui::TreePop();
+        }
     }
     ImGui::Spacing();
     ImGui::Text("Path (sine bulge, peaks half-way)");
@@ -5555,6 +5661,21 @@ void ModMain::DrawInteractTab()
         ImGui::SliderFloat("Cooldown", &s.meleeCooldown, 0.0f, 3.0f, "%.2f s");
         CheckboxInt("Also while aiming down sights", s.meleeWhileAiming);
         CheckboxInt("Swing sound", s.meleeSound, "Plays the audio trigger named by vm_melee_sound_name when the punch starts (default Play_Player_Throw, the throw whoosh; set another wwise event name in the console).");
+        CheckboxInt("Flip the hit's physics impulse", s.meleeImpulseFlip, "The wrench hit's impulse pulled objects toward the player when called from the punch; on, its direction is reversed. Log line with the raw direction when the debug overlay is on.");
+        ImGui::SliderFloat("Impulse scale", &s.meleeImpulseScale, 0.0f, 3.0f, "x %.2f");
+        if (ImGui::TreeNodeEx("Equipped weapon lowered while punching", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::TextWrapped("Added to the hip pose from the windup, taken back from the return.");
+            SliderCm("Right / left##ml", s.meleeLower.posX, 30.0f, nullptr);
+            SliderCm("Forward / back##ml", s.meleeLower.posY, 30.0f, nullptr);
+            SliderCm("Up / down##ml", s.meleeLower.posZ, 30.0f, "Negative lowers the weapon.");
+            SliderDeg("Pitch##ml", s.meleeLower.pitch, 60.0f, "Negative tips the muzzle down.");
+            SliderDeg("Yaw##ml", s.meleeLower.yaw, 60.0f, nullptr);
+            SliderDeg("Roll##ml", s.meleeLower.roll, 60.0f, nullptr);
+            ImGui::SliderFloat("Blend time##ml", &s.meleeLowerTime, 0.02f, 0.5f, "%.2f s");
+            ImGui::TextDisabled("now %.2f", I.meleeLowerBlend);
+            ImGui::TreePop();
+        }
         ImGui::Text("Camera kick");
         ImGui::SliderFloat("Pitch##mk", &s.meleeCamKick, -5.0f, 5.0f, "%.1f deg");
         ImGui::SliderFloat("Yaw##mk", &s.meleeCamKickYaw, -5.0f, 5.0f, "%.1f deg");
