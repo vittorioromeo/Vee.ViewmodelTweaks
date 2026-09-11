@@ -507,6 +507,9 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.6: arms forced on whenever the game clears the flag while we want them, not only on the first time -
+  hovering hand out, screen, exit, screen again left the hand invisible (the second entry cleared the flag
+  while `armsForced` was still true from the first).
 * 3.11.5: defaults = the values tuned in play through 3.11.4 (grab and punch styles incl. windup, envelope,
   rest / start spots, start arm pose, melee cooldown / kick / lowering, punch pose, door rule, wrench shoulder).
   The way to refresh them: dump `vm_interact_*` / `vm_melee_*` from `Chairloader_CVars.xml`, the `interact_*`

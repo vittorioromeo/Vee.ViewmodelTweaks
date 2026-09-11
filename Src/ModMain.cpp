@@ -2992,8 +2992,11 @@ void ModMain::UpdateArmsVisibility()
     const bool reachActive = (I.phase != InteractState::Idle && (I.curve > 0.001f || I.wind > 0.001f)) || I.restBlend > 0.001f;
     const bool want = s.interactShowArms && hiddenState && reachActive && Active() && s.interactEnabled;
     constexpr unsigned ENTITY_SLOT_RENDER_FLAG = 1u;
-    if (want && !I.armsForced && !(flags & ENTITY_SLOT_RENDER_FLAG))
+    if (want && !(flags & ENTITY_SLOT_RENDER_FLAG))
     {
+        // The game hid the arms (again): take over. "Again" matters - with the hovering hand out, entering a screen
+        // clears the flag while we still count the arms as forced from before; not re-forcing left the hand
+        // invisible on every second screen until the hover ended (3.11.5).
         I.savedSlotFlags = flags;
         I.armsForcedWhile = I.examining ? 1 : 2; // which state had the arms hidden when we took over
         CEntity::FSetSlotFlags(pCEnt, 0, flags | ENTITY_SLOT_RENDER_FLAG);
