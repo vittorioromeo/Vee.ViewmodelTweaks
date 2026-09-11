@@ -386,6 +386,29 @@ Version notes at the end.
 * Clicks on screens do not go through `Interact`; they are taken from the raw input listener
   (`vm_interact_exam_key*`, bindable) while `active && worldUI`.
 
+### Quick melee (3.11.0)
+
+* `ArkWrenchComponent::OnHit(dir, CArkWeapon&, damageScale, bCharged)` (`0x13926D0`) is the whole wrench hit:
+  `GetHits` (`0x13905C0`) casts from the *player's* view with the wrench's range stats, then per hit the damage
+  signal package (`m_packageId` / critical / charged variants, damage x `damageScale`), NPC reaction, physics
+  impulse, and the player's fatigue (`damageScale * m_fatigueThisHit`). It reads the weapon only for stats and
+  the owner entity, so it works on the wrench sitting in the inventory: `ArkPlayerWeaponComponent::FindWeapon
+  (ArkWrenchComponent::GetWrenchArchetypeId())` (or the double wrench) -> `CArkWeapon::GetWeaponFromEntityId`
+  (`0x1667720`) -> `static_cast<ArkWeaponWrench*>` -> `m_wrenchComponent` at `+0x4C8`. `dir` is the swipe angle
+  in degrees (0 = straight); `m_bDodge` set makes the call a no-op once. `ArkWeaponWrench::OnHit` (`0x1685090`)
+  is the same plus the charge scale and the hit animations - not used.
+* No wrench in the inventory: the punch plays and lands nothing (counted in the tab).
+* Sound: `ArkAudioTrigger::Load(name)` / `Execute(pEntity)` with a wwise event name; the wrench's own swing
+  event is not in the DLL's strings (it lives in the banks / entity properties), `Play_Player_Throw` (the
+  throw whoosh) is the default, `vm_melee_sound_name` takes another.
+* Camera kick: `params.rotation *= kick` in the `ArkPlayerCamera::UpdateView` post-hook before the aim lock reads
+  the camera, so the weapon follows; the arms are placed from the camera bone by the game and do not, which
+  reads as the head moving against the hands.
+* The punch is reach style 2 with a *windup* keyframe (`ReachStyle::windupTime`, `windX/Y/Z`): a phase before
+  the reach where `wind` runs 0 -> 1 (reach easing) and the hand goes to `start + windOffset`; during the reach
+  `wind = 1 - curve`. `ApexTime() = windup + reach` is what the deferred fire, the carry delay and the melee hit
+  use. The hit lands on the transition into the hold phase (`meleePending`).
+
 ### Arms visibility
 
 * States in which the game keeps the arms out of sight: unarmed and examining. While a reach or the resting
@@ -440,6 +463,11 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.0: quick melee (above). One-handed weapons did not take the hidden start because their left IK weight
+  is animated at 1 (only the target is off screen): `SupportHandOffWeapon()` now uses a per-weapon flag
+  (`interact_hand_off`, built in for the wrench / grenades / Nullwave = off, two-handed = on, else auto from the
+  weight and the animated hand's position, shown in the tab). Windup keyframe on every style; target offset
+  sliders to +-80 cm.
 * 3.10.4: carrying re-done around what testing showed. `OnActionUse` sends `Interact(holdUse)` on the first
   hold event, i.e. right after the press, and for a heavy object the Lua then calls `PerformInteraction(carry,
   ..., delay = the hold-to-lift time)`: the game's own "hold" IS `m_carryDelay`, and `StopHoldToUseInteract`

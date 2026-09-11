@@ -56,6 +56,9 @@
 #include <Prey/ArkEnums.h>
 #include <Prey/GameDll/ark/weapons/arkweapon.h>
 #include <Prey/GameDll/ark/weapons/arkweaponshotgun.h>
+#include <Prey/GameDll/ark/weapons/ArkWeaponWrench.h>
+#include <Prey/GameDll/ark/weapons/ArkWrenchComponent.h>
+#include <Prey/Ark/ArkAudioUtil.h>
 #include <Prey/GameDll/GameCVars.h>
 #include <Prey/GameDll/weaponlookoffset.h>
 #include <Prey/GameDll/weaponstrafeoffset.h>
@@ -1173,6 +1176,16 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         m_nanRecoveries++;
         return;
     }
+    // Quick melee: a small camera kick (pitch down, a touch of yaw) that comes and goes with the punch.
+    if (m_interact.meleeKickTime >= 0.0f && (s.meleeCamKick != 0.0f || s.meleeCamKickYaw != 0.0f))
+    {
+        const float u = clamp_tpl(m_interact.meleeKickTime / max(s.meleeCamKickTime, 0.01f), 0.0f, 1.0f);
+        const float a = sinf(gf_PI * u);
+        const Quat kick = Quat::CreateRotationXYZ(Ang3(DEG2RAD(-clamp_tpl(s.meleeCamKick, -10.0f, 10.0f) * a), 0.0f, DEG2RAD(-clamp_tpl(s.meleeCamKickYaw, -10.0f, 10.0f) * a)));
+        const Quat q = SafeNormalized(params.rotation * kick);
+        if (SaneQuat(q))
+            params.rotation = q;
+    }
     const Quat entRot = SafeNormalized(pEnt->GetWorldRotation());
     Vec3 camPosRel = params.position;
     R.positionWasWorld = camPosRel.GetLengthSquared() > 20.0f * 20.0f;
@@ -1552,7 +1565,7 @@ float ModMain::OnPerformCarry(void* pInteractionRaw, int mode, IEntity* pEntity,
     // that timer (StopHoldToUseInteract), which UpdateInteract watches to call the grab off.
     const float hold = max(max(delay, 0.0f), clamp_tpl(m_settings.interactCarryHoldTime, 0.0f, 2.0f));
     const ReachStyle& st = style == 1 ? m_settings.grab : (style == 2 ? m_settings.punch : m_settings.press);
-    const float apex = clamp_tpl(max(st.reachTime, 0.0f), 0.0f, 1.0f);
+    const float apex = clamp_tpl(st.ApexTime(), 0.0f, 1.5f);
     I.carryStyle = style;
     I.carryPending = true;
     I.carryStartIn = hold;
@@ -1608,13 +1621,102 @@ void ModMain::UpdateCarry(float dt)
     if (!timerLive && !I.carryStarted && I.phase != InteractState::Idle && !I.returning)
     {
         const ReachStyle& st = CurStyle();
-        I.time = max(st.reachTime, 0.0f) + max(st.holdTime, 0.0f) + max(st.returnTime, 0.0f) * (1.0f - clamp_tpl(I.curve, 0.0f, 1.0f));
+        I.time = st.ApexTime() + max(st.holdTime, 0.0f) + max(st.returnTime, 0.0f) * (1.0f - clamp_tpl(I.curve, 0.0f, 1.0f));
+        I.wind = 0.0f;
         I.carryCancelled++;
         I.carryAnimating = false;
         return;
     }
     if (I.phase == InteractState::Idle || I.carryStarted)
         I.carryAnimating = false;
+}
+
+bool ModMain::SupportHandOffWeapon() const
+{
+    const InteractState& I = m_interact;
+    if (I.unarmed)
+        return true;
+    const WeaponSettings* pW = InteractWeaponEntry();
+    const int mode = pW ? pW->interactHandOff : 2;
+    if (mode == 0) return false;
+    if (mode == 1) return true;
+    // auto: the left IK weight is animated at 0, or the animated hand is nowhere near the view
+    if (I.animIkWeightValid && I.animIkWeight < 0.5f)
+        return true;
+    const Vec3& h = I.handView;
+    return Finite(h) && (h.y < 0.05f || h.z < -0.45f || fabsf(h.x) > 0.5f);
+}
+
+void ModMain::StartMelee()
+{
+    InteractState& I = m_interact;
+    const ViewmodelSettings& s = m_settings;
+    if (!Active() || !s.interactEnabled || !s.meleeEnabled || m_playerDead || !m_offsetHookActive)
+        return;
+    if (I.meleeCooldownLeft > 0.0f || I.meleePending || I.holdMode != 0)
+        return;
+    if (m_currentWeaponClass.empty() && !s.interactUnarmed)
+        return;
+    if (!s.meleeWhileAiming && s.aimEnabled && m_aimBlend > 0.3f)
+        return;
+    if (I.examining || m_wsReloading || m_wsSwitching || m_wsDrawing || m_wsUnequipping)
+        return;
+    StartReach(2, nullptr);
+    I.meleePending = true;
+    I.meleeCooldownLeft = max(s.meleeCooldown, 0.0f);
+    I.meleeKickTime = 0.0f;
+    I.meleePunches++;
+    if (s.meleeSound && gEnv && gEnv->pConsole)
+    {
+        if (ICVar* pName = gEnv->pConsole->GetCVar("vm_melee_sound_name"))
+        {
+            const char* name = pName->GetString();
+            ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+            if (name && *name && pPlayer && pPlayer->GetEntity())
+            {
+                ArkAudioTrigger trig;
+                if (trig.Load(name))
+                    trig.Execute(pPlayer->GetEntity());
+                else if (!I.meleeSoundWarned)
+                {
+                    CryLog("ViewmodelTweaks: quick melee - audio trigger '{}' not found", name);
+                    I.meleeSoundWarned = true;
+                }
+            }
+        }
+    }
+}
+
+void ModMain::DoMeleeHit()
+{
+    // The wrench's own hit (ArkWrenchComponent::OnHit: the player's view ray, the wrench's range and damage
+    // stats, the damage signal, NPC reactions, fatigue), scaled - from the wrench in the inventory, equipped or
+    // not (the hit is computed from the player, not from the weapon's position).
+    InteractState& I = m_interact;
+    I.meleePending = false;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer)
+        return;
+    unsigned id = pPlayer->m_weaponComponent.FindWeapon(ArkWrenchComponent::GetWrenchArchetypeId());
+    if (!id)
+        id = pPlayer->m_weaponComponent.FindWeapon(ArkWrenchComponent::GetDoubleWrenchArchetypeId());
+    CArkWeapon* pW = id ? CArkWeapon::GetWeaponFromEntityId(id) : nullptr;
+    IEntity* pEnt = pW ? pW->GetEntity() : nullptr;
+    const char* cls = (pEnt && pEnt->GetClass()) ? pEnt->GetClass()->GetName() : nullptr;
+    if (!pW || !cls || strncmp(cls, "ArkWeaponWrench", 15) != 0 && strncmp(cls, "ArkWeaponDoubleWrench", 21) != 0)
+    {
+        I.meleeNoWrench++;
+        if (m_settings.interactDebugMarker)
+            CryLog("ViewmodelTweaks: quick melee - no wrench in the inventory, the punch lands nothing");
+        return;
+    }
+    ArkWeaponWrench* pWrench = static_cast<ArkWeaponWrench*>(pW);
+    const float scale = clamp_tpl(m_settings.meleeDamage, 0.0f, 10.0f);
+    const ArkWrenchComponent::hitResult r = pWrench->m_wrenchComponent.OnHit(0.0f, *pW, scale, false);
+    if (r != ArkWrenchComponent::hitResult::none)
+        I.meleeHits++;
+    if (m_settings.interactDebugMarker)
+        CryLog("ViewmodelTweaks: quick melee hit - result {} (0 none, 1 hit, 2 enemy), damage scale {:.2f}", (int)r, scale);
 }
 
 bool ModMain::InteractAnimAllowed(int type, int mode)
@@ -1732,7 +1834,7 @@ bool ModMain::OnInteract(void* pInteractionRaw, int mode)
     // Defer the game's side so the object reacts when the hand gets there, not before: after a fixed delay, or -
     // for grabs - when the reach is at its apex (the hand closest to the object).
     const bool apex = style == 1 && m_settings.interactGrabAtApex;
-    const float fireDelay = apex ? max(CurStyle().reachTime, 0.0f) : m_settings.interactFireDelay;
+    const float fireDelay = apex ? CurStyle().ApexTime() : m_settings.interactFireDelay;
     if (m_settings.interactDefer && fireDelay > 0.0f)
     {
         if (I.pending)
@@ -1764,9 +1866,10 @@ void ModMain::StartReach(int style, const Vec3* pWorld)
     // current progress; a linear guess is plenty for a couple of frames of difference.
     float startTime = 0.0f;
     if (I.phase != InteractState::Idle && I.curve > 0.0f)
-        startTime = clamp_tpl(I.curve, 0.0f, 1.0f) * max(st.reachTime, 0.0f);
-    I.phase = InteractState::Reach;
+        startTime = max(st.windupTime, 0.0f) + clamp_tpl(I.curve, 0.0f, 1.0f) * max(st.reachTime, 0.0f);
+    I.phase = st.windupTime > 0.0f && startTime <= 0.0f ? InteractState::Windup : InteractState::Reach;
     I.time = startTime;
+    I.wind = 0.0f;
     I.returning = false;
     I.hasWorldTarget = pWorld != nullptr && Finite(*pWorld);
     if (I.hasWorldTarget)
@@ -1873,25 +1976,39 @@ void ModMain::UpdateInteract(float dt)
             I.style = (m_stylePose[1] == nm && m_stylePose[0] != nm) ? 1 : ((m_stylePose[3] == nm && m_stylePose[0] != nm) ? 2 : 0);
         }
         const ReachStyle& st = CurStyle();
-        I.time = max(st.reachTime, 0.0f) + max(st.holdTime, 0.0f); // leaving posing mode continues with the return
+        I.wind = 0.0f;
+        I.time = st.ApexTime() + max(st.holdTime, 0.0f); // leaving posing mode continues with the return
         if (!Active() || (m_currentWeaponClass.empty() && !s.interactUnarmed) || m_playerDead)
             I.holdMode = 0;
     }
     else if (I.phase != InteractState::Idle)
     {
         const ReachStyle& st = CurStyle();
-        const float R = max(st.reachTime, 0.0f), H = max(st.holdTime, 0.0f), T = max(st.returnTime, 0.0f);
+        const float W = max(st.windupTime, 0.0f), R = max(st.reachTime, 0.0f), H = max(st.holdTime, 0.0f), T = max(st.returnTime, 0.0f);
         I.time += dt;
-        if (I.time < R)
+        if (I.time < W)
+        {
+            // Windup: the hand is pulled to the style's windup offset first (same easing as the reach), curve stays 0.
+            I.phase = InteractState::Windup;
+            const float u = I.time / W;
+            I.wind = EaseCurve(s.interactEaseIn, u);
+            I.curve = 0.0f;
+            I.arc = 0.0f;
+            I.returning = false;
+        }
+        else if (I.time < W + R)
         {
             I.phase = InteractState::Reach;
-            const float u = R > 0.0f ? I.time / R : 1.0f;
+            const float u = R > 0.0f ? (I.time - W) / R : 1.0f;
             I.curve = EaseCurve(s.interactEaseIn, u);
+            I.wind = W > 0.0f ? 1.0f - I.curve : 0.0f; // the pulled-back offset unwinds as the hand goes out
             I.arc = sinf(gf_PI * clamp_tpl(u, 0.0f, 1.0f));
             I.returning = false;
         }
-        else if (I.time < R + H)
+        else if (I.time < W + R + H)
         {
+            if (I.phase != InteractState::Hold && I.meleePending)
+                DoMeleeHit(); // the punch lands
             if (I.phase != InteractState::Hold && s.interactDebugMarker)
                 CryLog("ViewmodelTweaks: reach at target - view target ({:.2f} {:.2f} {:.2f}){} asked ({:.2f} {:.2f} {:.2f}) anim hand ({:.2f} {:.2f} {:.2f}) corr ({:.2f} {:.2f} {:.2f}) rest {:.2f} examining {} shift ({:.2f} {:.2f} {:.2f}) poseAbsPos {} hasWorldTarget {}",
                     I.targetView.x, I.targetView.y, I.targetView.z, I.clamped ? " CLAMPED" : "", I.desiredView.x, I.desiredView.y, I.desiredView.z,
@@ -1899,13 +2016,15 @@ void ModMain::UpdateInteract(float dt)
                     I.poseAbsolutePos, I.hasWorldTarget);
             I.phase = InteractState::Hold;
             I.curve = 1.0f;
+            I.wind = 0.0f;
             I.arc = 0.0f;
             I.returning = false;
         }
-        else if (I.time < R + H + T)
+        else if (I.time < W + R + H + T)
         {
             I.phase = InteractState::Return;
-            const float u = T > 0.0f ? (I.time - R - H) / T : 1.0f;
+            I.wind = 0.0f;
+            const float u = T > 0.0f ? (I.time - W - R - H) / T : 1.0f;
             I.curve = 1.0f - EaseCurve(s.interactEaseOut, u);
             I.arc = sinf(gf_PI * clamp_tpl(u, 0.0f, 1.0f));
             I.returning = true;
@@ -1914,14 +2033,18 @@ void ModMain::UpdateInteract(float dt)
         {
             I.phase = InteractState::Idle;
             I.curve = 0.0f;
+            I.wind = 0.0f;
             I.arc = 0.0f;
+            I.meleePending = false;
         }
         // The animation must not outlive the conditions it started under.
         if (!Active() || !s.interactEnabled || (m_currentWeaponClass.empty() && !s.interactUnarmed) || m_playerDead)
         {
             I.phase = InteractState::Idle;
             I.curve = 0.0f;
+            I.wind = 0.0f;
             I.arc = 0.0f;
+            I.meleePending = false;
         }
     }
 
@@ -1932,6 +2055,12 @@ void ModMain::UpdateInteract(float dt)
             I.fireNow = true; // made in UpdateBeforeSystem, inside the game's own update window
     }
     UpdateCarry(dt);
+    if (I.meleeCooldownLeft > 0.0f) I.meleeCooldownLeft = max(I.meleeCooldownLeft - dt, 0.0f);
+    if (I.meleeKickTime >= 0.0f)
+    {
+        I.meleeKickTime += dt;
+        if (I.meleeKickTime > max(s.meleeCamKickTime, 0.01f)) I.meleeKickTime = -1.0f;
+    }
 
     I.unarmed = m_currentWeaponClass.empty();
     I.examining = ExaminingWorldUI();
@@ -2146,7 +2275,8 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         return;
     }
 
-    const bool reaching = I.phase != InteractState::Idle && I.curve > 0.0f;
+    const float wind = I.phase != InteractState::Idle ? clamp_tpl(I.wind, 0.0f, 1.0f) : 0.0f;
+    const bool reaching = I.phase != InteractState::Idle && (I.curve > 0.0f || wind > 0.0f);
     const float curve = reaching ? clamp_tpl(I.curve, 0.0f, 1.0f) : 0.0f;
     const float rest = clamp_tpl(I.restBlend, 0.0f, 1.0f);
     if (!reaching && rest <= 0.0f)
@@ -2161,7 +2291,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     const ReachStyle& st = CurStyle();
     // Fingers / hand orientation: same progress as the reach (posing mode 1 = pose only, the hand stays where
     // the animation has it). While resting on a screen the pose is held at the rest blend.
-    PushHandPose(pModifier, pSkelPose, camReach, max(curve, rest));
+    PushHandPose(pModifier, pSkelPose, camReach, max(max(curve, wind), rest));
     if (I.holdMode == 1)
     {
         noReachThisFrame();
@@ -2246,7 +2376,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     // view instead (global, or the weapon's own), and the IK weight is on from the first frame.
     Vec3 startView = handView;
     I.hiddenStartUsed = false;
-    if (s.interactHiddenStart && (I.unarmed || (I.animIkWeightValid && I.animIkWeight < 0.5f)) && examBlend < 0.5f)
+    if (s.interactHiddenStart && SupportHandOffWeapon() && examBlend < 0.5f)
     {
         Vec3 sp(s.interactStartX, s.interactStartY, s.interactStartZ);
         if (const WeaponSettings* pW = InteractWeaponEntry(); pW && SanePose(pW->interactStart) && pW->interactStart.Pos().GetLengthSquared() > 1e-6f)
@@ -2261,6 +2391,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     if (st.along != 0.0f && targetView.GetLengthSquared() > 1e-6f)
         targetView += targetView.GetNormalized() * clamp_tpl(st.along, -0.5f, 0.5f); // along the camera -> target line
     Vec3 desired = base + (targetView - base) * (curve * clamp_tpl(st.amount, 0.0f, 2.0f));
+    desired += Vec3(st.windX, st.windY, st.windZ) * wind; // the windup keyframe: pulled back before the reach
     const float ax = I.returning ? st.retArcX : st.arcX;
     const float az = I.returning ? st.retArcZ : st.arcZ;
     desired += Vec3(ax * I.arc, 0.0f, az * I.arc);
@@ -2289,7 +2420,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         if (desired.z < -down) sc = min(sc, -down / desired.z);
         Vec3 clamped = desired * clamp_tpl(sc, 0.0f, 1.0f);
         clamped.y = max(clamped.y, max(s.interactMinForward, 0.02f) * 0.5f);
-        const float k = max(curve, rest);
+        const float k = max(max(curve, wind), rest);
         desired = unclamped + (clamped - unclamped) * k;
         I.clamped = (unclamped - clamped).GetLengthSquared() > 1e-6f;
     }
@@ -2385,7 +2516,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
                     if (Finite(rel)) { I.animIkWeight = clamp_tpl(rel.x, 0.0f, 1.0f); I.animIkWeightValid = true; }
                 }
             }
-            const float blend = max(curve, rest);
+            const float blend = max(max(curve, wind), rest);
             const float animW = I.animIkWeightValid ? I.animIkWeight : 0.0f;
             w = I.hiddenStartUsed ? 1.0f : clamp_tpl(animW + (1.0f - animW) * blend, 0.0f, 1.0f); // from the hidden spot the IK is on from the first frame
 
@@ -2532,7 +2663,7 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
     const HandPose* pPose = ActivePose();
     const HandPose* pRest = (I.holdMode != 0) ? nullptr : RestPose();
     const float restNow = (I.holdMode != 0) ? 0.0f : clamp_tpl(I.restBlend, 0.0f, 1.0f);
-    const float curveNow = (I.holdMode != 0) ? 1.0f : clamp_tpl(I.curve, 0.0f, 1.0f);
+    const float curveNow = (I.holdMode != 0) ? 1.0f : max(clamp_tpl(I.curve, 0.0f, 1.0f), I.phase != InteractState::Idle ? clamp_tpl(I.wind, 0.0f, 1.0f) : 0.0f); // the pose forms during the windup too
     const float k = restNow > 0.0f ? curveNow : 1.0f; // 0 = all rest pose, 1 = all reach pose
     if (!pPose) pPose = pRest;
     if (!pRest) pRest = pPose;
@@ -3448,11 +3579,13 @@ void ModMain::SanitizeSettings()
         fixF(r.offX, d.offX); fixF(r.offY, d.offY); fixF(r.offZ, d.offZ); fixF(r.arcX, d.arcX); fixF(r.arcZ, d.arcZ);
         fixF(r.retArcX, d.retArcX); fixF(r.retArcZ, d.retArcZ); fixF(r.pitch, d.pitch); fixF(r.yaw, d.yaw); fixF(r.roll, d.roll);
         fixF(r.envelopeScale, d.envelopeScale); fixF(r.along, d.along);
+        fixF(r.windupTime, d.windupTime); fixF(r.windX, d.windX); fixF(r.windY, d.windY); fixF(r.windZ, d.windZ);
     };
     fixStyle(s.press, def.press);
     fixStyle(s.grab, def.grab);
     fixStyle(s.pressExam, def.pressExam);
     fixStyle(s.punch, def.punch);
+    fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
     fixF(s.interactExamLeaveTime, def.interactExamLeaveTime); fixF(s.interactRestSwayPos, def.interactRestSwayPos); fixF(s.interactRestSwayRot, def.interactRestSwayRot);
     fixF(s.interactRestSwayFreq, def.interactRestSwayFreq); fixF(s.interactHoverMaxDist, def.interactHoverMaxDist); fixF(s.interactHoverTowards, def.interactHoverTowards);
@@ -3612,6 +3745,11 @@ namespace
     };
     void ApplyBuiltInInteract(const char* cls, WeaponSettings& w)
     {
+        // one-handed: the support hand is animated out of view
+        for (const char* oneHanded : { "ArkWeaponWrench", "ArkWeaponEMPGrenade", "ArkWeaponLureGrenade", "ArkWeaponRecyclerGrenade", "ArkWeaponExplosiveGrenade", "ArkWeaponNullwaveTransmitter" })
+            if (strcmp(oneHanded, cls) == 0) w.interactHandOff = 1;
+        for (const char* twoHanded : { "ArkWeaponPistol", "ArkWeaponShotgun", "ArkWeaponGooGun", "ArkWeaponStunGun", "ArkWeaponToyGun", "ArkWeaponInstalaser" })
+            if (strcmp(twoHanded, cls) == 0) w.interactHandOff = 0;
         for (const BuiltInInteract& b : s_builtInInteract)
             if (strcmp(b.cls, cls) == 0)
             {
@@ -3851,6 +3989,27 @@ bool ModMain::OnInputEvent(const SInputEvent& event)
     if (Active() && m_settings.nudgeKeys && event.deviceType == eIDT_Keyboard && !m_mouseCaptured && !IsHardwareCursorVisible())
     {
         if (HandleNudgeKey(event.keyId, pressed))
+            return true;
+    }
+
+    // Quick melee key.
+    if (m_waitingForMeleeKey)
+    {
+        if (pressed)
+        {
+            if (event.keyId != eKI_Escape)
+                m_settings.meleeKey = (int)event.keyId;
+            m_waitingForMeleeKey = false;
+            return true;
+        }
+        return false;
+    }
+    if (m_settings.meleeKey != 0 && (int)event.keyId == m_settings.meleeKey && Active() && m_settings.interactEnabled && m_settings.meleeEnabled
+        && !m_mouseCaptured && !IsHardwareCursorVisible() && !ExaminingWorldUI())
+    {
+        if (pressed)
+            StartMelee();
+        if (m_settings.meleeConsumeKey)
             return true;
     }
 
@@ -4229,6 +4388,7 @@ void ModMain::LoadWeapons()
         ReadPose(n, "interact_rest_", w.interactRest, PoseOffset());
         ReadPose(n, "interact_forearm_", w.interactForearm, PoseOffset());
         ReadPose(n, "interact_start_", w.interactStart, PoseOffset());
+        w.interactHandOff = clamp_tpl(n.attribute("interact_hand_off").as_int(2), 0, 2);
         {
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
@@ -4272,6 +4432,7 @@ void ModMain::SaveWeapons()
         WritePose(n, "interact_rest_", kv.second.interactRest);
         WritePose(n, "interact_forearm_", kv.second.interactForearm);
         WritePose(n, "interact_start_", kv.second.interactStart);
+        n.append_attribute("interact_hand_off") = kv.second.interactHandOff;
     }
     const fs::path path = GetWeaponsPath();
     if (!doc.save_file(path.c_str()))
@@ -4358,6 +4519,10 @@ static void RegisterReachStyleCVars(ReachStyle& r, const char* prefix, const cha
     REGISTER_CVAR2(name("rot_roll"), &r.roll, r.roll, VF_DUMPTOCHAIR, help("hand roll at the target (deg)"));
     REGISTER_CVAR2(name("envelope"), &r.envelopeScale, r.envelopeScale, VF_DUMPTOCHAIR, help("reach envelope limits times this while it plays (1 = as set)"));
     REGISTER_CVAR2(name("along"), &r.along, r.along, VF_DUMPTOCHAIR, help("target moved along the camera -> target line (m, + = into the object)"));
+    REGISTER_CVAR2(name("windup_time"), &r.windupTime, r.windupTime, VF_DUMPTOCHAIR, help("seconds of windup before the reach (0 = none)"));
+    REGISTER_CVAR2(name("windup_x"), &r.windX, r.windX, VF_DUMPTOCHAIR, help("windup: hand pulled right (m)"));
+    REGISTER_CVAR2(name("windup_y"), &r.windY, r.windY, VF_DUMPTOCHAIR, help("windup: hand pulled forward (m, negative = back)"));
+    REGISTER_CVAR2(name("windup_z"), &r.windZ, r.windZ, VF_DUMPTOCHAIR, help("windup: hand pulled up (m)"));
 }
 
 void ModMain::RegisterCVars()
@@ -4496,6 +4661,18 @@ void ModMain::RegisterCVars()
     RegisterReachStyleCVars(s.grab, "grab_", "grab");
     RegisterReachStyleCVars(s.pressExam, "press_exam_", "press on screens");
     RegisterReachStyleCVars(s.punch, "punch_", "punch (quick melee)");
+    REGISTER_CVAR2("vm_melee", &s.meleeEnabled, s.meleeEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee on a key - the punch plays and a wrench hit lands at its apex (0/1)");
+    REGISTER_CVAR2("vm_melee_key", &s.meleeKey, s.meleeKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee key (EKeyId, default 46 = V)");
+    REGISTER_CVAR2("vm_melee_consume_key", &s.meleeConsumeKey, s.meleeConsumeKey, VF_DUMPTOCHAIR, "Viewmodel Tweaks: swallow the quick melee key (0/1)");
+    REGISTER_CVAR2("vm_melee_damage", &s.meleeDamage, s.meleeDamage, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee damage relative to a wrench hit");
+    REGISTER_CVAR2("vm_melee_cooldown", &s.meleeCooldown, s.meleeCooldown, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds between quick melee punches");
+    REGISTER_CVAR2("vm_melee_cam_kick", &s.meleeCamKick, s.meleeCamKick, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera pitch kick (deg)");
+    REGISTER_CVAR2("vm_melee_cam_kick_yaw", &s.meleeCamKickYaw, s.meleeCamKickYaw, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera yaw kick (deg)");
+    REGISTER_CVAR2("vm_melee_cam_kick_time", &s.meleeCamKickTime, s.meleeCamKickTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the camera kick takes");
+    REGISTER_CVAR2("vm_melee_sound", &s.meleeSound, s.meleeSound, VF_DUMPTOCHAIR, "Viewmodel Tweaks: play a swing sound with the punch (0/1)");
+    REGISTER_CVAR2("vm_melee_while_aiming", &s.meleeWhileAiming, s.meleeWhileAiming, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee while aiming down sights (0/1)");
+    if (gEnv && gEnv->pConsole)
+        gEnv->pConsole->RegisterString("vm_melee_sound_name", "Play_Player_Throw", VF_DUMPTOCHAIR, "Viewmodel Tweaks: audio trigger played when the punch starts (a wwise event name; Play_Player_Throw is the throw whoosh)");
     REGISTER_CVAR2("vm_interact_carry_hold", &s.interactCarryHoldTime, s.interactCarryHoldTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carrying - seconds the key has to be held before the grab starts (a tap does nothing)");
     REGISTER_CVAR2("vm_interact_hidden_start", &s.interactHiddenStart, s.interactHiddenStart, VF_DUMPTOCHAIR, "Viewmodel Tweaks: with the support hand off the weapon (one-handed / none) the hand comes up from a fixed spot below the view (0/1)");
     REGISTER_CVAR2("vm_interact_start_x", &s.interactStartX, s.interactStartX, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, right (m)");
@@ -4967,9 +5144,19 @@ static void DrawReachStyle(ReachStyle& r, const char* id)
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far along the way to the target the hand goes (1 = touches it, 0.5 = half way, >1 = past it).");
     ImGui::Spacing();
     ImGui::Text("Target offset (view space, from the object point)");
-    SliderCm("Right / Left##off", r.offX, 30.0f, "Positive moves the hand target to the right.");
-    SliderCm("Forward / Back##off", r.offY, 30.0f, "Negative stops the hand short of the surface (the fist has a size).");
-    SliderCm("Up / Down##off", r.offZ, 30.0f, "Positive moves the hand target up.");
+    SliderCm("Right / Left##off", r.offX, 80.0f, "Positive moves the hand target to the right.");
+    SliderCm("Forward / Back##off", r.offY, 80.0f, "Negative stops the hand short of the surface (the fist has a size).");
+    SliderCm("Up / Down##off", r.offZ, 80.0f, "Positive moves the hand target up.");
+    ImGui::Spacing();
+    ImGui::Text("Windup (a keyframe before the reach: the hand is pulled back first)");
+    ImGui::SliderFloat("Windup time", &r.windupTime, 0.0f, 0.6f, "%.2f s");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = no windup. Uses the reach easing; the pulled-back offset unwinds as the hand goes out.");
+    if (r.windupTime > 0.0f)
+    {
+        SliderCm("Pulled right / left##wind", r.windX, 40.0f, "Relative to where the hand starts from.");
+        SliderCm("Pulled forward / back##wind", r.windY, 40.0f, "Negative = back towards the body (loading the arm).");
+        SliderCm("Pulled up / down##wind", r.windZ, 40.0f, nullptr);
+    }
     ImGui::Spacing();
     ImGui::Text("Path (sine bulge, peaks half-way)");
     SliderCm("Way out: sideways", r.arcX, 20.0f, "Bulge of the path towards the target, right (+) / left (-).");
@@ -5348,6 +5535,34 @@ void ModMain::DrawInteractTab()
         }
     }
 
+    // --- quick melee ---------------------------------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Quick melee", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::TextWrapped("A punch on its own key: the punch animation plays and, at its apex, the wrench's own hit lands (its range, force, reactions), scaled. "
+                           "Needs a wrench in the inventory - equipped or not.");
+        CheckboxInt("Enable quick melee", s.meleeEnabled);
+        ImGui::Text("Key: %s", GetKeyName(s.meleeKey));
+        ImGui::SameLine();
+        if (!m_waitingForMeleeKey)
+        {
+            if (ImGui::SmallButton("Bind##melee")) m_waitingForMeleeKey = true;
+        }
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "press the key (Esc cancels)");
+        ImGui::SameLine();
+        CheckboxInt("swallow the key", s.meleeConsumeKey, "The game does not see the key press.");
+        ImGui::SliderFloat("Damage (x wrench hit)", &s.meleeDamage, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Cooldown", &s.meleeCooldown, 0.0f, 3.0f, "%.2f s");
+        CheckboxInt("Also while aiming down sights", s.meleeWhileAiming);
+        CheckboxInt("Swing sound", s.meleeSound, "Plays the audio trigger named by vm_melee_sound_name when the punch starts (default Play_Player_Throw, the throw whoosh; set another wwise event name in the console).");
+        ImGui::Text("Camera kick");
+        ImGui::SliderFloat("Pitch##mk", &s.meleeCamKick, -5.0f, 5.0f, "%.1f deg");
+        ImGui::SliderFloat("Yaw##mk", &s.meleeCamKickYaw, -5.0f, 5.0f, "%.1f deg");
+        ImGui::SliderFloat("Time##mk", &s.meleeCamKickTime, 0.05f, 1.0f, "%.2f s");
+        ImGui::TextDisabled("punches %d, hits %d, without a wrench %d%s | timing and path: Reach -> Punch; pose: Hand pose -> Punch uses pose",
+            I.meleePunches, I.meleeHits, I.meleeNoWrench, I.meleeCooldownLeft > 0.0f ? " | cooling down" : "");
+    }
+
     // --- screens and keypads ----------------------------------------------------------------------------------
     if (ImGui::CollapsingHeader("Screens and keypads", ImGuiTreeNodeFlags_DefaultOpen))
     {
@@ -5469,9 +5684,14 @@ void ModMain::DrawInteractTab()
             ch |= SliderCm("Forward##sw", w.interactStart.posY, 80.0f, nullptr);
             ch |= SliderCm("Up / down##sw", w.interactStart.posZ, 100.0f, nullptr);
             if (ImGui::Button("Reset this weapon's spot##sw")) { w.interactStart.Reset(); ch = true; }
+            const char* handOff[] = { "on the weapon (blend from the animated hand)", "off the weapon (come up from the spot)", "auto (IK weight / where the animated hand is)" };
+            ImGui::SetNextItemWidth(320);
+            if (ImGui::Combo("Support hand for this weapon", &w.interactHandOff, handOff, 3)) ch = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("One-handed weapons (wrench, grenades) animate the support hand out of view: the hand should come up from the spot. Built-in per weapon; auto looks at the animated IK weight and hand position.");
             ImGui::PopID();
             if (ch) { w.valid = true; m_weaponsDirty = true; }
-            ImGui::TextDisabled("now: %s", I.hiddenStartUsed ? "coming up from the spot" : "from the animated hand");
+            ImGui::TextDisabled("now: %s | animated hand in view space (%.2f %.2f %.2f), IK weight %.2f%s", I.hiddenStartUsed ? "coming up from the spot" : "from the animated hand",
+                I.handView.x, I.handView.y, I.handView.z, I.animIkWeight, I.animIkWeightValid ? "" : " (not captured)");
             ImGui::TreePop();
         }
         if (ImGui::TreeNodeEx("Resting spot outside screens", ImGuiTreeNodeFlags_DefaultOpen))
@@ -5542,7 +5762,7 @@ void ModMain::DrawInteractTab()
         SliderCm("Test point: right / left", s.interactTestX, 50.0f, "Fixed test point, view space.");
         SliderCm("Test point: forward", s.interactTestY, 100.0f, nullptr);
         SliderCm("Test point: up / down", s.interactTestZ, 50.0f, nullptr);
-        const char* phaseNames[] = { "idle", "reach", "hold", "return" };
+        const char* phaseNames[] = { "idle", "reach", "hold", "return", "windup" };
         ImGui::Text("%s  t=%.2f s  progress %.2f  style %s", phaseNames[(int)I.phase], I.time, I.curve, I.style == 1 ? "grab" : (I.style == 2 ? "punch" : "press"));
         ImGui::ProgressBar(I.curve, ImVec2(-1, 0), I.phase == InteractState::Idle ? "idle" : "reaching");
         if (I.pending)

@@ -85,8 +85,11 @@ struct ReachStyle
     float pitch = -2.07f, yaw = -2.07f, roll = -1.7f; //!< hand rotation at the target (additive, degrees)
     float envelopeScale = 1.0f; //!< the reach envelope's limits times this while this style plays (relax it for grabs down to the floor)
     float along = 0.0f;         //!< moves the target along the camera -> target line (m; + = beyond the object, into it)
+    float windupTime = 0.0f;    //!< a keyframe before the reach: the hand is pulled to the windup offset first (0 = none)
+    float windX = 0.0f, windY = 0.0f, windZ = 0.0f; //!< where it is pulled to (m, view space, relative to where it starts from)
 
-    float Duration() const { return reachTime + holdTime + returnTime; }
+    float Duration() const { return windupTime + reachTime + holdTime + returnTime; }
+    float ApexTime() const { return max(windupTime, 0.0f) + max(reachTime, 0.0f); } //!< from the start to the hand at the target
     //! Quick melee: fast, straight ahead, snaps back.
     static ReachStyle Punch()
     {
@@ -94,6 +97,7 @@ struct ReachStyle
         r.reachTime = 0.12f; r.holdTime = 0.04f; r.returnTime = 0.28f; r.amount = 1.0f;
         r.offX = r.offY = r.offZ = 0.0f; r.arcX = 0.0f; r.arcZ = -0.02f; r.retArcX = 0.0f; r.retArcZ = -0.04f;
         r.pitch = r.yaw = r.roll = 0.0f;
+        r.windupTime = 0.14f; r.windX = 0.06f; r.windY = -0.14f; r.windZ = 0.03f; // the arm loads up: back, a little out and up
         return r;
     }
     //! The grab: a little slower, overshoots, sweeps in from the side and drops on the way back.
@@ -266,7 +270,17 @@ struct ViewmodelSettings
     int   interactGrabAtApex = 1;   //!< grab-style interactions (and carrying) fire at the end of the reach instead of after interactFireDelay
     int   interactCarryAtApex = 1;  //!< carrying starts when the hand gets there (the game's own carry delay is lengthened to the reach)
     ReachStyle pressExam = ReachStyle::GentlePress(); //!< the press while a screen / keypad is up (close to it, from the resting hand)
-    ReachStyle punch = ReachStyle::Punch(); //!< quick melee (style 2), for a later melee key; test button for now
+    ReachStyle punch = ReachStyle::Punch(); //!< quick melee (style 2)
+    int   meleeEnabled = 1;         //!< quick melee on a key: the punch plays and a wrench hit lands at its apex
+    int   meleeKey = 0x2E;          //!< EKeyId (default eKI_V)
+    int   meleeConsumeKey = 1;      //!< swallow the key so the game's own binding on it does nothing
+    float meleeDamage = 0.5f;       //!< damage scale relative to a wrench hit
+    float meleeCooldown = 1.0f;     //!< seconds between punches
+    float meleeCamKick = 1.5f;      //!< camera pitch kick (degrees, down then back) with the punch
+    float meleeCamKickYaw = 0.6f;   //!< ... and yaw (degrees, to the right then back)
+    float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
+    int   meleeSound = 1;           //!< play a swing sound (vm_melee_sound_name) when the punch starts
+    int   meleeWhileAiming = 0;     //!< allow while aiming down sights
     float interactCarryHoldTime = 0.15f; //!< carrying: the key has to be held this long before the grab starts (a tap does nothing)
     int   interactHiddenStart = 1;  //!< when the support hand is not on the weapon (one-handed weapons, no weapon), the hand comes up from a fixed spot below the view instead of from wherever the animation has it
     float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
@@ -385,7 +399,7 @@ struct HandPose
 //! Runtime state of the interaction reach (support hand), see ModMain::OnInteract / PushInteractReach.
 struct InteractState
 {
-    enum EPhase { Idle, Reach, Hold, Return };
+    enum EPhase { Idle, Reach, Hold, Return, Windup };
     EPhase phase = Idle;
     float time = 0.0f;              //!< seconds into the animation
     int style = 0;                  //!< 0 press, 1 grab
@@ -486,6 +500,13 @@ struct InteractState
     // Debug
     // Carrying (see OnPerformCarry): the grab starts once the key has been held, the game's carry delay ends at its apex
     bool hiddenStartUsed = false;   //!< this frame the hand comes up from the fixed spot (support hand not on the weapon)
+    float wind = 0.0f;              //!< 0..1: the windup keyframe (hand pulled to the style's windup offset); fades out during the reach
+    // Quick melee
+    bool meleePending = false;      //!< a punch is playing and its hit has not landed yet
+    float meleeCooldownLeft = 0.0f;
+    float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
+    int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
+    bool meleeSoundWarned = false;
     bool carryPending = false;      //!< waiting for the hold time before the grab starts
     float carryStartIn = 0.0f;      //!< seconds until it does
     unsigned carryEntityId = 0;     //!< what is being picked up (looked up again when the grab starts)
@@ -549,6 +570,7 @@ struct WeaponSettings
     PoseOffset interactRest;        //!< Where this weapon's resting / hovering hand waits, relative to the resting spot (position, m, view space; rotation unused).
     PoseOffset interactForearm;     //!< Extra rotation of the left forearm (about its own axes, degrees) while the hand is posed; the hand keeps its own orientation. Position unused.
     PoseOffset interactStart;       //!< This weapon's own "hand comes up from here" spot (view space, m), replaces the global one when non-zero. Rotation unused.
+    int interactHandOff = 2;        //!< Is the support hand off the weapon (animated out of view)? 0 no, 1 yes, 2 auto (from the left IK weight and where the animated hand is). Decides whether the hand comes up from the hidden spot.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
     static PoseOffset DefaultAim()
@@ -926,6 +948,9 @@ public:
     //! PerformInteraction(carry) hook: schedules the grab for when the key has been held, returns the carry delay to use (hold + reach).
     float OnPerformCarry(void* pInteraction, int mode, IEntity* pEntity, float delay);
     void OnCarryStarted();              //!< ArkPlayerCarry::StartCarrying happened
+    void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
+    void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
+    bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot
     void UpdateCarry(float dt);         //!< the pending / playing carry grab: start it, or call it off when the key was released
     //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
     void StartReach(int style, const Vec3* pWorld);
@@ -943,6 +968,7 @@ private:
     bool ExaminingWorldUI() const;
     //! World point a screen click aims at (examination mode): the centre ray of the view camera.
     bool CursorWorldPoint(Vec3& out);
+    bool m_waitingForMeleeKey = false;  //!< UI "bind": the next key becomes the quick melee key
     int m_waitingForExamKey = 0;        //!< UI "bind": the next key becomes screen click key 1 / 2
     int m_examZoomHandle = 0;           //!< our zoom-manager entry overriding the screen zoom (0 = none)
     float m_examZoomHfov = 0.0f;

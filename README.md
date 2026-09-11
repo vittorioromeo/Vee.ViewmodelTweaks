@@ -35,6 +35,9 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   drift and its own pose, pressing where the crosshair is; optionally the hand also comes up whenever
   something usable is in front of you (a button, an item, a container). Keypads can be used from where you
   stand instead of zooming in (the game's own per-screen-type switches, exposed).
+* **Quick melee.** A punch on its own key (V by default): the support hand winds up and strikes, and at the apex
+  the wrench's own hit lands at a configurable fraction of its damage (0.5 by default), with a cooldown, a swing
+  sound and a small camera kick. Works with any weapon out or none, as long as a wrench is in the inventory.
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 
