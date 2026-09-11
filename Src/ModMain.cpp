@@ -2331,6 +2331,9 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         return;
     }
     const ReachStyle& st = CurStyle();
+    // Does the hand come up from the fixed spot this frame (support hand off the weapon)? Decided here so the pose
+    // push below can blend the wrist from the spot's orientation.
+    I.hiddenStartUsed = s.interactHiddenStart && SupportHandOffWeapon() && examBlend < 0.5f;
     // Fingers / hand orientation: same progress as the reach (posing mode 1 = pose only, the hand stays where
     // the animation has it). While resting on a screen the pose is held at the rest blend.
     PushHandPose(pModifier, pSkelPose, camReach, max(max(curve, wind), rest));
@@ -2417,17 +2420,15 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     // couple of frames whatever the blend time: the hand "pops". So it comes up from a fixed spot below the
     // view instead (global, or the weapon's own), and the IK weight is on from the first frame.
     Vec3 startView = handView;
-    I.hiddenStartUsed = false;
-    if (s.interactHiddenStart && SupportHandOffWeapon() && examBlend < 0.5f)
+    if (I.hiddenStartUsed)
     {
         Vec3 sp(s.interactStartX, s.interactStartY, s.interactStartZ);
         if (const WeaponSettings* pW = InteractWeaponEntry(); pW && SanePose(pW->interactStart) && pW->interactStart.Pos().GetLengthSquared() > 1e-6f)
             sp = pW->interactStart.Pos();
         if (Finite(sp))
-        {
             startView = sp;
-            I.hiddenStartUsed = true;
-        }
+        else
+            I.hiddenStartUsed = false;
     }
     const Vec3 base = startView + (restView - startView) * rest;
     if (st.along != 0.0f && targetView.GetLengthSquared() > 1e-6f)
@@ -2797,6 +2798,18 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
     // not known which one the animation-driven IK honours: the IK target joint's orientation (if the limb IK
     // copies it to the hand) and the hand joint's rotation relative to the forearm (recomputed by the IK from
     // the relative pose, so it survives the solve; uses last frame's forearm, exact once the pose holds).
+    // Hand off the weapon: the wrist blends from the spot's orientation (global + weapon), not from the animated hand
+    // that is somewhere off screen.
+    Quat fromIk = I.animIkQ, fromHand = I.animHandAbs;
+    if (I.hiddenStartUsed)
+    {
+        Quat startRot = SanePose(s.interactStartHandRot) ? s.interactStartHandRot.Rot() : Quat(IDENTITY);
+        if (const WeaponSettings* pW = InteractWeaponEntry(); pW && SanePose(pW->interactStartHandRot))
+            startRot = pW->interactStartHandRot.Rot() * startRot;
+        const Quat abs = SafeNormalized(camAbs.q * startRot);
+        if (SaneQuat(abs))
+            fromIk = fromHand = abs;
+    }
     Quat wristView = SafeNormalized(Quat::CreateNlerp(pRest->HandRotView(), pPose->HandRotView(), k));
     // The style's "hand rotation at the target" (press / grab / punch pitch, yaw, roll), with the reach. When a pose
     // owns the wrist the additive route in PushInteractReach is skipped, so it is folded in here instead.
@@ -2815,7 +2828,7 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
     const Quat wristAbs = SafeNormalized(camAbs.q * wristView);
     if ((s.interactWristMode == 0 || s.interactWristMode == 2) && m_lock.leftIkJoint >= 0 && pIk)
     {
-        Quat q = SafeNormalized(Quat::CreateNlerp(I.animIkQ, wristAbs, w));
+        Quat q = SafeNormalized(Quat::CreateNlerp(fromIk, wristAbs, w));
         if (SaneQuat(q))
         {
             VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, m_lock.leftIkJoint, OP_OVERRIDE, &q);
@@ -2824,7 +2837,7 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
     }
     if (s.interactWristMode == 1 || s.interactWristMode == 2)
     {
-        const Quat handAbs = SafeNormalized(Quat::CreateNlerp(I.animHandAbs, wristAbs, w));
+        const Quat handAbs = SafeNormalized(Quat::CreateNlerp(fromHand, wristAbs, w));
         Quat rel = SafeNormalized((!pForearm->q) * handAbs);
         if (SaneQuat(rel))
         {
@@ -2835,9 +2848,15 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
     // Forearm: a per-weapon twist / bend (rotation about the forearm's own axes, eOp_Additive expressed in model
     // space with last frame's forearm frame). The hand's orientation is pushed absolutely above, so it does not
     // inherit this - only the forearm turns under the wrist, which is what fixes an over-rotated-looking wrist.
-    if (const WeaponSettings* pW = InteractWeaponEntry(); pW && SanePose(pW->interactForearm) && !R.leftSubtreeParent.empty() && R.leftSubtreeParent[0] >= 0)
+    if (const WeaponSettings* pW = InteractWeaponEntry(); pW && !R.leftSubtreeParent.empty() && R.leftSubtreeParent[0] >= 0)
     {
-        const PoseOffset& f = pW->interactForearm;
+        PoseOffset f = SanePose(pW->interactForearm) ? pW->interactForearm : PoseOffset();
+        if (I.hiddenStartUsed)
+        {
+            // hand off the weapon: the arm's own forearm attitude (global + weapon) on top
+            if (SanePose(s.interactStartForearmRot)) f.AddScaled(s.interactStartForearmRot, 1.0f);
+            if (SanePose(pW->interactStartForearmRot)) f.AddScaled(pW->interactStartForearmRot, 1.0f);
+        }
         if (f.pitch != 0.0f || f.yaw != 0.0f || f.roll != 0.0f)
         {
             const Quat local = SafeNormalized(f.Rot());
@@ -3692,6 +3711,8 @@ void ModMain::SanitizeSettings()
     if (s.meleeLower.Sanitize(def.meleeLower)) fixed++;
     if (s.interactStartShoulder.Sanitize(def.interactStartShoulder)) fixed++;
     if (s.interactStartElbow.Sanitize(def.interactStartElbow)) fixed++;
+    if (s.interactStartHandRot.Sanitize(def.interactStartHandRot)) fixed++;
+    if (s.interactStartForearmRot.Sanitize(def.interactStartForearmRot)) fixed++;
     fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
@@ -3715,6 +3736,8 @@ void ModMain::SanitizeSettings()
         if (w.interactStart.Sanitize(d.interactStart)) fixed++;
         if (w.interactStartShoulder.Sanitize(d.interactStartShoulder)) fixed++;
         if (w.interactStartElbow.Sanitize(d.interactStartElbow)) fixed++;
+        if (w.interactStartHandRot.Sanitize(d.interactStartHandRot)) fixed++;
+        if (w.interactStartForearmRot.Sanitize(d.interactStartForearmRot)) fixed++;
         fixF(w.wallPush, d.wallPush); fixF(w.wallPoseAmount, d.wallPoseAmount); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
         fixF(w.aimRecoilScale, d.aimRecoilScale); fixF(w.aimKickScale, d.aimKickScale); fixF(w.aimSpreadMult, d.aimSpreadMult); fixF(w.hipSpreadMult, d.hipSpreadMult);
     }
@@ -4500,6 +4523,8 @@ void ModMain::LoadWeapons()
         ReadPose(n, "interact_start_", w.interactStart, PoseOffset());
         ReadPose(n, "interact_start_shoulder_", w.interactStartShoulder, PoseOffset());
         ReadPose(n, "interact_start_elbow_", w.interactStartElbow, PoseOffset());
+        ReadPose(n, "interact_start_hand_", w.interactStartHandRot, PoseOffset());
+        ReadPose(n, "interact_start_forearm_", w.interactStartForearmRot, PoseOffset());
         {
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
@@ -4546,6 +4571,8 @@ void ModMain::SaveWeapons()
         WritePose(n, "interact_start_", kv.second.interactStart);
         WritePose(n, "interact_start_shoulder_", kv.second.interactStartShoulder);
         WritePose(n, "interact_start_elbow_", kv.second.interactStartElbow);
+        WritePose(n, "interact_start_hand_", kv.second.interactStartHandRot);
+        WritePose(n, "interact_start_forearm_", kv.second.interactStartForearmRot);
         n.append_attribute("interact_hand_off") = kv.second.interactHandOff;
     }
     const fs::path path = GetWeaponsPath();
@@ -4809,6 +4836,8 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_start_z", &s.interactStartZ, s.interactStartZ, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, up (m)");
     RegisterPoseCVars(s.interactStartShoulder, "interact_start_shoulder_", "hand off the weapon - shoulder moved while the hand is up");
     RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up");
+    RegisterPoseCVars(s.interactStartHandRot, "interact_start_hand_", "hand off the weapon - the hand's orientation at the spot (rotation only)");
+    RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up (rotation only)");
     REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
@@ -5994,6 +6023,12 @@ void ModMain::DrawInteractTab()
             SliderCm("Elbow right / left##hel", s.interactStartElbow.posX, 40.0f, "The forearm joint moved; the arm IK may re-solve it.");
             SliderCm("Elbow forward / back##hel", s.interactStartElbow.posY, 40.0f, nullptr);
             SliderCm("Elbow up / down##hel", s.interactStartElbow.posZ, 40.0f, nullptr);
+            SliderDeg("Hand pitch at the spot##hhr", s.interactStartHandRot.pitch, 180.0f, "The hand's orientation as it comes up (view space); the pose blends from it instead of from the off-screen animated hand.");
+            SliderDeg("Hand yaw at the spot##hhr", s.interactStartHandRot.yaw, 180.0f, nullptr);
+            SliderDeg("Hand roll at the spot##hhr", s.interactStartHandRot.roll, 180.0f, nullptr);
+            SliderDeg("Forearm pitch##hfr", s.interactStartForearmRot.pitch, 90.0f, "Forearm rotation about its own axes while the hand is up (the hand keeps its orientation).");
+            SliderDeg("Forearm yaw##hfr", s.interactStartForearmRot.yaw, 90.0f, nullptr);
+            SliderDeg("Forearm roll##hfr", s.interactStartForearmRot.roll, 90.0f, nullptr);
             ImGui::TextDisabled("plus, for %s only:", m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
             ch |= SliderCm("Shoulder right / left##wsh2", w.interactStartShoulder.posX, 40.0f, nullptr);
             ch |= SliderCm("Shoulder forward / back##wsh2", w.interactStartShoulder.posY, 40.0f, nullptr);
@@ -6001,7 +6036,13 @@ void ModMain::DrawInteractTab()
             ch |= SliderCm("Elbow right / left##wel2", w.interactStartElbow.posX, 40.0f, nullptr);
             ch |= SliderCm("Elbow forward / back##wel2", w.interactStartElbow.posY, 40.0f, nullptr);
             ch |= SliderCm("Elbow up / down##wel2", w.interactStartElbow.posZ, 40.0f, nullptr);
-            if (ImGui::Button("Reset this weapon's arm##sw2")) { w.interactStartShoulder.Reset(); w.interactStartElbow.Reset(); ch = true; }
+            ch |= SliderDeg("Hand pitch at the spot##whr", w.interactStartHandRot.pitch, 180.0f, nullptr);
+            ch |= SliderDeg("Hand yaw at the spot##whr", w.interactStartHandRot.yaw, 180.0f, nullptr);
+            ch |= SliderDeg("Hand roll at the spot##whr", w.interactStartHandRot.roll, 180.0f, nullptr);
+            ch |= SliderDeg("Forearm pitch##wfr", w.interactStartForearmRot.pitch, 90.0f, nullptr);
+            ch |= SliderDeg("Forearm yaw##wfr", w.interactStartForearmRot.yaw, 90.0f, nullptr);
+            ch |= SliderDeg("Forearm roll##wfr", w.interactStartForearmRot.roll, 90.0f, nullptr);
+            if (ImGui::Button("Reset this weapon's arm##sw2")) { w.interactStartShoulder.Reset(); w.interactStartElbow.Reset(); w.interactStartHandRot.Reset(); w.interactStartForearmRot.Reset(); ch = true; }
             const char* handOff[] = { "on the weapon (blend from the animated hand)", "off the weapon (come up from the spot)", "auto (IK weight / where the animated hand is)" };
             ImGui::SetNextItemWidth(320);
             if (ImGui::Combo("Support hand for this weapon", &w.interactHandOff, handOff, 3)) ch = true;

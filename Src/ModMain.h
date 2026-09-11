@@ -296,6 +296,8 @@ struct ViewmodelSettings
     float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
     PoseOffset interactStartShoulder;   //!< with the hand off the weapon: the shoulder (upper-arm joint) moved by this while the hand is up (view space, m) - the animated arm hangs somewhere else
     PoseOffset interactStartElbow;      //!< ... and the elbow (forearm joint); the arm IK may re-solve it
+    PoseOffset interactStartHandRot;    //!< ... the hand's orientation at the spot (view space, deg): the pose blends from this instead of the animated hand. Position unused.
+    PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (about its own axes, deg). Position unused.
     int   meleeLowerEase = 4;
     int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
 
@@ -590,6 +592,8 @@ struct WeaponSettings
     PoseOffset interactStart;       //!< This weapon's own "hand comes up from here" spot (view space, m), replaces the global one when non-zero. Rotation unused.
     PoseOffset interactStartShoulder; //!< ... and its shoulder offset (added to the global one). Rotation unused.
     PoseOffset interactStartElbow;    //!< ... and its elbow offset (added to the global one). Rotation unused.
+    PoseOffset interactStartHandRot;  //!< ... the hand's orientation at the spot (added to the global one, deg). Position unused.
+    PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (added to the global one, deg). Position unused.
     int interactHandOff = 2;        //!< Is the support hand off the weapon (animated out of view)? 0 no, 1 yes, 2 auto (from the left IK weight and where the animated hand is). Decides whether the hand comes up from the hidden spot.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 

@@ -480,6 +480,10 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.4: hand off the weapon - orientation too: the wrist blends from the spot's orientation
+  (`vm_interact_start_hand_*`, per weapon `interact_start_hand_*`) instead of from the off-screen animated hand,
+  and an extra forearm rotation while the hand is up (`vm_interact_start_forearm_*`, per weapon
+  `interact_start_forearm_*`) on top of the per-weapon twist. `hiddenStartUsed` is decided before the pose push.
 * 3.11.3: the own operator queue crashed on its second frame ("Pure function call"): the reference handed to
   `PushPoseModifier` is consumed, see "What does not work". One extra reference per push.
 * 3.11.2: the hand before the first weapon (own operator queue, above). The 1.5 m sanity limit on the additive
