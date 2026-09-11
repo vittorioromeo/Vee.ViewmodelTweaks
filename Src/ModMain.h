@@ -290,10 +290,14 @@ struct ViewmodelSettings
     float meleeImpulseScale = 1.0f; //!< ... and scale it
     PoseOffset meleeLower = MeleeLowerDefault(); //!< the equipped weapon is moved / tilted by this while the punch plays (hip pose, view space m / deg)
     static PoseOffset MeleeLowerDefault() { PoseOffset p; p.posX = 0.03f; p.posY = -0.04f; p.posZ = -0.06f; p.pitch = -12.0f; p.yaw = 6.0f; p.roll = 8.0f; return p; }
-    float meleeLowerTime = 0.12f;   //!< seconds to blend the lowering in (windup) and out (return)
+    float meleeLowerTime = 0.18f;   //!< seconds to blend the lowering in (windup) and out (return)
     float interactCarryHoldTime = 0.15f; //!< carrying: the key has to be held this long before the grab starts (a tap does nothing)
     int   interactHiddenStart = 1;  //!< when the support hand is not on the weapon (one-handed weapons, no weapon), the hand comes up from a fixed spot below the view instead of from wherever the animation has it
     float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
+    PoseOffset interactStartShoulder;   //!< with the hand off the weapon: the shoulder (upper-arm joint) moved by this while the hand is up (view space, m) - the animated arm hangs somewhere else
+    PoseOffset interactStartElbow;      //!< ... and the elbow (forearm joint); the arm IK may re-solve it
+    int   meleeLowerEase = 4;
+    int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -516,6 +520,8 @@ struct InteractState
     float meleeCooldownLeft = 0.0f;
     float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
+    bool ownQueueUsed = false;      //!< the game's context did not run last frame: our own pose modifier carried the pushes
+    int ownQueuePushes = 0;
     bool meleeSoundWarned = false;
     bool meleeHitInProgress = false; //!< inside our OnHit call (the impulse hook looks at this)
     float meleeLowerBlend = 0.0f;   //!< 0..1: the equipped weapon's lowering
@@ -582,6 +588,8 @@ struct WeaponSettings
     PoseOffset interactRest;        //!< Where this weapon's resting / hovering hand waits, relative to the resting spot (position, m, view space; rotation unused).
     PoseOffset interactForearm;     //!< Extra rotation of the left forearm (about its own axes, degrees) while the hand is posed; the hand keeps its own orientation. Position unused.
     PoseOffset interactStart;       //!< This weapon's own "hand comes up from here" spot (view space, m), replaces the global one when non-zero. Rotation unused.
+    PoseOffset interactStartShoulder; //!< ... and its shoulder offset (added to the global one). Rotation unused.
+    PoseOffset interactStartElbow;    //!< ... and its elbow offset (added to the global one). Rotation unused.
     int interactHandOff = 2;        //!< Is the support hand off the weapon (animated out of view)? 0 no, 1 yes, 2 auto (from the left IK weight and where the animated hand is). Decides whether the hand comes up from the hidden spot.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
@@ -973,6 +981,15 @@ private:
     bool m_interactReentry = false;     //!< our own deferred Interact call is running: let it through
     void UpdateInteract(float dt);      //!< timeline + deferred call countdown (MainUpdate)
     void FireDeferredInteract();        //!< makes the stored Interact call (UpdateBeforeSystem)
+    //! Before the first weapon has ever been equipped the game's procedural weapon context does not exist (a weapon
+    //! procedural clip creates it), so nothing carries our pushes: our own operator queue does, handed to the
+    //! skeleton the way the context does it. Only while the context did not run last frame.
+    void PushWithOwnQueue();
+    void* m_ownQueue = nullptr;         //!< IAnimationOperatorQueue* (the object)
+    void* m_ownQueueCtrl = nullptr;     //!< its std::shared_ptr control block
+    void* m_ownQueuePM = nullptr;       //!< the same object as IAnimationPoseModifier* (QueryInterface), what PushPoseModifier takes
+    bool m_ownQueueTried = false;
+    bool m_ownQueueBroken = false;      //!< a check failed once: never again this session
     //! Skeleton-side: pushes the additive offset of the support hand's IK target for this frame.
     void PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& camAbs);
     //! Best model-space camera for the frame being animated (see OnProceduralContextUpdated).

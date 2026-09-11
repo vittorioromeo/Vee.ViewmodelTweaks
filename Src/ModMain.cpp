@@ -457,6 +457,7 @@ static bool ArkPlayerCarry_StartCarrying_Hook(ArkPlayerCarry* const _this, IEnti
 //---------------------------------------------------------------------------------
 // Helpers
 //---------------------------------------------------------------------------------
+static float EaseCurve(int mode, float u); // below
 static inline float SmoothStep01(float t)
 {
     t = clamp_tpl(t, 0.0f, 1.0f);
@@ -603,7 +604,7 @@ void ModMain::ApplyOffset(QuatT& offset) const
         total.AddScaled(m_feel.dragHipOut, 1.0f - ab);
     // Quick melee: the weapon drops out of the way while the punch plays.
     if (m_interact.meleeLowerBlend > 0.0f && SanePose(s.meleeLower))
-        total.AddScaled(s.meleeLower, SmoothStep01(m_interact.meleeLowerBlend));
+        total.AddScaled(s.meleeLower, EaseCurve(s.meleeLowerEase, clamp_tpl(m_interact.meleeLowerBlend, 0.0f, 1.0f)));
 
     // Reloads: the support hand is animated in place (shells, magazines) against where the weapon is in
     // the stock pose, so everything that moves the weapon fades out for the duration and comes back after.
@@ -2303,7 +2304,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         // hand does not pop back to the animation for a frame). Next frame's read-back minus that is then the
         // pure animation, and the chain starts clean. The closed loop starts over as well.
         Vec3 repeat = I.lastReach;
-        if (!Finite(repeat) || repeat.GetLengthSquared() > 1.5f * 1.5f)
+        if (!Finite(repeat) || repeat.GetLengthSquared() > 3.0f * 3.0f)
             repeat = Vec3(ZERO);
         if (repeat.GetLengthSquared() > 0.0f)
             VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, joint, OP_ADDITIVE, &repeat);
@@ -2529,13 +2530,42 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         const Quat rotView = Quat::CreateRotationXYZ(Ang3(DEG2RAD(st.pitch * curve), DEG2RAD(st.roll * curve), DEG2RAD(st.yaw * curve)));
         add.q = SafeNormalized(camReach.q * rotView * (!camReach.q)); // the same rotation expressed in model space
     }
-    if (!Finite(add.t) || add.t.GetLengthSquared() > 1.5f * 1.5f || !SaneQuat(add.q))
+    // (3 m: with the support hand animated off screen - one-handed weapons, no weapon - the additive from there to a
+    // punch 75 cm ahead is well over 1.5 m; the old limit dropped the push for a frame at the apex, and the hand
+    // popped to the animation and back.)
+    if (!Finite(add.t) || add.t.GetLengthSquared() > 3.0f * 3.0f || !SaneQuat(add.q))
     {
         noReachThisFrame();
         m_nanRecoveries++;
         return;
     }
     VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, joint, OP_ADDITIVE, &add.t);
+    // Hand off the weapon (one-handed weapon, no weapon): the animated arm hangs somewhere off screen, and the IK
+    // solving from that shoulder to a target in view gives a crooked, over-stretched arm. The shoulder (and,
+    // rig permitting, the elbow) is moved to where a hand held up in view would have it - global spot plus the
+    // weapon's own - for as long as the hand is up.
+    if (I.hiddenStartUsed)
+    {
+        const float k = max(max(curve, wind), rest);
+        Vec3 sh(s.interactStartShoulder.posX, s.interactStartShoulder.posY, s.interactStartShoulder.posZ);
+        Vec3 el(s.interactStartElbow.posX, s.interactStartElbow.posY, s.interactStartElbow.posZ);
+        if (const WeaponSettings* pW = InteractWeaponEntry(); pW)
+        {
+            if (SanePose(pW->interactStartShoulder)) sh += pW->interactStartShoulder.Pos();
+            if (SanePose(pW->interactStartElbow)) el += pW->interactStartElbow.Pos();
+        }
+        if (k > 0.0f && R.leftUpperArm >= 0 && sh.GetLengthSquared() > 1e-8f)
+        {
+            const Vec3 off = camReach.q * (sh * k);
+            if (Finite(off)) VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, R.leftUpperArm, OP_ADDITIVE, &off);
+        }
+        const int forearm = R.leftSubtreeParent.empty() ? -1 : R.leftSubtreeParent[0];
+        if (k > 0.0f && forearm >= 0 && el.GetLengthSquared() > 1e-8f)
+        {
+            const Vec3 off = camReach.q * (el * k);
+            if (Finite(off)) VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushPosition, forearm, OP_ADDITIVE, &off);
+        }
+    }
     // The windup's shoulder / elbow / forearm: additive on the arm joints (the limb IK re-solves the arm from the
     // moved shoulder; whether it keeps a moved elbow is the rig's call), scaled by the windup and, optionally,
     // kept through the strike.
@@ -2939,7 +2969,7 @@ void ModMain::UpdateArmsVisibility()
     const unsigned flags = CEntity::FGetSlotFlags(pCEnt, 0);
     I.slotFlagsNow = flags;
     const bool hiddenState = I.unarmed || I.examining;           // states in which the game keeps the arms out of sight
-    const bool reachActive = (I.phase != InteractState::Idle && I.curve > 0.001f) || I.restBlend > 0.001f;
+    const bool reachActive = (I.phase != InteractState::Idle && (I.curve > 0.001f || I.wind > 0.001f)) || I.restBlend > 0.001f;
     const bool want = s.interactShowArms && hiddenState && reachActive && Active() && s.interactEnabled;
     constexpr unsigned ENTITY_SLOT_RENDER_FLAG = 1u;
     if (want && !I.armsForced && !(flags & ENTITY_SLOT_RENDER_FLAG))
@@ -3660,6 +3690,8 @@ void ModMain::SanitizeSettings()
     fixStyle(s.pressExam, def.pressExam);
     fixStyle(s.punch, def.punch);
     if (s.meleeLower.Sanitize(def.meleeLower)) fixed++;
+    if (s.interactStartShoulder.Sanitize(def.interactStartShoulder)) fixed++;
+    if (s.interactStartElbow.Sanitize(def.interactStartElbow)) fixed++;
     fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
@@ -3681,6 +3713,8 @@ void ModMain::SanitizeSettings()
         if (w.interactRest.Sanitize(d.interactRest)) fixed++;
         if (w.interactForearm.Sanitize(d.interactForearm)) fixed++;
         if (w.interactStart.Sanitize(d.interactStart)) fixed++;
+        if (w.interactStartShoulder.Sanitize(d.interactStartShoulder)) fixed++;
+        if (w.interactStartElbow.Sanitize(d.interactStartElbow)) fixed++;
         fixF(w.wallPush, d.wallPush); fixF(w.wallPoseAmount, d.wallPoseAmount); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
         fixF(w.aimRecoilScale, d.aimRecoilScale); fixF(w.aimKickScale, d.aimKickScale); fixF(w.aimSpreadMult, d.aimSpreadMult); fixF(w.hipSpreadMult, d.hipSpreadMult);
     }
@@ -4464,6 +4498,8 @@ void ModMain::LoadWeapons()
         ReadPose(n, "interact_rest_", w.interactRest, PoseOffset());
         ReadPose(n, "interact_forearm_", w.interactForearm, PoseOffset());
         ReadPose(n, "interact_start_", w.interactStart, PoseOffset());
+        ReadPose(n, "interact_start_shoulder_", w.interactStartShoulder, PoseOffset());
+        ReadPose(n, "interact_start_elbow_", w.interactStartElbow, PoseOffset());
         {
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
@@ -4508,6 +4544,8 @@ void ModMain::SaveWeapons()
         WritePose(n, "interact_rest_", kv.second.interactRest);
         WritePose(n, "interact_forearm_", kv.second.interactForearm);
         WritePose(n, "interact_start_", kv.second.interactStart);
+        WritePose(n, "interact_start_shoulder_", kv.second.interactStartShoulder);
+        WritePose(n, "interact_start_elbow_", kv.second.interactStartElbow);
         n.append_attribute("interact_hand_off") = kv.second.interactHandOff;
     }
     const fs::path path = GetWeaponsPath();
@@ -4769,6 +4807,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_start_x", &s.interactStartX, s.interactStartX, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, right (m)");
     REGISTER_CVAR2("vm_interact_start_y", &s.interactStartY, s.interactStartY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, forward (m)");
     REGISTER_CVAR2("vm_interact_start_z", &s.interactStartZ, s.interactStartZ, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, up (m)");
+    RegisterPoseCVars(s.interactStartShoulder, "interact_start_shoulder_", "hand off the weapon - shoulder moved while the hand is up");
+    RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up");
+    REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
+    REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
     REGISTER_CVAR2("vm_world_fov_enabled", &s.worldFovEnabled, s.worldFovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the game's horizontal FOV, cl_hfov (0/1)");
     REGISTER_CVAR2("vm_world_fov", &s.worldFov, s.worldFov, VF_DUMPTOCHAIR, "Viewmodel Tweaks: horizontal FOV in degrees");
@@ -4971,6 +5013,137 @@ void ModMain::UpdateBeforeSystem(unsigned updateFlags)
     // A deferred interaction is made here, before the game's own update, i.e. in the same window the
     // input-driven call would normally happen in.
     FireDeferredInteract();
+    // No weapon animation context yet (nothing ever equipped) -> our own pose modifier carries the hand.
+    PushWithOwnQueue();
+}
+
+// CryCreateClassInstance(const char* className, std::shared_ptr<T>& out) - the factory the game's own procedural
+// context uses for its operator queue ("AnimationPoseModifier_OperatorQueue", CProceduralWeaponAnimationContext::
+// Initialize at 0x17D5B88).
+static auto s_fnCryCreateClassInstance = PreyFunction<bool(const char* className, void* pSharedPtrOut)>(0x2C3530);
+// IAnimationPoseModifier IID the context passes to the queue's QueryInterface (slot 2) before PushPoseModifier
+// (0x17D4E95 -> .rdata 0x1CE6508).
+static const unsigned char s_iidAnimationPoseModifier[16] = { 0x7f, 0x44, 0x42, 0x5e, 0x75, 0x47, 0xfe, 0x22, 0x49, 0xf4, 0x9a, 0xd3, 0x4e, 0x27, 0xb6, 0xba };
+
+// A pointer that can be read and whose first word (the vtable) points into the game module. Under SEH.
+static bool LooksLikeGameObject(const void* p, uintptr_t moduleBase, uintptr_t moduleEnd)
+{
+    if (!p || (uintptr_t)p < 0x10000 || (uintptr_t)p > 0x00007FFFFFFFFFFFull)
+        return false;
+    __try
+    {
+        const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(p);
+        return vt >= moduleBase && vt < moduleEnd;
+    }
+    __except (1)
+    {
+        return false;
+    }
+}
+
+static bool SafePushPoseModifier(void* pSkelAnim, size_t slot, unsigned layer, const void* pSharedPtr, const char* name)
+{
+    using Fn = void (*)(void*, unsigned, const void*, const char*);
+    Fn fn = reinterpret_cast<Fn>((*reinterpret_cast<void***>(pSkelAnim))[slot]);
+    __try
+    {
+        fn(pSkelAnim, layer, pSharedPtr, name);
+        return true;
+    }
+    __except (1)
+    {
+        return false;
+    }
+}
+
+void ModMain::PushWithOwnQueue()
+{
+    using namespace PreyInternals;
+    InteractState& I = m_interact;
+    const ViewmodelSettings& s = m_settings;
+    I.ownQueueUsed = false;
+    if (!s.interactNoContextFallback || m_ownQueueBroken || !Active() || !s.interactEnabled || !m_offsetHookActive || m_playerDead)
+        return;
+    // Only when the game's context did not run last frame: otherwise it carries our pushes (and a second modifier
+    // would apply them twice).
+    if (m_diag.ctxUpdatesLastFrame > 0)
+        return;
+    // Anything to push at all? (The reach, the resting hand, a pose being edited.)
+    const bool wanted = I.phase != InteractState::Idle || I.restBlend > 0.0f || I.holdMode != 0 || I.restActive;
+    if (!wanted)
+        return;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    IEntity* pEnt = pPlayer ? pPlayer->GetEntity() : nullptr;
+    ICharacterInstance* pChar = pEnt ? pEnt->GetCharacter(0) : nullptr;
+    if (!pChar)
+        return;
+    const uintptr_t base = GetModuleBase();
+    const uintptr_t end = base + 0x4000000; // PreyDll is ~48 MB; anything within 64 MB of the base is "in the module"
+    if (!base)
+        return;
+
+    if (!m_ownQueue && !m_ownQueueTried)
+    {
+        m_ownQueueTried = true;
+        struct { void* ptr; void* ctrl; } sp = { nullptr, nullptr };
+        if (s_fnCryCreateClassInstance("AnimationPoseModifier_OperatorQueue", &sp) && sp.ptr && sp.ctrl)
+        {
+            if (!LooksLikeGameObject(sp.ptr, base, end))
+            {
+                CryLog("ViewmodelTweaks: own operator queue - the created object does not look like one ({}), fallback disabled", sp.ptr);
+                m_ownQueueBroken = true;
+                return;
+            }
+            void* pm = VCall<void*>(sp.ptr, 2, (const void*)s_iidAnimationPoseModifier); // ICryUnknown::QueryInterface
+            if (!LooksLikeGameObject(pm, base, end))
+            {
+                CryLog("ViewmodelTweaks: own operator queue - QueryInterface gave {} for the pose-modifier interface (object {}), fallback disabled", pm, sp.ptr);
+                m_ownQueueBroken = true;
+                return;
+            }
+            m_ownQueue = sp.ptr;
+            m_ownQueueCtrl = sp.ctrl; // kept for the life of the DLL (one small object)
+            m_ownQueuePM = pm;
+            CryLog("ViewmodelTweaks: created our own AnimationPoseModifier_OperatorQueue ({}), pose-modifier interface {} - carries the hand while the game's weapon animation context does not exist", m_ownQueue, m_ownQueuePM);
+        }
+        else
+        {
+            CryLog("ViewmodelTweaks: could not create an AnimationPoseModifier_OperatorQueue - no hand until a weapon has been equipped once");
+            m_ownQueueBroken = true;
+            return;
+        }
+    }
+    if (!m_ownQueue || !m_ownQueuePM)
+        return;
+
+    // Same thing the game's context does every frame: hand the queue to the skeleton (layer 6, named), clear it,
+    // then fill it.
+    void* pSkelAnim = VCall<void*>(pChar, 0x28 / 8);
+    void* pSkelPose = VCall<void*>(pChar, VT_ICharacterInstance_GetISkeletonPose);
+    if (!pSkelAnim || !pSkelPose || !LooksLikeGameObject(pSkelAnim, base, end))
+        return;
+    struct { void* ptr; void* ctrl; } spPM = { m_ownQueuePM, m_ownQueueCtrl };
+    if (!SafePushPoseModifier(pSkelAnim, 0x120 / 8, 6u, &spPM, "ProceduralWeapon"))
+    {
+        CryLog("ViewmodelTweaks: own operator queue - PushPoseModifier faulted, fallback disabled");
+        m_ownQueueBroken = true;
+        return;
+    }
+    VCall<void>(m_ownQueue, 0x70 / 8); // the queue's Clear() - what the context calls right after pushing the modifier
+
+    // The context's joint ids are what the pushes address; without the context they come from the skeleton by name.
+    if (m_lock.leftIkJoint < 0)
+    {
+        void* pSkel = VCall<void*>(pChar, VT_ICharacterInstance_GetIDefaultSkeleton);
+        if (pSkel)
+            m_lock.leftIkJoint = VCall<int>(pSkel, VT_IDefaultSkeleton_GetJointIDByName, "l_hand_spine_target");
+    }
+    QuatT camAbs(IDENTITY);
+    if (!PredictCamera(pPlayer, camAbs))
+        return;
+    PushInteractReach(m_ownQueue, pSkelPose, camAbs);
+    I.ownQueueUsed = true;
+    I.ownQueuePushes++;
 }
 
 void ModMain::MainUpdate(unsigned updateFlags)
@@ -5673,6 +5846,8 @@ void ModMain::DrawInteractTab()
             SliderDeg("Yaw##ml", s.meleeLower.yaw, 60.0f, nullptr);
             SliderDeg("Roll##ml", s.meleeLower.roll, 60.0f, nullptr);
             ImGui::SliderFloat("Blend time##ml", &s.meleeLowerTime, 0.02f, 0.5f, "%.2f s");
+            const char* lowerEases[] = { "Linear", "Smooth", "Ease out (fast start)", "Ease in (slow start)", "Ease in-out" };
+            ImGui::Combo("Easing##ml", &s.meleeLowerEase, lowerEases, 5);
             ImGui::TextDisabled("now %.2f", I.meleeLowerBlend);
             ImGui::TreePop();
         }
@@ -5805,6 +5980,21 @@ void ModMain::DrawInteractTab()
             ch |= SliderCm("Forward##sw", w.interactStart.posY, 80.0f, nullptr);
             ch |= SliderCm("Up / down##sw", w.interactStart.posZ, 100.0f, nullptr);
             if (ImGui::Button("Reset this weapon's spot##sw")) { w.interactStart.Reset(); ch = true; }
+            ImGui::TextDisabled("Arm while the hand is up (the animated arm hangs elsewhere - move the shoulder to where it would be)");
+            SliderCm("Shoulder right / left##hsh", s.interactStartShoulder.posX, 40.0f, "The upper-arm joint moved (view space) while the hand is up, hand off the weapon only. The arm is re-solved from there.");
+            SliderCm("Shoulder forward / back##hsh", s.interactStartShoulder.posY, 40.0f, nullptr);
+            SliderCm("Shoulder up / down##hsh", s.interactStartShoulder.posZ, 40.0f, nullptr);
+            SliderCm("Elbow right / left##hel", s.interactStartElbow.posX, 40.0f, "The forearm joint moved; the arm IK may re-solve it.");
+            SliderCm("Elbow forward / back##hel", s.interactStartElbow.posY, 40.0f, nullptr);
+            SliderCm("Elbow up / down##hel", s.interactStartElbow.posZ, 40.0f, nullptr);
+            ImGui::TextDisabled("plus, for %s only:", m_currentWeaponClass.empty() ? "no weapon" : m_currentWeaponClass.c_str());
+            ch |= SliderCm("Shoulder right / left##wsh2", w.interactStartShoulder.posX, 40.0f, nullptr);
+            ch |= SliderCm("Shoulder forward / back##wsh2", w.interactStartShoulder.posY, 40.0f, nullptr);
+            ch |= SliderCm("Shoulder up / down##wsh2", w.interactStartShoulder.posZ, 40.0f, nullptr);
+            ch |= SliderCm("Elbow right / left##wel2", w.interactStartElbow.posX, 40.0f, nullptr);
+            ch |= SliderCm("Elbow forward / back##wel2", w.interactStartElbow.posY, 40.0f, nullptr);
+            ch |= SliderCm("Elbow up / down##wel2", w.interactStartElbow.posZ, 40.0f, nullptr);
+            if (ImGui::Button("Reset this weapon's arm##sw2")) { w.interactStartShoulder.Reset(); w.interactStartElbow.Reset(); ch = true; }
             const char* handOff[] = { "on the weapon (blend from the animated hand)", "off the weapon (come up from the spot)", "auto (IK weight / where the animated hand is)" };
             ImGui::SetNextItemWidth(320);
             if (ImGui::Combo("Support hand for this weapon", &w.interactHandOff, handOff, 3)) ch = true;
@@ -5925,9 +6115,11 @@ void ModMain::DrawInteractTab()
             LogHandJoints();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Writes the first-person arms' hand / arm / IK joint names to the game log.");
         ImGui::Text("State");
-        ImGui::TextDisabled("%s%s%s, arms slot flags 0x%X%s, game context ran last frame: %s", I.unarmed ? "no weapon" : "weapon out",
+        ImGui::TextDisabled("%s%s%s, arms slot flags 0x%X%s, game context ran last frame: %s%s", I.unarmed ? "no weapon" : "weapon out",
             I.examining ? ", on a screen" : "", I.bodyShiftActive ? " (body brought to the camera)" : "", I.slotFlagsNow, I.armsForced ? " (arms shown by us)" : "",
-            m_diag.ctxUpdatesLastFrame > 0 ? "yes" : "no");
+            m_diag.ctxUpdatesLastFrame > 0 ? "yes" : "no", I.ownQueueUsed ? " -> our own pose modifier" : (m_ownQueueBroken ? " (own pose modifier disabled after a failed check)" : ""));
+        CheckboxInt("Before any weapon was equipped: drive the hand with our own pose modifier", s.interactNoContextFallback,
+            "The game's weapon animation context, which carries our pushes, is only created when a weapon is first equipped. Until then this fills in.");
         if (I.bodyShiftActive)
             ImGui::TextDisabled("camera is %.2f m from the head (%.2f %.2f %.2f)", I.bodyShift.GetLength(), I.bodyShift.x, I.bodyShift.y, I.bodyShift.z);
         if (I.examCursorValid)

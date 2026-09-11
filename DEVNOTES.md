@@ -235,7 +235,21 @@ Version notes at the end.
   weapon with the arm solved by the rig. The left weight joint is `l_hand_spine_blend` (looked up by name,
   forced to 1 during a reach).
 * The context keeps running with **no weapon out** (the hidden arms are still animated), and it keeps running
-  on screens. So one queue serves every state; the "own operator queue" fallback (below) is never needed.
+  on screens - *once it exists*. It is a mannequin procedural context ("ProceduralWeaponAnimationContext",
+  `TProceduralContextualClip::GetContextName` at `0x17D36D0`), created by the first weapon procedural clip that
+  runs, i.e. the first time a weapon is equipped: on a fresh game, before the wrench, there is no context and
+  no `Update` to hook, and nothing carried our pushes (3.11.1). **No weapon animation context yet**: 3.11.2
+  drives the hand with our own queue in that window (`PushWithOwnQueue`, from `UpdateBeforeSystem`, only while
+  `ctxUpdatesLastFrame == 0`): `CryCreateClassInstance("AnimationPoseModifier_OperatorQueue", &sp)`
+  (`0x2C3530`, `std::shared_ptr` {ptr, ctrl}), the pose-modifier interface via `QueryInterface` (slot 2, IID
+  `7f44425e-7547-fe22-49f4-9ad34e27b6ba`), then every frame what the context does at `0x17D4E86`-`0x17D4F9F`:
+  `ISkeletonAnim::PushPoseModifier(layer 6, shared_ptr&, "ProceduralWeapon")` (slot 36), the queue's
+  `Clear()` (slot 14), then the pushes; the left IK joint by name (`l_hand_spine_target`). Also seen there:
+  `CProceduralWeaponAnimationContext::Initialize` is really `0x17D5B50` (`m_instanceCount++`, then the
+  once-only part at `0x17D5B60`: store the *IScope* at `+0x38`, `scope->GetCharInst()` (slot 3), create the
+  queue, resolve the three joints), and `Update` calls `m_pScope->GetCharInst()` before anything else - a
+  context cannot be initialised without a real scope, which is why the own queue and not a hand-made
+  Initialize.
 * `IAnimationOperatorQueue` vtable: `PushPosition` slot 8 (`+0x40`), `PushOrientation` slot 9 (`+0x48`);
   ops 0 = Override, 1 = OverrideRelative, 3 = Additive. Positions are model space.
 * **A position pushed on a joint travels down to its children.** Pushing the same shift on the root moves the
@@ -425,11 +439,10 @@ Version notes at the end.
   shown, but the ImGui frame is live every frame (`NewFrame` in `ChairImGui::UpdateBeforeSystem`, `Render`
   at `RenderEnd`), so `ImGui::GetForegroundDrawList()` from `MainUpdate` is the way to draw overlays
   (`DrawInteractMarkers`).
-* Own `AnimationPoseModifier_OperatorQueue` (`CryCreateClassInstance` `0x2C3530` into an MSVC
-  `std::shared_ptr` {ptr, ctrl}; `QueryInterface` slot 2 with IID `7f44425e-7547-fe22-49f4-9ad34e27b6ba`;
-  `ISkeletonAnim::PushPoseModifier` layer 6): the pointer from `QueryInterface` was not a valid object and
-  `PushPoseModifier` read its vtable at -1 (`+0x83A114`, crash on a keypad). Not needed anyway: the game's
-  context runs without a weapon. `vm_interact_own_queue` stays 0.
+* Own `AnimationPoseModifier_OperatorQueue` - *retried in 3.11.2*, see "No weapon animation context yet" in
+  the rig section. The 3.8.2 attempt crashed (`PushPoseModifier` read at -1); the retry mirrors the game's call
+  sequence exactly and checks every pointer (vtable inside the module, SEH around the push) before trusting it,
+  disabling itself for the session on the first failed check.
 * Render-side body shift (writing the abs buffer after the camera is final, 3.8.1-3.9.2): inconsistent with
   the read-back, see rule 5.
 * Every-joint body shift: multiplies down the hierarchy, see "The rig".
@@ -463,6 +476,11 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.2: the hand before the first weapon (own operator queue, above). The 1.5 m sanity limit on the additive
+  dropped the push for a frame at the apex of a punch from an off-screen hand (hand popped to the animation and
+  back): 3 m now. Arms are shown during the windup too (`reachActive` includes `wind`). Hand off the weapon: a
+  shoulder / elbow offset (global + per weapon) applied while the hand is up, so the IK does not solve the arm
+  from wherever the one-handed animation left the shoulder. Weapon lowering eased (`vm_melee_lower_ease`).
 * 3.11.1: the one-handed flag was not reaching `SupportHandOffWeapon()`: the user's weapons file has an entry
   for every weapon, and those entries read the new attribute as "auto", so the built-in answer never applied.
   A missing attribute now takes the built-in value on load, and "auto" consults the built-in table before the
