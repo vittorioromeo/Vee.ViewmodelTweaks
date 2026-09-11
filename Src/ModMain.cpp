@@ -5041,6 +5041,8 @@ static bool LooksLikeGameObject(const void* p, uintptr_t moduleBase, uintptr_t m
     }
 }
 
+extern "C" long _InterlockedIncrement(long volatile*); // compiler intrinsic
+
 static bool SafePushPoseModifier(void* pSkelAnim, size_t slot, unsigned layer, const void* pSharedPtr, const char* name)
 {
     using Fn = void (*)(void*, unsigned, const void*, const char*);
@@ -5122,7 +5124,12 @@ void ModMain::PushWithOwnQueue()
     void* pSkelPose = VCall<void*>(pChar, VT_ICharacterInstance_GetISkeletonPose);
     if (!pSkelAnim || !pSkelPose || !LooksLikeGameObject(pSkelAnim, base, end))
         return;
+    // PushPoseModifier takes the shared_ptr BY VALUE and consumes the reference it is handed (the context builds a
+    // temporary with `lock inc [ctrl+8]` and never releases it). Handing it our only reference let the skeleton
+    // drop the object at the end of the frame - the next frame's push then called a virtual on a destroyed object
+    // ("Pure function call", 3.11.2). So: one reference per push, ours stays.
     struct { void* ptr; void* ctrl; } spPM = { m_ownQueuePM, m_ownQueueCtrl };
+    _InterlockedIncrement(reinterpret_cast<long volatile*>(static_cast<char*>(m_ownQueueCtrl) + 8));
     if (!SafePushPoseModifier(pSkelAnim, 0x120 / 8, 6u, &spPM, "ProceduralWeapon"))
     {
         CryLog("ViewmodelTweaks: own operator queue - PushPoseModifier faulted, fallback disabled");

@@ -439,10 +439,14 @@ Version notes at the end.
   shown, but the ImGui frame is live every frame (`NewFrame` in `ChairImGui::UpdateBeforeSystem`, `Render`
   at `RenderEnd`), so `ImGui::GetForegroundDrawList()` from `MainUpdate` is the way to draw overlays
   (`DrawInteractMarkers`).
-* Own `AnimationPoseModifier_OperatorQueue` - *retried in 3.11.2*, see "No weapon animation context yet" in
-  the rig section. The 3.8.2 attempt crashed (`PushPoseModifier` read at -1); the retry mirrors the game's call
-  sequence exactly and checks every pointer (vtable inside the module, SEH around the push) before trusting it,
-  disabling itself for the session on the first failed check.
+* Own `AnimationPoseModifier_OperatorQueue` - works since 3.11.3, see "No weapon animation context yet" in the
+  rig section. Both earlier attempts (3.8.2 "read at -1", 3.11.2 "Pure function call" on the second push) had
+  the same cause: `ISkeletonAnim::PushPoseModifier` takes the `shared_ptr` **by value and consumes the
+  reference** (the context increments the control block's use count for the temporary it passes and never
+  releases it; MSVC x64 hands the copy to the callee), so passing our single reference let the skeleton
+  destroy the queue at the end of the frame, and the next frame's calls went through a destroyed object's
+  vtable. One `lock inc [ctrl+8]` per push fixes it; the rest (vtable-in-module checks, SEH around the push,
+  self-disable on a failed check) stays as a guard.
 * Render-side body shift (writing the abs buffer after the camera is final, 3.8.1-3.9.2): inconsistent with
   the read-back, see rule 5.
 * Every-joint body shift: multiplies down the hierarchy, see "The rig".
@@ -476,6 +480,8 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.3: the own operator queue crashed on its second frame ("Pure function call"): the reference handed to
+  `PushPoseModifier` is consumed, see "What does not work". One extra reference per push.
 * 3.11.2: the hand before the first weapon (own operator queue, above). The 1.5 m sanity limit on the additive
   dropped the push for a frame at the apex of a punch from an off-screen hand (hand popped to the animation and
   back): 3 m now. Arms are shown during the windup too (`reachActive` includes `wind`). Hand off the weapon: a
