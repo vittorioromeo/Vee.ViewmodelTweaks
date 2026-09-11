@@ -507,7 +507,10 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
-* 3.11.7: the hand blinked for a moment on the way into and out of a screen (and around weapon holster /
+* 4.0.0: the same build as 3.11.7, renumbered - the interaction animation, the resting / hovering hand, screens
+  and keypads, the rules, carrying at the apex and the quick melee together are the 4.x feature set.
+* 3.11.7: impact shake on a landed punch (`vm_melee_shake*`: decaying sine on pitch / yaw / roll in the
+  `UpdateView` post-hook, same place as the kick; scaled for enemy hits). The hand blinked for a moment on the way into and out of a screen (and around weapon holster /
   draw): the fallback queue engaged one frame after the context stopped running (a frame with no push - the
   hand at the animation) and, the frame the context ran again, both pushed (applied twice - the hand past the
   target). Now our own pose modifier carries the interaction pushes *every* frame

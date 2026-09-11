@@ -288,6 +288,10 @@ struct ViewmodelSettings
     float meleeCamKick = 3.3f;      //!< camera pitch kick (degrees, down then back) with the punch
     float meleeCamKickYaw = 1.2f;   //!< ... and yaw (degrees, to the right then back)
     float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
+    float meleeShakeAmp = 0.9f;     //!< camera shake on a landed punch (degrees, decaying)
+    float meleeShakeTime = 0.25f;   //!< ... seconds it lasts
+    float meleeShakeFreq = 18.0f;   //!< ... Hz
+    float meleeShakeEnemy = 1.5f;   //!< ... multiplier when the hit was an enemy
     int   meleeSound = 1;           //!< play a swing sound (vm_melee_sound_name) when the punch starts
     int   meleeWhileAiming = 0;     //!< allow while aiming down sights
     int   meleeImpulseFlip = 1;     //!< flip the physics impulse the wrench hit applies (objects were pulled in instead of pushed)
@@ -527,6 +531,8 @@ struct InteractState
     bool meleePending = false;      //!< a punch is playing and its hit has not landed yet
     float meleeCooldownLeft = 0.0f;
     float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
+    float meleeShakeT = -1.0f;      //!< seconds into the impact shake, < 0 = none
+    float meleeShakeScale = 1.0f;   //!< 1, or the enemy multiplier
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
     bool ownQueueUsed = false;      //!< our own pose modifier carried the pushes this frame
     int ownQueueFrame = -1;         //!< the frame (m_frameIndex) it did

@@ -1184,15 +1184,35 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         m_nanRecoveries++;
         return;
     }
-    // Quick melee: a small camera kick (pitch down, a touch of yaw) that comes and goes with the punch.
-    if (m_interact.meleeKickTime >= 0.0f && (s.meleeCamKick != 0.0f || s.meleeCamKickYaw != 0.0f))
+    // Quick melee: a small camera kick (pitch down, a touch of yaw) that comes and goes with the punch, and a
+    // decaying shake when it lands (like the wrench's).
     {
-        const float u = clamp_tpl(m_interact.meleeKickTime / max(s.meleeCamKickTime, 0.01f), 0.0f, 1.0f);
-        const float a = sinf(gf_PI * u);
-        const Quat kick = Quat::CreateRotationXYZ(Ang3(DEG2RAD(-clamp_tpl(s.meleeCamKick, -10.0f, 10.0f) * a), 0.0f, DEG2RAD(-clamp_tpl(s.meleeCamKickYaw, -10.0f, 10.0f) * a)));
-        const Quat q = SafeNormalized(params.rotation * kick);
-        if (SaneQuat(q))
-            params.rotation = q;
+        float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
+        if (m_interact.meleeKickTime >= 0.0f && (s.meleeCamKick != 0.0f || s.meleeCamKickYaw != 0.0f))
+        {
+            const float u = clamp_tpl(m_interact.meleeKickTime / max(s.meleeCamKickTime, 0.01f), 0.0f, 1.0f);
+            const float a = sinf(gf_PI * u);
+            pitch += -clamp_tpl(s.meleeCamKick, -10.0f, 10.0f) * a;
+            yaw += -clamp_tpl(s.meleeCamKickYaw, -10.0f, 10.0f) * a;
+        }
+        if (m_interact.meleeShakeT >= 0.0f && s.meleeShakeAmp != 0.0f)
+        {
+            const float len = max(s.meleeShakeTime, 0.01f);
+            const float t = m_interact.meleeShakeT;
+            const float env = clamp_tpl(1.0f - t / len, 0.0f, 1.0f);             // linear decay to zero at the end
+            const float amp = clamp_tpl(s.meleeShakeAmp, -10.0f, 10.0f) * m_interact.meleeShakeScale * env * env;
+            const float w = 2.0f * gf_PI * clamp_tpl(s.meleeShakeFreq, 1.0f, 60.0f);
+            pitch += amp * sinf(w * t);
+            yaw += amp * 0.6f * sinf(w * 1.31f * t + 1.2f);
+            roll += amp * 0.4f * sinf(w * 0.77f * t + 2.4f);
+        }
+        if (pitch != 0.0f || yaw != 0.0f || roll != 0.0f)
+        {
+            const Quat kick = Quat::CreateRotationXYZ(Ang3(DEG2RAD(pitch), DEG2RAD(roll), DEG2RAD(yaw)));
+            const Quat q = SafeNormalized(params.rotation * kick);
+            if (SaneQuat(q))
+                params.rotation = q;
+        }
     }
     const Quat entRot = SafeNormalized(pEnt->GetWorldRotation());
     Vec3 camPosRel = params.position;
@@ -1755,7 +1775,11 @@ void ModMain::DoMeleeHit()
     const ArkWrenchComponent::hitResult r = pWrench->m_wrenchComponent.OnHit(0.0f, *pW, scale, false);
     I.meleeHitInProgress = false;
     if (r != ArkWrenchComponent::hitResult::none)
+    {
         I.meleeHits++;
+        I.meleeShakeT = 0.0f; // impact: the camera shakes
+        I.meleeShakeScale = r == ArkWrenchComponent::hitResult::hitEnemy ? max(m_settings.meleeShakeEnemy, 0.0f) : 1.0f;
+    }
     if (m_settings.interactDebugMarker)
         CryLog("ViewmodelTweaks: quick melee hit - result {} (0 none, 1 hit, 2 enemy), damage scale {:.2f}", (int)r, scale);
 }
@@ -2101,6 +2125,11 @@ void ModMain::UpdateInteract(float dt)
     {
         I.meleeKickTime += dt;
         if (I.meleeKickTime > max(s.meleeCamKickTime, 0.01f)) I.meleeKickTime = -1.0f;
+    }
+    if (I.meleeShakeT >= 0.0f)
+    {
+        I.meleeShakeT += dt;
+        if (I.meleeShakeT > max(s.meleeShakeTime, 0.01f)) I.meleeShakeT = -1.0f;
     }
     // The equipped weapon's lowering: in from the windup, out from the return.
     {
@@ -3721,6 +3750,7 @@ void ModMain::SanitizeSettings()
     if (s.interactStartHandRot.Sanitize(def.interactStartHandRot)) fixed++;
     if (s.interactStartForearmRot.Sanitize(def.interactStartForearmRot)) fixed++;
     fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
+    fixF(s.meleeShakeAmp, def.meleeShakeAmp); fixF(s.meleeShakeTime, def.meleeShakeTime); fixF(s.meleeShakeFreq, def.meleeShakeFreq); fixF(s.meleeShakeEnemy, def.meleeShakeEnemy);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
     fixF(s.interactExamLeaveTime, def.interactExamLeaveTime); fixF(s.interactRestSwayPos, def.interactRestSwayPos); fixF(s.interactRestSwayRot, def.interactRestSwayRot);
@@ -4830,6 +4860,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_melee_cam_kick", &s.meleeCamKick, s.meleeCamKick, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera pitch kick (deg)");
     REGISTER_CVAR2("vm_melee_cam_kick_yaw", &s.meleeCamKickYaw, s.meleeCamKickYaw, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera yaw kick (deg)");
     REGISTER_CVAR2("vm_melee_cam_kick_time", &s.meleeCamKickTime, s.meleeCamKickTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the camera kick takes");
+    REGISTER_CVAR2("vm_melee_shake", &s.meleeShakeAmp, s.meleeShakeAmp, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera shake on a landed punch (deg)");
+    REGISTER_CVAR2("vm_melee_shake_time", &s.meleeShakeTime, s.meleeShakeTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... seconds");
+    REGISTER_CVAR2("vm_melee_shake_freq", &s.meleeShakeFreq, s.meleeShakeFreq, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... Hz");
+    REGISTER_CVAR2("vm_melee_shake_enemy", &s.meleeShakeEnemy, s.meleeShakeEnemy, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... multiplier when an enemy was hit");
     REGISTER_CVAR2("vm_melee_sound", &s.meleeSound, s.meleeSound, VF_DUMPTOCHAIR, "Viewmodel Tweaks: play a swing sound with the punch (0/1)");
     REGISTER_CVAR2("vm_melee_impulse_flip", &s.meleeImpulseFlip, s.meleeImpulseFlip, VF_DUMPTOCHAIR, "Viewmodel Tweaks: flip the physics impulse of the quick melee hit (0/1)");
     REGISTER_CVAR2("vm_melee_impulse_scale", &s.meleeImpulseScale, s.meleeImpulseScale, VF_DUMPTOCHAIR, "Viewmodel Tweaks: scale of the physics impulse of the quick melee hit");
@@ -5899,7 +5933,12 @@ void ModMain::DrawInteractTab()
             ImGui::TextDisabled("now %.2f", I.meleeLowerBlend);
             ImGui::TreePop();
         }
-        ImGui::Text("Camera kick");
+        ImGui::Text("Impact shake (when the punch lands)");
+        ImGui::SliderFloat("Intensity##ms", &s.meleeShakeAmp, 0.0f, 5.0f, "%.2f deg");
+        ImGui::SliderFloat("Length##ms", &s.meleeShakeTime, 0.05f, 1.0f, "%.2f s");
+        ImGui::SliderFloat("Frequency##ms", &s.meleeShakeFreq, 4.0f, 40.0f, "%.0f Hz");
+        ImGui::SliderFloat("On an enemy, times##ms", &s.meleeShakeEnemy, 0.0f, 3.0f, "x %.2f");
+        ImGui::Text("Camera kick (with the swing)");
         ImGui::SliderFloat("Pitch##mk", &s.meleeCamKick, -5.0f, 5.0f, "%.1f deg");
         ImGui::SliderFloat("Yaw##mk", &s.meleeCamKickYaw, -5.0f, 5.0f, "%.1f deg");
         ImGui::SliderFloat("Time##mk", &s.meleeCamKickTime, 0.05f, 1.0f, "%.2f s");
