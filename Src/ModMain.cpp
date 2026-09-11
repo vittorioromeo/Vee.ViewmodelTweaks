@@ -879,7 +879,10 @@ void ModMain::OnProceduralContextUpdated(void* pContext)
     PredictCamera(pPlayer, camAbs);
 
     PushAimLock(pModifier, camAbs, L.ikAbs, L.weaponAbs, ab);
-    PushInteractReach(pModifier, pSkelPose, camAbs);
+    // The interaction pushes go through our own pose modifier when it already carried them this frame (see
+    // PushWithOwnQueue); pushing them here as well applied them twice - the hand overshot on those frames.
+    if (!(m_interact.ownQueueUsed && m_interact.ownQueueFrame == m_frameIndex))
+        PushInteractReach(pModifier, pSkelPose, camAbs);
 }
 
 bool ModMain::PredictCamera(ArkPlayer* pPlayer, QuatT& camAbs) const
@@ -4844,6 +4847,7 @@ void ModMain::RegisterCVars()
     RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up");
     RegisterPoseCVars(s.interactStartHandRot, "interact_start_hand_", "hand off the weapon - the hand's orientation at the spot (rotation only)");
     RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up (rotation only)");
+    REGISTER_CVAR2("vm_interact_own_queue_always", &s.interactOwnQueueAlways, s.interactOwnQueueAlways, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carry the hand pushes with our own pose modifier every frame (1) or only when the game's context did not run (0)");
     REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
@@ -5101,9 +5105,10 @@ void ModMain::PushWithOwnQueue()
     I.ownQueueUsed = false;
     if (!s.interactNoContextFallback || m_ownQueueBroken || !Active() || !s.interactEnabled || !m_offsetHookActive || m_playerDead)
         return;
-    // Only when the game's context did not run last frame: otherwise it carries our pushes (and a second modifier
-    // would apply them twice).
-    if (m_diag.ctxUpdatesLastFrame > 0)
+    // Either every frame (the context hook then skips its copy of the pushes: nothing applied twice, no frame
+    // without a push when the context skips one - weapon holster / draw and screen transitions made the hand
+    // blink), or only when the context did not run last frame.
+    if (!s.interactOwnQueueAlways && m_diag.ctxUpdatesLastFrame > 0)
         return;
     // Anything to push at all? (The reach, the resting hand, a pose being edited.)
     const bool wanted = I.phase != InteractState::Idle || I.restBlend > 0.0f || I.holdMode != 0 || I.restActive;
@@ -5185,6 +5190,7 @@ void ModMain::PushWithOwnQueue()
         return;
     PushInteractReach(m_ownQueue, pSkelPose, camAbs);
     I.ownQueueUsed = true;
+    I.ownQueueFrame = m_frameIndex;
     I.ownQueuePushes++;
 }
 
@@ -6172,8 +6178,15 @@ void ModMain::DrawInteractTab()
         ImGui::TextDisabled("%s%s%s, arms slot flags 0x%X%s, game context ran last frame: %s%s", I.unarmed ? "no weapon" : "weapon out",
             I.examining ? ", on a screen" : "", I.bodyShiftActive ? " (body brought to the camera)" : "", I.slotFlagsNow, I.armsForced ? " (arms shown by us)" : "",
             m_diag.ctxUpdatesLastFrame > 0 ? "yes" : "no", I.ownQueueUsed ? " -> our own pose modifier" : (m_ownQueueBroken ? " (own pose modifier disabled after a failed check)" : ""));
-        CheckboxInt("Before any weapon was equipped: drive the hand with our own pose modifier", s.interactNoContextFallback,
-            "The game's weapon animation context, which carries our pushes, is only created when a weapon is first equipped. Until then this fills in.");
+        CheckboxInt("Drive the hand with our own pose modifier", s.interactNoContextFallback,
+            "The game's weapon animation context, which can carry our pushes, is only created when a weapon is first equipped; our own pose modifier fills in.");
+        if (s.interactNoContextFallback)
+        {
+            ImGui::Indent();
+            CheckboxInt("every frame (the game's context skips its copy)", s.interactOwnQueueAlways,
+                "On: no frame without a push and none with two around weapon holster / draw and screen transitions (the hand blinked there). Off: only when the game's context did not run last frame.");
+            ImGui::Unindent();
+        }
         if (I.bodyShiftActive)
             ImGui::TextDisabled("camera is %.2f m from the head (%.2f %.2f %.2f)", I.bodyShift.GetLength(), I.bodyShift.x, I.bodyShift.y, I.bodyShift.z);
         if (I.examCursorValid)

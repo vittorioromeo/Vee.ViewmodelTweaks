@@ -304,7 +304,8 @@ struct ViewmodelSettings
     PoseOffset interactStartHandRot = RotPos(0, 0, 0, -1.97f, -0.66f, -65.03f); //!< ... the hand's orientation at the spot (view space, deg): the pose blends from this instead of the animated hand. Position unused.
     PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (about its own axes, deg). Position unused.
     int   meleeLowerEase = 2;
-    int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
+    int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier
+    int   interactOwnQueueAlways = 1;    //!< carry the hand pushes with our own pose modifier every frame (the game's context skips them), instead of only when the context did not run: no gap and no double push around weapon / screen transitions       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -527,7 +528,8 @@ struct InteractState
     float meleeCooldownLeft = 0.0f;
     float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
-    bool ownQueueUsed = false;      //!< the game's context did not run last frame: our own pose modifier carried the pushes
+    bool ownQueueUsed = false;      //!< our own pose modifier carried the pushes this frame
+    int ownQueueFrame = -1;         //!< the frame (m_frameIndex) it did
     int ownQueuePushes = 0;
     bool meleeSoundWarned = false;
     bool meleeHitInProgress = false; //!< inside our OnHit call (the impulse hook looks at this)

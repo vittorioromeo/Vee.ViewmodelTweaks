@@ -507,6 +507,15 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.7: the hand blinked for a moment on the way into and out of a screen (and around weapon holster /
+  draw): the fallback queue engaged one frame after the context stopped running (a frame with no push - the
+  hand at the animation) and, the frame the context ran again, both pushed (applied twice - the hand past the
+  target). Now our own pose modifier carries the interaction pushes *every* frame
+  (`vm_interact_own_queue_always`, default on) and `OnProceduralContextUpdated` skips its copy when
+  `ownQueueFrame == m_frameIndex`; the aim lock still goes through the context. Cost: the pushes are computed
+  in `UpdateBeforeSystem`, i.e. with the previous frame's camera rotation (one frame of lag on the hand while
+  turning; the loop is measured in `camReachPrev` so it does not drift). Off = the old way (fallback only when
+  the context did not run last frame), still with the double-push guard.
 * 3.11.6: arms forced on whenever the game clears the flag while we want them, not only on the first time -
   hovering hand out, screen, exit, screen again left the hand invisible (the second entry cleared the flag
   while `armsForced` was still true from the first).
