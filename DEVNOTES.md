@@ -308,7 +308,19 @@ Version notes at the end.
   `ui_examine_{fabricator,keycard,keypad,operatordispenser,securitystation,workstation}` (defaults 1,0,1,0,1,1;
   kiosks never). When it says no, the screen takes the "use" press itself at the crosshair (`0x139D4E0`);
   when yes, `ArkWorldUIOwner::OnInteraction` (`0x13B1CC0`) calls `ArkExaminationMode::SetExamining(true)`.
-  `vm_interact_nozoom_*` writes those cvars (on change only, `ApplyExamineCVars`).
+  `vm_interact_nozoom_*` writes those cvars whenever the live value differs (`ApplyExamineCVars`; the game
+  re-registers them with their defaults on level load).
+* Which animation an interaction gets is a rule list (`InteractRule`, `ResolveStyle`, `<Rules>` in the poses
+  file; first match on type / mode / entity class substring / prompt text substring -> press, grab or none,
+  and whether the hovering hand comes up). Prompt texts are localisation tokens (`@use_npc`, `@i_defaultBook`),
+  not English words; entity class names are in `ArkEntityClassLibrary.h` (`ArkHuman`, `ArkContainer`,
+  `ArkCargoContainer`, `ArkHarvestable`, `ArkBook`, `ArkOperator*`, `ArkWeapon*` ...). The last interaction's
+  class and prompt text are shown in the tab, with a button that turns them into a rule.
+* Full list of hooks the feature uses: `ArkPlayerInteraction::Interact` (pre, deferral), `::PerformInteraction`
+  (pre, carry), `ArkPlayerCarry::StartCarrying` (null guard + "carry started"), `ArkWeaponUtils::
+  DoWeaponImpulse` (only while our own melee hit is on the stack), the `CProceduralWeaponAnimationContext::
+  Update` hook shared with the aim lock (pushes), `ArkPlayerCamera::UpdateView` (camera kick, read-back), the
+  raw input listener (screen clicks, melee key).
 
 ### Target point and view space
 
@@ -457,9 +469,19 @@ Version notes at the end.
 ### Reading the diagnostics
 
 The overlay (`vm_interact_debug`, ImGui): red = target, green = where the wrist is asked, cyan = where the
-wrist joint really is (last frame), magenta = shoulder, blue = OS cursor, yellow = HUD reticle, plus a line of
-numbers. Click log lines "screen click ..." / "reach at target ..." in `Game.log`. Counters in the Interact
-tab: pushes, pushes not applied, chain resets, NaN recoveries.
+wrist joint really is (last frame), magenta = shoulder, plus a line of numbers. Log lines in `Game.log` with
+the overlay on: "screen click ...", "reach at target ...", "quick melee hit ...", "quick melee impulse ..."
+(raw impulse direction against the view forward), "screen ray hit ...". Readouts in the Interact tab:
+pushes / chain resets / NaN recoveries (Advanced), carries called off, hovering state with the usable
+thing's type and distance, the animated hand's view-space position and the IK weight ("Where it comes up
+from"), whether the hand comes from the spot or the animated hand, whether the game's context or our own
+pose modifier carried the pushes (Advanced state line), punches / hits / without a wrench.
+
+Fresh-game checklist (a wrong answer here is where the last three releases' bugs lived): before the wrench,
+the Advanced state line must say "-> our own pose modifier" and `Game.log` must have "created our own
+AnimationPoseModifier_OperatorQueue" without a following "fallback disabled"; with the wrench out, "Where
+it comes up from" must say "coming up from the spot"; with the pistol out it must say "from the animated
+hand".
 
 | Symptom | Meaning |
 | --- | --- |
@@ -471,6 +493,11 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
 | arms invisible after a screen, weapon too | render flag written back after the game restored it |
 | `TOO CLOSE` on a keypad | target closer than `vm_interact_exam_min_dist`: intended |
 | chain resets climbing while just looking around | animation jumps > 30 cm/frame on the IK target: lower the threshold's assumptions or check the weapon anim |
+| hand pops into view over two frames with the wrench / grenades / no weapon | the blend started from the off-screen animated hand: "Support hand for this weapon" is not "off the weapon" (check the weapons file entry) |
+| punch hand vanishes for a frame at the apex | a push was dropped by a sanity limit (`add.t` over 3 m) or the arms were not shown for the phase |
+| nothing at all on a fresh game before the wrench | the own operator queue did not engage: look for "fallback disabled" in the log and the reason on the same line |
+| "Pure function call" fatal error | a virtual called on a destroyed object - for the own queue, a lost reference (see "What does not work") |
+| a tap on a physics object plays a grab | `vm_interact_carry_hold` is 0, or the game's carry timer was not read (offset 0x460 static_assert) |
 
 ### Version notes
 
