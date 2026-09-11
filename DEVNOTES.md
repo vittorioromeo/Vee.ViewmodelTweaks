@@ -507,6 +507,11 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.11.5: defaults = the values tuned in play through 3.11.4 (grab and punch styles incl. windup, envelope,
+  rest / start spots, start arm pose, melee cooldown / kick / lowering, punch pose, door rule, wrench shoulder).
+  The way to refresh them: dump `vm_interact_*` / `vm_melee_*` from `Chairloader_CVars.xml`, the `interact_*`
+  attributes from the weapons file and the poses file, and copy into `ViewmodelSettings`, the `ReachStyle`
+  factories, `SeedDefaultPoses`, `SeedDefaultRules` and `s_builtInInteract`.
 * 3.11.4: hand off the weapon - orientation too: the wrist blends from the spot's orientation
   (`vm_interact_start_hand_*`, per weapon `interact_start_hand_*`) instead of from the off-screen animated hand,
   and an extra forearm rotation while the hand is up (`vm_interact_start_forearm_*`, per weapon

@@ -1510,6 +1510,7 @@ void ModMain::SeedDefaultRules()
         InteractRule r; r.type = type; r.mode = mode; r.classContains = cls; r.textContains = text; r.style = style; r.hover = hover; r.note = note;
         m_rules.push_back(r);
     };
+    add(-1, (int)EArkInteractionMode::use, "ArkDoor", "", 1, 1, "opening / closing doors");
     add(-1, (int)EArkInteractionMode::use, "ArkHuman", "@use_npc", 2, 0, "talking to someone: no animation, no hovering hand");
     add(-1, (int)EArkInteractionMode::use, "ArkOperator", "@use_npc", 2, 0, "talking to an operator");
     add(-1, -1, "ArkHuman", "", 1, 1, "searching a body");
@@ -3115,7 +3116,7 @@ void ModMain::SeedDefaultPoses(std::vector<HandPose>& poses, std::string* pStyle
     joint(rest, "l_index2_jnt", 0, -16, 0);  joint(rest, "l_index3_jnt", 0, -16, 0);
     HandPose punch = point; // the fist: the pointing hand with the index curled too, held at a fixed spot ahead
     punch.name = "punch";
-    punch.posY = 0.7482f;
+    punch.posX = 0.0511f; punch.posY = 0.6861f; punch.posZ = 0.0f;
     punch.absolutePos = 1;
     joint(punch, "l_index1_jnt", 0, -77, -11); joint(punch, "l_index2_jnt", 0, -55, 0); joint(punch, "l_index3_jnt", 0, -118, 0);
     poses.push_back(point);
@@ -3883,6 +3884,8 @@ namespace
             if (strcmp(oneHanded, cls) == 0) w.interactHandOff = 1;
         for (const char* twoHanded : { "ArkWeaponPistol", "ArkWeaponShotgun", "ArkWeaponGooGun", "ArkWeaponStunGun", "ArkWeaponToyGun", "ArkWeaponInstalaser" })
             if (strcmp(twoHanded, cls) == 0) w.interactHandOff = 0;
+        if (strcmp(cls, "ArkWeaponWrench") == 0)
+            w.interactStartShoulder.posY = -0.0044f; // as tuned: cancels the global shoulder-forward for the wrench
         for (const BuiltInInteract& b : s_builtInInteract)
             if (strcmp(b.cls, cls) == 0)
             {

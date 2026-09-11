@@ -98,21 +98,25 @@ struct ReachStyle
     static ReachStyle Punch()
     {
         ReachStyle r;
-        r.reachTime = 0.12f; r.holdTime = 0.04f; r.returnTime = 0.28f; r.amount = 1.0f;
-        r.offX = r.offY = r.offZ = 0.0f; r.arcX = 0.0f; r.arcZ = -0.02f; r.retArcX = 0.0f; r.retArcZ = -0.04f;
-        r.pitch = r.yaw = r.roll = 0.0f;
-        r.windupTime = 0.14f; r.windX = 0.06f; r.windY = -0.14f; r.windZ = 0.03f; // the arm loads up: back, a little out and up
-        r.windShX = 0.02f; r.windShY = -0.04f; r.windShZ = 0.0f;                 // the shoulder goes back with it
+        r.reachTime = 0.10f; r.holdTime = 0.04f; r.returnTime = 0.27f; r.amount = 1.5f;
+        r.offX = -0.0117f; r.offY = 0.3095f; r.offZ = 0.0f; r.arcX = 0.0f; r.arcZ = -0.02f; r.retArcX = 0.0f; r.retArcZ = -0.04f;
+        r.pitch = -0.66f; r.yaw = 7.88f; r.roll = 0.0f;
+        r.envelopeScale = 0.85f; r.along = 0.1008f;
+        r.windupTime = 0.33f; r.windX = -0.3343f; r.windY = -0.1328f; r.windZ = 0.0702f; // the arm loads up: back and across
+        r.windShX = -0.0767f; r.windShY = -0.1078f; r.windShZ = 0.0f;                 // the shoulder goes back with it
+        r.windElX = 0.0f; r.windElY = -0.0964f; r.windElZ = -0.0241f;
+        r.windKeep = 0.15f;
         return r;
     }
     //! The grab: a little slower, overshoots, sweeps in from the side and drops on the way back.
     static ReachStyle Grab()
     {
         ReachStyle r;
-        r.reachTime = 0.25f; r.holdTime = 0.06f; r.returnTime = 0.30f; r.amount = 1.5f;
-        r.offX = 0.0012f; r.offY = 0.0006f; r.offZ = -0.0006f;
-        r.arcX = -0.0324f; r.arcZ = -0.03f; r.retArcX = 0.0f; r.retArcZ = -0.06f;
-        r.pitch = -15.0f; r.yaw = 0.0f; r.roll = 20.0f;
+        r.reachTime = 0.31f; r.holdTime = 0.10f; r.returnTime = 0.30f; r.amount = 1.24f;
+        r.offX = 0.0012f; r.offY = 0.0011f; r.offZ = -0.0011f;
+        r.arcX = -0.0547f; r.arcZ = 0.0284f; r.retArcX = -0.0511f; r.retArcZ = 0.0219f;
+        r.pitch = -15.44f; r.yaw = 1.97f; r.roll = 24.31f;
+        r.along = 0.0525f;
         return r;
     }
     //! Softer variant for screens: slower in and out, a shorter way (the hand starts from the resting spot).
@@ -263,13 +267,13 @@ struct ViewmodelSettings
     int   interactEaseOut = 2;      //!< return easing (same list)
     int   interactTypeMask = 0x1FFF & ~((1 << 0) | (1 << 2) | (1 << 12)); //!< EArkInteractionType bits that animate (default: all but none/unavailable/hoover)
     int   interactRemoteMode = 0;   //!< Animate the remote-manipulation (psi) mode too.
-    float interactMaxForward = 0.75f; //!< reach envelope, view space (m): furthest the wrist goes forward
+    float interactMaxForward = 0.82f; //!< reach envelope, view space (m): furthest the wrist goes forward
     float interactExamMaxForward = 1.0f; //!< the same on in-world screens (the arms are moved to the examination camera, the arm has its full length)
     float interactMinForward = 0.12f; //!< ... nearest
     float interactMaxSide = 0.40f;    //!< ... left / right of the eye
     float interactMaxUp = 0.30f;      //!< ... above the eye
-    float interactMaxDown = 0.80f;    //!< ... below the eye
-    float interactTestX = 0.0f, interactTestY = 0.45f, interactTestZ = -0.08f; //!< fixed test point (view space, m)
+    float interactMaxDown = 0.73f;    //!< ... below the eye
+    float interactTestX = 0.0f, interactTestY = 1.0f, interactTestZ = -0.07f; //!< fixed test point (view space, m)
     ReachStyle press;               //!< buttons, switches, terminals, hacking, repairs (scriptDefined / codeDefined / hack / repair / fortify)
     ReachStyle grab = ReachStyle::Grab(); //!< pickups, loot, consumables, carry, equip, examine
     int   interactGrabAtApex = 1;   //!< grab-style interactions (and carrying) fire at the end of the reach instead of after interactFireDelay
@@ -280,25 +284,26 @@ struct ViewmodelSettings
     int   meleeKey = 0x2E;          //!< EKeyId (default eKI_V)
     int   meleeConsumeKey = 1;      //!< swallow the key so the game's own binding on it does nothing
     float meleeDamage = 0.5f;       //!< damage scale relative to a wrench hit
-    float meleeCooldown = 1.0f;     //!< seconds between punches
-    float meleeCamKick = 1.5f;      //!< camera pitch kick (degrees, down then back) with the punch
-    float meleeCamKickYaw = 0.6f;   //!< ... and yaw (degrees, to the right then back)
+    float meleeCooldown = 0.8f;     //!< seconds between punches
+    float meleeCamKick = 3.3f;      //!< camera pitch kick (degrees, down then back) with the punch
+    float meleeCamKickYaw = 1.2f;   //!< ... and yaw (degrees, to the right then back)
     float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
     int   meleeSound = 1;           //!< play a swing sound (vm_melee_sound_name) when the punch starts
     int   meleeWhileAiming = 0;     //!< allow while aiming down sights
     int   meleeImpulseFlip = 1;     //!< flip the physics impulse the wrench hit applies (objects were pulled in instead of pushed)
     float meleeImpulseScale = 1.0f; //!< ... and scale it
     PoseOffset meleeLower = MeleeLowerDefault(); //!< the equipped weapon is moved / tilted by this while the punch plays (hip pose, view space m / deg)
-    static PoseOffset MeleeLowerDefault() { PoseOffset p; p.posX = 0.03f; p.posY = -0.04f; p.posZ = -0.06f; p.pitch = -12.0f; p.yaw = 6.0f; p.roll = 8.0f; return p; }
-    float meleeLowerTime = 0.18f;   //!< seconds to blend the lowering in (windup) and out (return)
+    static PoseOffset RotPos(float x, float y, float z, float pitch, float yaw, float roll) { PoseOffset p; p.posX = x; p.posY = y; p.posZ = z; p.pitch = pitch; p.yaw = yaw; p.roll = roll; return p; }
+    static PoseOffset MeleeLowerDefault() { PoseOffset p; p.posX = 0.0493f; p.posY = -0.1347f; p.posZ = -0.081f; p.pitch = -9.2f; p.yaw = -9.2f; p.roll = 22.12f; return p; }
+    float meleeLowerTime = 0.24f;   //!< seconds to blend the lowering in (windup) and out (return)
     float interactCarryHoldTime = 0.15f; //!< carrying: the key has to be held this long before the grab starts (a tap does nothing)
     int   interactHiddenStart = 1;  //!< when the support hand is not on the weapon (one-handed weapons, no weapon), the hand comes up from a fixed spot below the view instead of from wherever the animation has it
-    float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
-    PoseOffset interactStartShoulder;   //!< with the hand off the weapon: the shoulder (upper-arm joint) moved by this while the hand is up (view space, m) - the animated arm hangs somewhere else
-    PoseOffset interactStartElbow;      //!< ... and the elbow (forearm joint); the arm IK may re-solve it
-    PoseOffset interactStartHandRot;    //!< ... the hand's orientation at the spot (view space, deg): the pose blends from this instead of the animated hand. Position unused.
+    float interactStartX = -0.3285f, interactStartY = 0.2745f, interactStartZ = -0.2847f; //!< that spot (view space, m)
+    PoseOffset interactStartShoulder = RotPos(0.0132f, 0.0044f, 0.0f, 0, 0, 0); //!< with the hand off the weapon: the shoulder (upper-arm joint) moved by this while the hand is up (view space, m) - the animated arm hangs somewhere else
+    PoseOffset interactStartElbow = RotPos(0.0f, -0.003f, 0.0f, 0, 0, 0);     //!< ... and the elbow (forearm joint); the arm IK may re-solve it
+    PoseOffset interactStartHandRot = RotPos(0, 0, 0, -1.97f, -0.66f, -65.03f); //!< ... the hand's orientation at the spot (view space, deg): the pose blends from this instead of the animated hand. Position unused.
     PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (about its own axes, deg). Position unused.
-    int   meleeLowerEase = 4;
+    int   meleeLowerEase = 2;
     int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
