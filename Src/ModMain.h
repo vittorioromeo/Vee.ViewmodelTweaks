@@ -8,6 +8,7 @@
 
 class ArkPlayerCamera;
 class CArkItem;
+struct IEntity;
 struct SViewParams;
 class CArkWeapon;
 
@@ -66,6 +67,30 @@ struct PoseOffset
             if (!(fabsf(v) < 1e30f)) { v = const_cast<PoseOffset&>(fallback).Axis(i); fixed = true; }
         }
         return fixed;
+    }
+};
+
+//! One procedural reach animation of the support hand (a "press" or a "grab"), all tunable.
+//! Distances are meters in view space (X right, Y forward, Z up), times in seconds, angles in degrees.
+struct ReachStyle
+{
+    float reachTime = 0.22f;    //!< hand travels to the target
+    float holdTime = 0.08f;     //!< stays there
+    float returnTime = 0.30f;   //!< travels back to the animated pose
+    float amount = 1.0f;        //!< fraction of the way to the target (1 = touch it)
+    float offX = 0.0f, offY = -0.05f, offZ = 0.0f;  //!< target offset (e.g. stop a little short of the surface)
+    float arcX = 0.0f, arcZ = 0.0f;                 //!< sideways / vertical bulge of the way out (sine, peaks half-way)
+    float retArcX = 0.0f, retArcZ = 0.0f;           //!< the same for the way back
+    float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;    //!< hand rotation at the target (additive, degrees)
+
+    float Duration() const { return reachTime + holdTime + returnTime; }
+    //! Softer variant for screens: slower in and out, a shorter way (the hand starts from the resting spot).
+    static ReachStyle GentlePress()
+    {
+        ReachStyle r;
+        r.reachTime = 0.32f; r.holdTime = 0.10f; r.returnTime = 0.40f;
+        r.offY = -0.03f;
+        return r;
     }
 };
 
@@ -145,6 +170,73 @@ struct ViewmodelSettings
     float wallPosePitchStrength = 1.0f; //!< how much of the pose is removed at full pitch (1 = all, 0 = the pitch fade is off)
 
 
+    // --- Interaction animation (procedural left-hand reach) ---------------------------------------
+    int   interactEnabled = 1;      //!< Reach out with the support hand when interacting (buttons, pickups, ...).
+    int   interactDefer = 1;        //!< Delay the game's interaction until the hand is about to arrive.
+    float interactFireDelay = 0.15f;//!< seconds from the key press to the actual interaction (when deferring)
+    int   interactCancelRetarget = 0; //!< Drop the deferred interaction if the crosshair moved to another object meanwhile.
+    int   interactTargetMode = 0;   //!< 0 = the point the crosshair ray hits on the object (fallback: object centre), 1 = object centre, 2 = fixed point ahead
+    int   interactWhileAiming = 0;  //!< Also animate while aiming down sights (default: the sights win).
+    int   interactForceLeftIk = 1;  //!< Force the left arm's IK weight to 1 during the reach (one-handed stances otherwise ignore the target).
+    int   interactRotate = 1;       //!< Push the style's hand rotation too (the rig may or may not honour it).
+    float interactCorrGain = 0.5f;  //!< closed-loop hand position correction per frame (0 = off)
+    int   interactUnarmed = 1;      //!< Also animate with no weapon out (the arms are shown for the reach; the game hides them).
+    int   interactExamination = 1;  //!< Also animate clicks on in-world screens / keypads (examination mode), towards the cursor.
+    int   interactExamKey = 0x100;  //!< EKeyId that counts as a click on a screen (default eKI_Mouse1)
+    int   interactExamKey2 = 0x11;  //!< second one (default eKI_E)
+    int   interactExamFlipY = 1;    //!< the cursor's y runs from the top of the screen
+    int   interactExamCursorSource = 0; //!< where a screen click aims: 0 = the OS mouse cursor (client position), 1 = centre of the view, 2 = HUD reticle, 3 = engine hardware-mouse position
+    int   interactExamFollow = 0;   //!< TEST: while on a screen, the hand tracks the cursor continuously (no click needed)
+    PoseOffset examCorr;            //!< extra hand correction applied only while on a screen (m, deg) - big ranges, for tuning
+    float interactExamArmExtend = 0.0f; //!< on screens: push the left shoulder forward by this much (m) so the arm reaches further
+    float interactExamBodyX = 0.0f, interactExamBodyY = 0.0f, interactExamBodyZ = 0.0f; //!< on screens: move the whole arms/torso relative to the camera (view space, m) - brings the shoulder within reach
+    int   interactExamAutoBody = 1; //!< on screens: bring the body forward automatically when the wrist would be beyond the arm's length
+    float interactExamArmLength = 0.55f; //!< shoulder-to-wrist distance the auto body offset keeps (m)
+    float interactExamMinTargetDist = 0.35f; //!< on screens: targets closer than this to the camera (keypads you are nose-to-nose with) are not reached for
+    int   interactExamShiftMode = 1; //!< how the arms are brought to the examination camera: 1 = skeleton, root joint pushed (additive; travels down to every joint), 0 = every joint (each child gets it again - wrong), 2 = render side (old, inconsistent with the read-back)
+    int   interactExamFovMode = 0;  //!< camera FOV while on a screen: 0 = the game's zoom, 1 = no zoom (regular cl_hfov), 2 = custom (interactExamFov)
+    float interactExamFov = 70.0f;  //!< custom horizontal FOV on screens (deg)
+    int   interactDebugMarker = 0;  //!< draw the reach target (red) and the asked hand position (green) in the world
+    int   interactExamRest = 1;     //!< On screens: keep the arms shown and hold the pointing hand at a resting spot between clicks.
+    float interactRestX = -0.14f, interactRestY = 0.42f, interactRestZ = -0.16f; //!< resting spot outside screens (view space, m)
+    float interactRestExamX = -0.14f, interactRestExamY = 0.42f, interactRestExamZ = -0.16f; //!< resting spot on screens (view space, m)
+    int   interactHoverWhileAiming = 0;  //!< hover hand also while aiming down sights (off: the support hand stays on the gun)
+    int   interactIkWeightRamp = 1;      //!< blend the left arm's IK weight in with the reach / rest instead of forcing 1 (one-handed weapons animate it at 0: forcing snaps the hand)
+    float interactRestBlendTime = 0.35f; //!< seconds to settle into / out of the resting spot
+    float interactExamLeaveTime = 0.4f;  //!< seconds over which everything screen-specific (body shift, screen corrections, limits) fades when leaving a screen
+    float interactRestSwayPos = 0.012f;  //!< resting hand: slow drift amplitude (m; vertical 60 % of it, forward 30 %)
+    float interactRestSwayRot = 2.0f;    //!< resting hand: slow drift amplitude (degrees)
+    float interactRestSwayFreq = 0.35f;  //!< Hz of the slow axis
+    int   interactHoverRest = 0;         //!< Outside screens too: hold the resting hand up while looking at something usable within reach
+    int   interactHoverTypeMask = 0x1FFA;//!< which interaction types (EArkInteractionType bits) bring the hand up
+    float interactHoverMaxDist = 1.6f;   //!< only when the usable thing is closer than this (m, from the camera)
+    float interactHoverTowards = 0.35f;  //!< 0 = plain resting spot, 1 = the hand hovers right at the target (pose offset included)
+    int   interactHoverUnarmed = 1;      //!< also with no weapon out (the arms are shown for it)
+    int   interactHoverWeapon = 1;       //!< also with a weapon out (the support hand leaves the grip)
+    int   interactNoZoomKeypad = 1;      //!< use keypads from where you stand: no automatic zoom-in (the game's ui_examine_keypad)
+    int   interactNoZoomFabricator = 0;  //!< the same for fabricators (ui_examine_fabricator)
+    int   interactNoZoomSecurity = 0;    //!< ... security stations (ui_examine_securitystation)
+    int   interactNoZoomWorkstation = 0; //!< ... workstations (ui_examine_workstation)
+    int   interactExamGentle = 1;        //!< on screens the press uses its own, gentler style (pressExam)
+    int   interactShowArms = 1;     //!< Un-hide the arms while a reach plays in a state where the game hides them (unarmed, screens).
+    int   interactOwnQueue = 0;     //!< Experimental fallback: drive the skeleton with our own pose modifier when the game's weapon context skipped a frame. Off: it crashed (3.8.2) and the context runs without a weapon anyway.
+    int   interactHideRightArm = 0; //!< ... and move the right arm (and whatever it holds) out of view for the duration (shows a stump on some rigs).
+    int   interactWristMode = 2;    //!< how a pose's wrist orientation is applied: 0 = on the IK target joint, 1 = on the hand joint (relative to the forearm), 2 = both
+    int   interactEaseIn = 2;       //!< reach easing: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 ease in-out
+    int   interactEaseOut = 4;      //!< return easing (same list)
+    int   interactTypeMask = 0x1FFF & ~((1 << 0) | (1 << 2) | (1 << 12)); //!< EArkInteractionType bits that animate (default: all but none/unavailable/hoover)
+    int   interactRemoteMode = 0;   //!< Animate the remote-manipulation (psi) mode too.
+    float interactMaxForward = 0.65f; //!< reach envelope, view space (m): furthest the wrist goes forward
+    float interactExamMaxForward = 0.72f; //!< the same on in-world screens (the arms are moved to the examination camera, the arm has its full length)
+    float interactMinForward = 0.12f; //!< ... nearest
+    float interactMaxSide = 0.40f;    //!< ... left / right of the eye
+    float interactMaxUp = 0.30f;      //!< ... above the eye
+    float interactMaxDown = 0.50f;    //!< ... below the eye
+    float interactTestX = 0.0f, interactTestY = 0.45f, interactTestZ = -0.08f; //!< fixed test point (view space, m)
+    ReachStyle press;               //!< buttons, switches, terminals, hacking, repairs (scriptDefined / codeDefined / hack / repair / fortify)
+    ReachStyle grab;                //!< pickups, loot, consumables, carry, equip, examine
+    ReachStyle pressExam = ReachStyle::GentlePress(); //!< the press while a screen / keypad is up (close to it, from the resting hand)
+
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
     int   sprintSensEnabled = 0;//!< Override the look-sensitivity scale the game applies while sprinting.
@@ -207,7 +299,169 @@ struct ViewmodelSettings
     {
         sprint.posX = 0.02f; sprint.posY = -0.05f; sprint.posZ = -0.0671f;
         sprint.pitch = -6.76f; sprint.yaw = 9.57f; sprint.roll = 10.0f;
+        // A grab comes in a touch slower, from slightly below and outside, and sweeps back towards the body.
+        grab.reachTime = 0.26f; grab.holdTime = 0.06f; grab.returnTime = 0.34f;
+        grab.offY = -0.03f; grab.offZ = 0.01f;
+        grab.arcX = -0.04f; grab.arcZ = -0.03f;
+        grab.retArcX = -0.05f; grab.retArcZ = -0.06f;
+        grab.pitch = -15.0f; grab.roll = 20.0f;
+        // A press pokes straight in with the fist turned a little.
+        press.offY = -0.06f;
+        press.arcZ = 0.02f;
+        press.pitch = -10.0f;
     }
+};
+
+//! One joint of a hand pose: the joint's rotation relative to its parent, as an adjustment (degrees) on top of the
+//! skeleton's bind pose. The bind pose is the same whatever weapon is held, so the pose is absolute.
+struct HandPoseJoint
+{
+    std::string name;
+    float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
+    Quat Adjust() const { return Quat::CreateRotationXYZ(Ang3(DEG2RAD(pitch), DEG2RAD(roll), DEG2RAD(yaw))); }
+    bool Adjusted() const { return pitch != 0.0f || yaw != 0.0f || roll != 0.0f; }
+};
+
+//! A full support-hand pose: wrist offset (view space) and orientation (absolute, view space) plus every joint
+//! under the hand. Stored in Vee.ViewmodelTweaks.poses.xml.
+struct HandPose
+{
+    std::string name;
+    float posX = 0.0f, posY = 0.0f, posZ = 0.0f;        //!< wrist offset from the reach target (m, view space) - or the wrist position itself when absolutePos
+    int absolutePos = 0;                                 //!< 1 = the hand goes to pos (view space) regardless of the object; 0 = pos is an offset from the object point
+    float handPitch = 0.0f, handYaw = 0.0f, handRoll = 0.0f; //!< wrist orientation in view space (degrees)
+    std::vector<HandPoseJoint> joints;
+
+    HandPoseJoint* Find(const char* jointName)
+    {
+        for (HandPoseJoint& j : joints)
+            if (j.name == jointName) return &j;
+        return nullptr;
+    }
+    const HandPoseJoint* Find(const char* jointName) const
+    {
+        for (const HandPoseJoint& j : joints)
+            if (j.name == jointName) return &j;
+        return nullptr;
+    }
+    Quat HandRotView() const { return Quat::CreateRotationXYZ(Ang3(DEG2RAD(handPitch), DEG2RAD(handRoll), DEG2RAD(handYaw))); }
+    Vec3 Pos() const { return Vec3(posX, posY, posZ); }
+};
+
+//! Runtime state of the interaction reach (support hand), see ModMain::OnInteract / PushInteractReach.
+struct InteractState
+{
+    enum EPhase { Idle, Reach, Hold, Return };
+    EPhase phase = Idle;
+    float time = 0.0f;              //!< seconds into the animation
+    int style = 0;                  //!< 0 press, 1 grab
+    float curve = 0.0f;             //!< 0..1 progress towards the target this frame (after easing)
+    float arc = 0.0f;               //!< sine bulge weight this frame (0..1), way out or way back
+    bool returning = false;
+    bool hasWorldTarget = false;
+    Vec3 targetWorld = Vec3(ZERO);  //!< the point the hand goes to (world), when hasWorldTarget
+    Vec3 targetView = Vec3(ZERO);   //!< ... in view space this frame (debug / fixed target)
+    Vec3 handView = Vec3(ZERO);     //!< animated support hand this frame (view space, debug)
+    Vec3 desiredView = Vec3(ZERO);  //!< where we put it (debug)
+    bool clamped = false;           //!< the target was outside the reach envelope
+
+    // Additive chain on the left IK target joint (same bookkeeping as the aim lock)
+    bool addValid = false;
+    QuatT lastAdd = QuatT(IDENTITY);
+    QuatT animIk = QuatT(IDENTITY);
+    Vec3 finalPrev = Vec3(ZERO);    //!< last frame's final IK target joint as read back (detects a skeleton that did not update)
+    bool finalPrevValid = false;
+    bool chainJustReset = false;    //!< last frame reset the chain: this frame's reconstruction is the new baseline
+    int pushesNotApplied = 0;       //!< debug: frames where the read-back did not fit "animation + what we pushed" -> chain reset
+    int chainResets = 0;            //!< debug: those resets (one frame without the reach each)
+    int pushes = 0;
+    int weightJoint = -1;           //!< "l_hand_spine_blend" (ADIK weight of the left arm), -1 = not found
+    int weightJointParent = -1;
+    float animIkWeight = 1.0f;      //!< the animated IK weight (the weight joint's relative x), captured on the first frame we push
+    bool animIkWeightValid = false;
+    float ikWeightPushed = 0.0f;    //!< what we pushed last frame (debug)
+    std::string weaponSeen;         //!< weapon class the capture belongs to
+    std::string weightJointName;
+
+    // Deferred game interaction
+    bool pending = false;
+    void* pInteraction = nullptr;   //!< ArkPlayerInteraction the call belongs to
+    int mode = 0;
+    unsigned entityId = 0;
+    float fireIn = 0.0f;            //!< seconds until the original call is made
+    bool fireNow = false;
+
+    // Hand pose (wrist orientation + finger overrides on the left hand subtree)
+    int holdMode = 0;               //!< posing mode: 0 off, 1 hold the pose on the animated hand, 2 hold the pose and the reach to the test point
+    bool poseApplied = false;       //!< overrides were pushed last frame (the final pose is then ours, keep the captured animation)
+    std::vector<Quat> animRel;      //!< animated parent-relative rotations of the subtree joints, captured when the pose started blending in
+    Quat animHandAbs = Quat(IDENTITY); //!< animated hand orientation (model space) at the same moment
+    Quat animIkQ = Quat(IDENTITY);  //!< animated orientation of the left IK target joint at the same moment
+    bool animValid = false;
+    Vec3 poseOffsetView = Vec3(ZERO); //!< wrist offset of the active pose this frame, already weighted (added to the reach target)
+    bool poseAbsolutePos = false;   //!< the active pose dictates the hand position (view space) instead of the object point
+    Vec3 poseAbsView = Vec3(ZERO);
+    // Closed-loop position correction: the IK target is pushed, but what must land on the point is the hand joint
+    // (the IK effector may sit elsewhere on the hand, the IK weight may be partial): the error measured on last
+    // frame's final pose is integrated into the push, so the hand ends exactly where asked whatever the weapon.
+    Vec3 corr = Vec3(ZERO);         //!< accumulated correction (view space, m)
+    Vec3 desiredPrev = Vec3(ZERO);  //!< where the hand was asked to be last frame (view space)
+    bool desiredPrevValid = false;
+    QuatT camReachPrev = QuatT(IDENTITY); //!< the camera (model space) that push was computed in; the read-back is measured in it
+    float corrError = 0.0f;         //!< debug: last measured error (m)
+    Vec3 handActualView = Vec3(ZERO); //!< debug: where the hand joint really ended up last frame (view space, real camera)
+    bool handActualValid = false;
+    Vec3 shoulderView = Vec3(ZERO);   //!< debug: the left upper-arm joint (shoulder) as seen (view space, real camera)
+    bool shoulderValid = false;
+    float autoBodyY = 0.0f;         //!< automatic body-forward offset on screens (m), smoothed
+    bool examTooClose = false;      //!< the screen point is closer than the minimum: no reach
+    int poseJointsPushed = 0;       //!< debug
+    std::string poseName;           //!< pose used this frame (debug)
+    float poseWeight = 0.0f;
+
+    // Arms in states where the game hides them (no weapon, in-world screens)
+    bool armsForced = false;        //!< we set the arms slot's render flag
+    unsigned savedSlotFlags = 0;    //!< what it was before
+    int armsForcedWhile = 0;        //!< 1 = the arms were hidden by a screen (examination) when we forced them on, 2 = by being unarmed
+    bool hideRightArm = false;      //!< this reach relocates the right arm out of view
+    bool examining = false;         //!< in-world UI examination mode (screens, keypads) this frame
+    bool unarmed = false;           //!< no weapon out this frame
+    bool ownQueueUsed = false;      //!< the game's procedural context did not run: our own pose modifier carried the pushes
+    int ownQueuePushes = 0;
+    Vec3 examCursorWorld = Vec3(ZERO); //!< where the screen cursor ray hit (debug)
+    bool examCursorValid = false;
+    float markerTimer = 0.0f;       //!< seconds left to draw the debug markers after a click
+    unsigned slotFlagsNow = 0;      //!< debug
+    // Examination mode moves the camera away from the head while the arms stay with the body: the reach is
+    // computed against a camera at the head (same rotation) and the final pose is shifted to the real camera
+    // on the render side, so the arms appear where the view is.
+    float restBlend = 0.0f;         //!< 0..1: the hand is held at the resting spot (in-world screens, or hovering over something usable)
+    bool restActive = false;
+    bool hoverActive = false;       //!< the resting hand is up because of something usable in front of us (not a screen)
+    bool hoverTargetValid = false;
+    Vec3 hoverWorld = Vec3(ZERO);   //!< the usable thing's point (world), refreshed every frame while hovering
+    int hoverType = -1;             //!< its interaction type (debug)
+    float hoverDist = 0.0f;         //!< camera to it (m, debug)
+    Vec3 restPointView = Vec3(ZERO);//!< where the resting hand is being held (view space), smoothed so screen <-> hover hand-overs do not pop
+    bool restPointValid = false;
+    float examBlend = 0.0f;         //!< 0..1: the screen-specific pieces (body shift, corrections, limits); fades out over interactExamLeaveTime
+    float swayTime = 0.0f;          //!< seconds, drives the resting hand's drift
+    float frameDt = 0.0f;           //!< this frame's dt (for the smoothing done at push time)
+    Vec3 swayPos = Vec3(ZERO);      //!< this frame's drift (view space, m)
+    Quat swayRot = Quat(IDENTITY);  //!< this frame's drift (view space)
+    Vec3 lastReach = Vec3(ZERO);    //!< last frame's reach part of the additive (without the body shift), model space
+    Vec2 cursorReticle = Vec2(ZERO), cursorHardware = Vec2(ZERO); //!< debug: both cursor sources, 0..1 of the screen
+    Vec2 cursorOs = Vec2(ZERO);     //!< the OS cursor in the game window's client area, 0..1 (y from the top)
+    bool cursorOsValid = false;
+    Vec3 renderShift = Vec3(ZERO);          //!< applied to every joint this frame (model space)
+    Vec3 renderShiftApplied = Vec3(ZERO);   //!< what the previous frame's final pose carries (subtract when reading it)
+    bool renderShiftActive = false;
+
+    // Debug
+    int lastType = -1, lastMode = -1;
+    std::string lastEntity;
+    int started = 0, deferred = 0, fired = 0, dropped = 0, skipped = 0;
+    std::string skipReason;
 };
 
 //! Per-frame state of the procedural "feel" layer (sprint pose, aim sway, view drag).
@@ -255,6 +509,8 @@ struct WeaponSettings
     float aimKickScale = 0.3f;      //!< Multiplier on the fire *animation's* weapon kick while aiming (the hand animation, not the procedural offset).
     float aimSpreadMult = 1.0f;     //!< Per-weapon spread multiplier while aiming (times the global one).
     float hipSpreadMult = 1.0f;     //!< Per-weapon spread multiplier while not aiming (times the global one).
+    PoseOffset interact;            //!< Interaction reach correction for this weapon: hand position offset (m, view space) and wrist rotation (deg), on top of the pose.
+    PoseOffset interactRest;        //!< Where this weapon's resting / hovering hand waits, relative to the resting spot (position, m, view space; rotation unused).
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
     static PoseOffset DefaultAim()
@@ -350,6 +606,13 @@ struct RenderLockState
     int rightHand = -1, leftHand = -1;
     std::string rightHandName, leftHandName;
     std::vector<int> rightSubtree, leftSubtree;
+    std::vector<std::string> leftSubtreeNames;  //!< parallel to leftSubtree
+    std::vector<int> leftSubtreeParent;         //!< parallel to leftSubtree (parent joint id)
+    std::vector<Quat> leftSubtreeDefaultRel;    //!< parallel to leftSubtree: bind-pose rotation relative to the parent
+    std::vector<int> rightArmChain;             //!< right hand, its two ancestors (forearm, upper arm) and everything under the hand
+    int leftUpperArm = -1;                      //!< the left hand's grandparent (the joint at the shoulder)
+    bool defaultPoseValid = false;              //!< the bind pose accessors were found and verified on this skeleton
+    int defaultRelSlot = -1, defaultAbsSlot = -1;
     bool leftOnWeapon = false;
     float leftHandDist = 0.0f;
 };
@@ -422,7 +685,7 @@ public:
     //---------------------------------------------------------------------------------
     // Main Update Loop
     //---------------------------------------------------------------------------------
-    virtual void UpdateBeforeSystem(unsigned updateFlags) override {}
+    virtual void UpdateBeforeSystem(unsigned updateFlags) override;
     virtual void UpdateBeforePhysics(unsigned updateFlags) override {}
     virtual void MainUpdate(unsigned updateFlags) override;
     virtual void LateUpdate(unsigned updateFlags) override;
@@ -619,7 +882,71 @@ private:
 public:
     //! Diagnostics for the shotgun/pistol pellet spread (vm_spread_debug), called from the SpawnPellets hook.
     void OnSpawnPellets(const void* pWeapon, const Vec3& position, const Vec3& aimPoint, bool bShootStraight);
+
+    //! ArkPlayerInteraction::Interact pre-hook. Starts the support-hand reach and, when deferring, stores the
+    //! call for later. Returns true if the original call must NOT run now (it has been deferred).
+    bool OnInteract(void* pInteraction, int mode);
+    //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
+    void StartReach(int style, const Vec3* pWorld);
+    const InteractState& GetInteract() const { return m_interact; }
 private:
+    InteractState m_interact;
+    bool m_interactReentry = false;     //!< our own deferred Interact call is running: let it through
+    void UpdateInteract(float dt);      //!< timeline + deferred call countdown (MainUpdate)
+    void FireDeferredInteract();        //!< makes the stored Interact call (UpdateBeforeSystem)
+    //! Skeleton-side: pushes the additive offset of the support hand's IK target for this frame.
+    void PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& camAbs);
+    //! Moves the right arm (and what it holds) out of view for this frame (screens / unarmed).
+    void PushHideRightArm(void* pModifier, const QuatT& camAbs);
+    //! Best model-space camera for the frame being animated (see OnProceduralContextUpdated).
+    bool PredictCamera(ArkPlayer* pPlayer, QuatT& camAbs) const;
+    //! When the game's procedural weapon context did not run this frame (no weapon), carry the pushes with our own queue.
+    void PushWithOwnQueue();
+    void UpdateArmsVisibility();
+    bool ExaminingWorldUI() const;
+    //! World point under the screen cursor (examination mode), from the reticle position through the view camera.
+    bool CursorWorldPoint(Vec3& out);
+    //! The OS mouse cursor relative to the game window's client area (0..1, y from the top). False if unavailable.
+    static bool OsCursorNormalized(Vec2& out);
+    void* m_ownQueue = nullptr;         //!< IAnimationOperatorQueue* (owned via the shared_ptr below)
+    void* m_ownQueueCtrl = nullptr;     //!< its std::shared_ptr control block
+    void* m_ownQueuePM = nullptr;       //!< the same object as IAnimationPoseModifier* (QueryInterface), what PushPoseModifier takes
+    bool m_ownQueueTried = false;
+    int m_waitingForExamKey = 0;        //!< UI "bind": the next key becomes screen click key 1 / 2
+    int m_examZoomHandle = 0;           //!< our zoom-manager entry overriding the screen zoom (0 = none)
+    float m_examZoomHfov = 0.0f;
+    void UpdateExamZoom();
+    //! Per-weapon entry for the interaction reach; with no weapon out the "_none" entry.
+    const WeaponSettings* InteractWeaponEntry() const;
+    //! Whether an interaction of this type / mode should animate right now; fills skipReason when not.
+    bool InteractAnimAllowed(int type, int mode);
+    //! Finds the point the hand should go to for the given target entity (world). False = no usable point.
+    bool FindInteractPoint(IEntity* pEntity, Vec3& outWorld) const;
+    void DrawInteractTab();
+    void DrawInteractMarkers(float dt);
+    void DrawHandPoseEditor();
+    void LogHandJoints();
+
+    // Hand poses (Vee.ViewmodelTweaks.poses.xml)
+    std::vector<HandPose> m_poses;
+    std::string m_stylePose[3] = { "point", "", "" };  //!< pose used by the press / grab styles and the resting hand ("" = fingers keep the animation; rest: "" = the press pose)
+    float m_stylePoseAmount[3] = { 1.0f, 1.0f, 1.0f };
+    int m_uiExamineApplied[4] = { -1, -1, -1, -1 };    //!< what we last wrote to ui_examine_{keypad,fabricator,securitystation,workstation} (-1 = nothing yet)
+    int m_editPose = 0;                 //!< index of the pose being edited in the UI
+    bool m_posesDirty = false;
+    float m_posesSaveTimer = 0.0f;
+    char m_newPoseName[32] = "";
+    HandPose* FindPose(const char* name);
+    const HandPose* ActivePose() const; //!< pose for the current animation (style / posing mode)
+    const HandPose* RestPose() const;   //!< pose of the resting hand (its own, or the press pose)
+    const ReachStyle& CurStyle() const; //!< the style of the current reach (grab / press / the gentler press on screens)
+    void UpdateHover();                 //!< is there something usable in front of us to hold the hand up for?
+    void ApplyExamineCVars();           //!< ui_examine_* (the game's automatic zoom-in per screen type) from our settings
+    void LoadPoses();
+    void SavePoses();
+    fs::path GetPosesPath() const;
+    //! Pushes the hand orientation / finger overrides for this frame (called from PushInteractReach).
+    void PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs, float weight);
 };
 
 extern ModMain* gMod;

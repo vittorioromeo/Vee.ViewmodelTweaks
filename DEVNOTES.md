@@ -116,6 +116,232 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
   (pitch from the view ray, `asin(dir.z)`): looking steeply up or down the wall is no longer where the muzzle
   would go, so the weapon returns to the plain pull-back.
 
+## Interaction animation (support-hand reach)
+
+Written as a reference rather than a diary: the facts about the rig first, then the rules that fell out of
+getting it stable (each one cost a release), then what does *not* work, then how to read the diagnostics.
+Version notes at the end.
+
+### The rig
+
+* The first-person arms use CryEngine's *animation-driven IK*. `CProceduralWeaponAnimationContext::Initialize`
+  (`0x17D5B60`) resolves three joints by name: `r_hand_spine_target` (`ctx+0x18`, right IK target),
+  `l_hand_spine_target` (`ctx+0x1C`, left IK target) and `r_hand_spine_blend` (`ctx+0x20`, the right arm's
+  IK weight). Every `Update` pushes `PushPosition(weightJoint, eOp_OverrideRelative(1), Vec3(1,0,0))` - the
+  right arm's IK weight forced to 1 - then the rotated `m_rightOffset` / `m_leftOffset` additively onto the
+  two target joints; the limb IK (`LftArm01` / `RgtArm01`, `AnimationPoseModifier_LimbIk`) brings each hand
+  to its target. An additive push on the *left* target joint alone therefore moves the support hand off the
+  weapon with the arm solved by the rig. The left weight joint is `l_hand_spine_blend` (looked up by name,
+  forced to 1 during a reach).
+* The context keeps running with **no weapon out** (the hidden arms are still animated), and it keeps running
+  on screens. So one queue serves every state; the "own operator queue" fallback (below) is never needed.
+* `IAnimationOperatorQueue` vtable: `PushPosition` slot 8 (`+0x40`), `PushOrientation` slot 9 (`+0x48`);
+  ops 0 = Override, 1 = OverrideRelative, 3 = Additive. Positions are model space.
+* **A position pushed on a joint travels down to its children.** Pushing the same shift on the root moves the
+  whole body once; pushing it on every joint moves the hand once per ancestor (the 3.9.3 "every joint
+  flails" mode). Move a body with the root joint (index 0) only.
+* **An additive push is applied exactly.** `final = animated + add` for the pushed joint, and the shift from
+  the root arrives unchanged. This is what makes the bookkeeping below deterministic.
+* `ISkeletonPose::GetAbsJointByID` (slot 24, `+0xC0`) returns a *reference into the final-pose buffer of the
+  previous frame* (writable; the skinning reads it at render time - the aim lock's render-side edits live
+  there). Anything read from it is one frame old and includes every modifier that ran, ours included.
+* `IDefaultSkeleton`: `GetJointCount` slot 1, `GetJointParentIDByID` 2, `GetJointNameByID` 6, `GetJointIDByName`
+  7, `GetDefaultAbsJointByID` 8, `GetDefaultRelJointByID` 9. The last two are not in the SDK header;
+  `UpdateSkeletonCache` proves them on the live skeleton (`abs[j] == abs[parent] * rel[j]` for all 101 joints,
+  reads under SEH via `SafeReadJoint`) before trusting them ("bind pose accessors verified" in the log). The
+  left hand subtree is 21 joints.
+* `ISkeletonAnim` = `ICharacterInstance` slot 5 (`+0x28`); `PushPoseModifier` slot 36 (`+0x120`), the game uses
+  layer 6. The arms' camera bone: `ArkPlayer::GetBoneTransform(BONE_CAMERA)`, model space.
+* The IK weight is the weight joint's *relative translation x* (that is what the game's `eOp_OverrideRelative
+  (1,0,0)` sets). Two-handed weapons animate the left weight at 1; one-handed ones (wrench, grenades) at 0,
+  with the support hand animated off screen. Forcing the weight to 1 there snaps the hand to the IK target in
+  one frame (the 3.10.0 "hover hand pops with the wrench"). The mod captures the animated weight on the first
+  frame it pushes (`animIkWeight`, re-captured on weapon change) and pushes `animW + (1 - animW) * blend`
+  (`vm_interact_ik_weight_ramp`), so the hand comes in along with the blend.
+* The limb IK runs *after* the queue and recomputes the hand from the arm: an absolute `eOp_Override`
+  orientation on the hand joint itself is discarded. The wrist is steered through the IK target joint's
+  orientation (`eOp_Override` on `l_hand_spine_target`) and/or a parent-relative override on the hand
+  (`!forearmAbs_prev.q * desired`) - both routes exist as `vm_interact_wrist_mode`.
+
+### Hooks
+
+* Trigger: pre-hook of `ArkPlayerInteraction::Interact(EArkInteractionMode)` (`0x1566820`). It is
+  self-contained - target from `m_usableEntityId` (`+0x46C`), type from `m_interactionInfo[mode]`
+  (`+0x128 + mode*0x18`, `EArkInteractionType` at +0, hold duration at +0x14), runs the entity's Lua
+  `OnUsed`/`OnHoldUsed`/... then `PerformInteraction(type, mode, pEntity, delay)`. So the call can be
+  stored and made later: the hook returns `true` and the stored `(this, mode)` is invoked from
+  `UpdateBeforeSystem` after `vm_interact_fire_delay` seconds (re-entrancy flag lets it through), after
+  re-validating the target. `PerformInteraction`'s own `delay` only feeds the carry type.
+  Modes: 0 use, 1 holdUse, 2 loot, 3 special, 4 remoteManipulation. Types: 1 scriptDefined, 3 codeDefined,
+  4 pickup, 5 consume, 6 carry, 7 hack, 8 repair, 9 fortify, 10 examine, 11 equip, 12 hoover.
+* Carry is never deferred, and `ArkPlayerCarry::StartCarrying` (`0x122FC50`) is hooked to refuse a null
+  entity: when `m_carryDelay` (`+0x460`) runs out, `ArkPlayerInteraction::Update` (`+0x161A`) calls
+  `StartCarrying(pCurrentTarget, false, false)` with the target selector's *current* entity, null whenever
+  the crosshair has left the object (menu, mimic form, dead) - a vanilla crash (`mov rax,[rsi]` at
+  `+0x122FD2D`) that a longer press-to-pickup window makes real.
+* "Something usable in front of us" for the hover hand is simply `m_usableEntityId != 0` plus the four
+  modes' types - the same data the game shows its prompt from. No extra ray until the point is needed.
+* Auto zoom-in on screens: `ArkInteractiveScreen::OnInteraction` (`0x139B9F0`) asks
+  `ArkWorldUIManager::ShouldAutoExamineType(type)` (`0x13AF310`), a table of the vanilla cvars
+  `ui_examine_{fabricator,keycard,keypad,operatordispenser,securitystation,workstation}` (defaults 1,0,1,0,1,1;
+  kiosks never). When it says no, the screen takes the "use" press itself at the crosshair (`0x139D4E0`);
+  when yes, `ArkWorldUIOwner::OnInteraction` (`0x13B1CC0`) calls `ArkExaminationMode::SetExamining(true)`.
+  `vm_interact_nozoom_*` writes those cvars (on change only, `ApplyExamineCVars`).
+
+### Target point and view space
+
+* Everything is computed in view space (camera at the origin: X right, Y forward, Z up) with the exact
+  model-space camera the aim lock already has (`camAbs`; on screens `PredictCamera` returns the real view
+  camera, `R.camModel` from `gEnv->pSystem->GetViewCamera()`). World -> model = entity-inverse, model ->
+  view = `camAbs^-1`.
+* The point: the crosshair ray hit (`RayWorldIntersection`, 4 m, `rwi_stop_at_pierceable`, skipping the
+  player) if it lies within 25 cm of the entity's world bounds, else the bounds centre (`FindInteractPoint`).
+  On screens the same centre ray (3 m) - see "Examination mode" for why the centre and not a cursor.
+* Reach math: `base = handView + (rest - handView) * restBlend` (the animated IK target, or the resting spot);
+  `desired = base + (target - base) * curve * amount + arc + poseOffset * w + weaponCorr * curve + examCorr *
+  curve * examBlend`; then the envelope on the *wrist* (never behind the camera; beyond the forward limit the
+  whole vector is scaled so the hand still covers the target on screen; side / up / down clamps). Applying the
+  envelope to the *target* instead (3.8.x) left the hand hovering mid-air at the same depth every click.
+
+### Hand poses
+
+* Fingers are plain joints under the hand joint (`RenderLockState::leftSubtree`, parents first);
+  `PushOrientation(joint, eOp_OverrideRelative, bindRel * userAdjust)` makes a pose *absolute* - the same
+  whatever weapon is held, the weapon's grip only supplies the start of the blend (subtree pose captured on
+  the first frame we push; from then on the final pose is ours, so it cannot be re-captured).
+* A pose also carries a wrist offset (view space) added to the target so the fingertip, not the wrist, lands
+  on the object; or `absolute_pos` - the hand position itself, object ignored (not useful for pointing).
+* Three pose slots in `Vee.ViewmodelTweaks.poses.xml` (`Style name="press|grab|rest"`): the reach's pose and
+  the resting hand's. While resting, the joint target is `nlerp(restPose, reachPose, curve)` so a press
+  blends out of the rest pose and back without a pop. Posing mode freezes the reach fully "in".
+* Per-weapon correction (`WeaponSettings::interact`, `interact_*` in the weapons file, `_none` for unarmed):
+  the grip changes where the hand starts and with it how the fingertip sits relative to the wrist joint at the
+  end. Screens have their own on top (`examCorr`).
+
+### The closed loop and the additive chain - rules
+
+1. **Reconstruct, do not guess.** The animated (pre-modifier) IK target of last frame is `final - lastAdd`,
+   where `lastAdd` is *everything* we pushed that reached the joint: the reach add *and* the body shift
+   arriving from the root. Frames without a reach still record the shift (`noReachThisFrame`). The old
+   "applied / skipped" two-hypothesis test (still used by the aim lock, where it is fine) could pick wrong
+   and then never recover: a wrong baseline gives a wrong push whose read-back fits the wrong hypothesis
+   again - the hand snapping between two states forever ("flailing", 3.9.3).
+2. **Detect, then reset.** A skeleton that did not update returns an identical read-back: keep the previous
+   reconstruction. A reconstructed animation jumping over 30 cm in one frame means the model is wrong
+   (animation change, our push not taken): reset - push only what is known exactly (the shift and last
+   frame's reach repeated, so nothing pops) and start clean next frame. Counter "chain resets" in the tab.
+3. **Measure the reach from where the joint will be after the shift** (`handView = cam^-1 * (anim + shift)`).
+   Measuring before it made the push overshoot by the whole shift (0.4-0.8 m on screens); the closed loop
+   spent its entire 35 cm budget taking that back, so the hand was "on target" only where the shift was
+   under 35 cm and "IK NOT REACHING" beyond (3.9.3).
+4. **Compare in the frame the push was made in.** The hand read back is last frame's; compare it with last
+   frame's `desired` in *last frame's* camera (`camReachPrev`), never the current one - otherwise every
+   camera movement is integrated as a hand error and the hand chases the turn.
+5. **What the skeleton side reads back must be what the skeleton side produced.** Render-side edits of the
+   abs buffer (the 3.8.1 body shift) are not consistently visible in the read-back; the loop chased a hand it
+   saw somewhere else. Body moves go through the queue (root joint additive).
+6. The loop itself: `corr += (desiredPrev - handActual) * gain` (gain `vm_interact_correct`, clamped to
+   35 cm, reset when the reach and rest end or the chain resets). It only has the rig's effector offset to
+   absorb now; `corr SATURATED` in the overlay means something structural is wrong, not that the gain is off.
+7. Gate every screen-only quantity on a *blend* (`examBlend`: in 0.1 s, out over `vm_interact_exam_leave_time`),
+   not on the raw flag - body shift, screen corrections, forward limit, arm extension - or leaving a screen
+   snaps the arm to the weapon (3.10.0).
+
+### Examination mode (in-world screens and keypads)
+
+* State: `ArkPlayer+0x9B0` = `ArkExaminationMode`; `m_examinationState` (`+0x98`) 1 = active,
+  `m_examinationType` 1 = worldUI, `m_localRotation` `+0x44`, `m_reticlePos` `+0x60`, `m_targetEntity` `+0x9C`.
+* `SetExamining_Internal` (`0x157E1E0`): on enter unequips the weapon (`ArkPlayerWeaponComponent` call) and
+  clears the render flag (bit 1) of the player entity's slots 0 (arms) and 5; on exit sets `flags | 1` back.
+  **Drawing a weapon does not set the flag again** - whoever clears it after exit hides the arms for good
+  (the 3.9.4 "viewmodels stop rendering after a screen" bug).
+* `ArkExaminationMode::UpdateView` (`0x157EC80`) runs *inside* `ArkPlayerCamera::UpdateView` (`+0x9C5`, which
+  returns early when it handled the view): the camera lerps to the "optimal view" in front of the screen -
+  0.39-0.84 m away from the head bone; keypads ~22-26 cm from the surface, monitors 0.6-0.8 m. With a mouse,
+  `ArkPlayerInput::GetRotation` accumulates into `m_localRotation` (clamped to a FOV-based limit times
+  `m_maxCameraRotation`): **the camera turns, the click is the centre of the view**. `m_reticlePos` is the
+  gamepad cursor and sits at (0.5, 0.5) with a mouse; the hardware cursor is in desktop coordinates. Aiming
+  the hand at either was wrong (3.8.1-3.8.3); the centre ray is right (`vm_interact_exam_cursor 0`).
+* The arms stay with the body at the head, so a hand reaching in front of the *view* is beyond the arm and
+  behind the camera. The body is brought along by a root-joint additive `realCam.t - camBone.t + bodyOffset`
+  (`vm_interact_exam_shift_mode 1`, rules 1-5 above). Even then the shoulder sits ~0.45 m behind and 0.3 m
+  below the view: `vm_interact_exam_auto_body` slides the body forward until shoulder-to-wrist equals the arm
+  length (`vm_interact_exam_arm_length`), needed for monitors, idle on keypads. Below
+  `vm_interact_exam_min_dist` there is no reach (a hand touching a keypad 22 cm away would sit on the lens;
+  a finger filling the screen for the press is acceptable, the point is that it hits the right button).
+* The examined screen renders in the *nearest* pass together with the arms (`m_nearFOVLockedCount != 0`
+  there, so `EnforceWeaponFov` leaves the near FOV alone): changing the world FOV rescales the surroundings
+  but not the screen; hand and screen share one projection, and the centre-ray hit on the screen's physics
+  mesh is the right target under any FOV. The zoom is a zoom-manager entry `SetDesiredHFOV(worldUI+0x98, 0,
+  false, priority normal(3))` pushed once the camera lerp is done; an entry at priority high overrides it
+  (`vm_interact_exam_fov_mode`).
+* Clicks on screens do not go through `Interact`; they are taken from the raw input listener
+  (`vm_interact_exam_key*`, bindable) while `active && worldUI`.
+
+### Arms visibility
+
+* States in which the game keeps the arms out of sight: unarmed and examining. While a reach or the resting
+  hand is active there the mod sets `CEntity::SetSlotFlags(0, flags | 1)` and remembers what it found
+  (`armsForcedWhile` = which state). It writes the remembered flags back **only if that same state is still
+  on**; after a screen the game has already restored the flag and must be left alone (see above).
+* Hiding the right arm by pushing all its joints behind the camera leaves a stump (skin weighted to joints
+  above the upper arm): off by default.
+
+### What does not work (do not retry without a new idea)
+
+* `IRenderAuxGeom::RenderText` - goes through Chairloader's `CAuxGeomCB` into `gRenDev->FlushTextMessages`,
+  which draws nothing in this build (in either of our mods). Mods' `Draw()` only runs while the F1 GUI is
+  shown, but the ImGui frame is live every frame (`NewFrame` in `ChairImGui::UpdateBeforeSystem`, `Render`
+  at `RenderEnd`), so `ImGui::GetForegroundDrawList()` from `MainUpdate` is the way to draw overlays
+  (`DrawInteractMarkers`).
+* Own `AnimationPoseModifier_OperatorQueue` (`CryCreateClassInstance` `0x2C3530` into an MSVC
+  `std::shared_ptr` {ptr, ctrl}; `QueryInterface` slot 2 with IID `7f44425e-7547-fe22-49f4-9ad34e27b6ba`;
+  `ISkeletonAnim::PushPoseModifier` layer 6): the pointer from `QueryInterface` was not a valid object and
+  `PushPoseModifier` read its vtable at -1 (`+0x83A114`, crash on a keypad). Not needed anyway: the game's
+  context runs without a weapon. `vm_interact_own_queue` stays 0.
+* Render-side body shift (writing the abs buffer after the camera is final, 3.8.1-3.9.2): inconsistent with
+  the read-back, see rule 5.
+* Every-joint body shift: multiplies down the hierarchy, see "The rig".
+* Arm extension (additive on the upper arm on screens): the limb IK re-solves from the shoulder, no gain.
+* A separate world FOV on screens to "make room": the screen is in the nearest pass, it does not rescale.
+* A hardware / reticle cursor as the click point on screens: see "Examination mode".
+
+### Reading the diagnostics
+
+The overlay (`vm_interact_debug`, ImGui): red = target, green = where the wrist is asked, cyan = where the
+wrist joint really is (last frame), magenta = shoulder, blue = OS cursor, yellow = HUD reticle, plus a line of
+numbers. Click log lines "screen click ..." / "reach at target ..." in `Game.log`. Counters in the Interact
+tab: pushes, pushes not applied, chain resets, NaN recoveries.
+
+| Symptom | Meaning |
+| --- | --- |
+| residual ~0, `corr SATURATED` | a structural offset the loop is hiding (double-counted shift, wrong frame): fix the model, not the gain |
+| `IK NOT REACHING`, residual constant | wrist asked beyond the arm: shoulder too far back (auto body / body offset), or the envelope limit is above what the arm can do |
+| hand snaps between two places every frame | chain bookkeeping lost (rule 1/2); should now show as chain resets instead |
+| hand drifts while turning the camera, settles after | loop measured in the wrong camera (rule 4) |
+| whole arm pops once when a screen closes | a screen-only quantity gated on the raw flag (rule 7) |
+| arms invisible after a screen, weapon too | render flag written back after the game restored it |
+| `TOO CLOSE` on a keypad | target closer than `vm_interact_exam_min_dist`: intended |
+| chain resets climbing while just looking around | animation jumps > 30 cm/frame on the IK target: lower the threshold's assumptions or check the weapon anim |
+
+### Version notes
+
+* 3.6.0 first version (deferral, tween styles); 3.6.1 carry crash (null `StartCarrying`).
+* 3.7.x absolute bind-pose finger/wrist poses, wrist via IK target, closed loop, per-weapon correction.
+* 3.8.x no weapon + screens: arms shown by slot flags, centre-ray click, envelope on the wrist, rest hand,
+  ImGui overlay, screen FOV override; own-queue crash disabled.
+* 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
+  reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.10.1 IK weight ramp for one-handed weapons, resting spot per mode (outside / on screens,
+  `vm_interact_rest_exam_*`) plus a per-weapon offset (`interact_rest_*` in the weapons file), hover off while
+  aiming unless `vm_interact_hover_aiming`.
+* 3.10.0 arms-invisible-after-screen fix, `examBlend` fade, chain reset repeats last reach, rest pose slot +
+  drift + hover outside screens (`vm_interact_hover_*`), gentle press style on screens
+  (`vm_interact_press_exam_*`), `ui_examine_*` exposed as `vm_interact_nozoom_*`.
+
+Open: a Chairloader `ShutdownGame` crash was seen once when quitting the game while a screen was up (not
+reproduced, not investigated).
+
 ## Bullet spread (shotgun and pistol share `CArkWeaponShotgun`)
 
 Two independent terms, and for the shotgun only the first one is normally alive:
@@ -187,6 +413,8 @@ Two independent terms, and for the shotgun only the first one is normally alive:
   moves `m_reticlePos` (+0x60) and sends `reticlePosition` to the HUD, so a hidden reticle means no cursor.
   The mod therefore un-hides the reticle while `ArkPlayer::m_examinationMode.m_examinationState != inactive`
   with `m_examinationType == worldUI`, and only ever writes the cvar when its own target value changes.
+  Note that with a mouse `m_reticlePos` stays at the centre and the *camera* turns instead (see the
+  interaction section): the reticle is a fixed centre marker there, not a moving cursor.
 
 ## Robustness
 
@@ -195,8 +423,11 @@ Two independent terms, and for the shotgun only the first one is normally alive:
   attachment, hand joints) is checked again. Accumulated state (low-passes, springs, blends, the additive chain,
   the kick reference) is reset when a bad number shows up, and persisted settings are sanitized on load.
   `Ang3(Quat)` in CryMath uses an unclamped `asin`, so all Euler conversions go through a clamped copy.
-* The additive hand push is only subtracted from the final pose when the skeleton actually applied it (the
-  animation update can be skipped while the hook still runs); otherwise the chain would grow without bound.
+* The aim lock's additive hand push is only subtracted from the final pose when the skeleton actually applied
+  it (the animation update can be skipped while the hook still runs); otherwise the chain would grow without
+  bound. The interaction reach uses the stricter scheme described in its section (exact reconstruction, an
+  identical read-back = no update, a reset on an implausible jump) after the two-hypothesis test proved able
+  to lock into the wrong answer there.
 * Mod cvars are unregistered in `ShutdownSystem`: the console keeps raw pointers to the names and storage,
   which vanish with the DLL, and touches them again at engine shutdown (crash on exit otherwise).
 

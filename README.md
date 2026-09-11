@@ -22,6 +22,19 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   that blends in as the weapon is pressed against the wall (the shotgun goes muzzle-up), no aiming while the
   muzzle would be in a wall, while reloading or while switching weapons; the offsets ease out during reloads so the support
   hand meets the shells.
+* **Interaction animation** *(new, experimental)*. The support hand reaches out when you interact: a poke for
+  buttons, switches, terminals and hacking, a grab (with a sweep back towards you) for pickups, loot,
+  consumables and things you carry. Purely procedural - a tween on the hand's IK target on top of the live
+  animation - so it works with any two-handed weapon and every timing, offset and path is tunable in the
+  *Interact* tab, with test buttons. The game's side of the interaction can be deferred a fraction of a
+  second so the item vanishes / the button clicks when the hand gets there. The wrist and every finger can be
+  posed (a pointing finger for screens, an open hand for grabs) as an absolute pose on the skeleton's bind pose -
+  the same whatever weapon is held; shape it with per-joint sliders in a live posing mode, save it, assign it
+  to the press / grab style. Works with no weapon out and on in-world screens and keypads too: there the arms
+  are brought along to the zoomed-in view and the pointing hand waits in view between clicks, with a slow
+  drift and its own pose, pressing where the crosshair is; optionally the hand also comes up whenever
+  something usable is in front of you (a button, an item, a container). Keypads can be used from where you
+  stand instead of zooming in (the game's own per-screen-type switches, exposed).
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 
@@ -94,6 +107,7 @@ experimental features in the window.
   ironsights depends on the weapon FOV; adjust *Ironsights FOV* to taste.
 * Grenades, the wrench and the Nullwave transmitter have aiming disabled by default; enable per weapon if
   you want it.
+* The interaction animation needs a weapon out (the arms are only driven procedurally with a weapon).
 
 ## Building from source
 
