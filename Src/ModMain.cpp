@@ -1457,6 +1457,98 @@ static const char* InteractionModeName(int mode)
     return (mode >= 0 && mode < 5) ? names[mode] : "?";
 }
 
+static bool ContainsNoCase(const char* hay, const std::string& needle)
+{
+    if (needle.empty()) return true;
+    if (!hay) return false;
+    std::string h(hay), n(needle);
+    for (char& c : h) c = (char)tolower((unsigned char)c);
+    for (char& c : n) c = (char)tolower((unsigned char)c);
+    return h.find(n) != std::string::npos;
+}
+
+int ModMain::ResolveStyle(int type, int mode, const char* className, const char* text, bool* pHover) const
+{
+    if (pHover) *pHover = true;
+    for (const InteractRule& r : m_rules)
+    {
+        if (r.type >= 0 && r.type != type) continue;
+        if (r.mode >= 0 && r.mode != mode) continue;
+        if (!ContainsNoCase(className, r.classContains)) continue;
+        if (!ContainsNoCase(text, r.textContains)) continue;
+        if (pHover) *pHover = r.style != 2 && r.hover != 0;
+        return clamp_tpl(r.style, 0, 2);
+    }
+    return StyleForInteraction(type, mode);
+}
+
+void ModMain::SeedDefaultRules()
+{
+    // What testing found the built-in choice gets wrong. Entity class names from ArkEntityClassLibrary.
+    auto add = [&](int type, int mode, const char* cls, const char* text, int style, int hover, const char* note) {
+        InteractRule r; r.type = type; r.mode = mode; r.classContains = cls; r.textContains = text; r.style = style; r.hover = hover; r.note = note;
+        m_rules.push_back(r);
+    };
+    add(-1, (int)EArkInteractionMode::use, "ArkHuman", "talk", 2, 0, "talking to someone: no animation, no hovering hand");
+    add(-1, -1, "ArkHuman", "", 1, 1, "searching a body");
+    add(-1, -1, "Container", "", 1, 1, "containers (ArkContainer, ArkCargoContainer, ...)");
+    add(-1, -1, "ArkHarvestable", "", 1, 1, "harvesting");
+    add(-1, (int)EArkInteractionMode::holdUse, "ArkWeapon", "", 1, 1, "taking the ammo out of a dropped weapon (hold)");
+}
+
+// PerformInteraction(carry, mode, entity, delay) is the point where a carry really begins. With delay > 0 the
+// game arms m_carryDelay and StartCarrying follows from ArkPlayerInteraction::Update when it runs out (with the
+// target selector's entity of that moment - null-guarded in our StartCarrying hook); with delay <= 0 it picks
+// the object up right here. Stretching the delay to the reach puts the pickup at the apex of the grab, with no
+// state of ours to go stale.
+static auto s_hookPerformInteraction = ArkPlayerInteraction::FPerformInteraction.MakeHook();
+static void ArkPlayerInteraction_PerformInteraction_Hook(ArkPlayerInteraction* const _this, EArkInteractionType _interaction, EArkInteractionMode _mode, IEntity* const _pEntity, float _delay)
+{
+    float delay = _delay;
+    if (gMod && _interaction == EArkInteractionType::carry)
+        delay = gMod->OnPerformCarry(_this, (int)_mode, _pEntity, _delay);
+    s_hookPerformInteraction.InvokeOrig(_this, _interaction, _mode, _pEntity, delay);
+}
+
+float ModMain::OnPerformCarry(void* pInteractionRaw, int mode, IEntity* pEntity, float delay)
+{
+    InteractState& I = m_interact;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer || pInteractionRaw != &pPlayer->m_interaction || !pEntity || mode == (int)EArkInteractionMode::remoteManipulation)
+        return delay;
+    const int type = (int)EArkInteractionType::carry;
+    I.lastType = type;
+    I.lastMode = mode;
+    I.lastClass = (pEntity->GetClass() && pEntity->GetClass()->GetName()) ? pEntity->GetClass()->GetName() : "?";
+    I.lastText.clear();
+    I.lastEntity = I.lastClass + (pEntity->GetName() ? std::string(" '") + pEntity->GetName() + "'" : std::string()) + " (carry)";
+    if (!InteractAnimAllowed(type, mode))
+    {
+        I.skipped++;
+        return delay;
+    }
+    const int style = ResolveStyle(type, mode, I.lastClass.c_str(), nullptr);
+    if (style == 2)
+    {
+        I.skipReason = "rule: no animation for this";
+        I.skipped++;
+        return delay;
+    }
+    Vec3 world;
+    const bool haveTarget = m_settings.interactTargetMode != 2 && FindInteractPoint(pEntity, world);
+    StartReach(style, haveTarget ? &world : nullptr);
+    if (m_settings.interactCarryAtApex)
+    {
+        const float apex = clamp_tpl(max(CurStyle().reachTime, 0.0f), 0.0f, 1.0f);
+        if (apex > delay)
+        {
+            I.deferred++;
+            return apex;
+        }
+    }
+    return delay;
+}
+
 bool ModMain::InteractAnimAllowed(int type, int mode)
 {
     InteractState& I = m_interact;
@@ -1525,13 +1617,18 @@ bool ModMain::OnInteract(void* pInteractionRaw, int mode)
     if (!pPlayer || pInteraction != &pPlayer->m_interaction)
         return false; // not the player's (or the player is gone): leave the game alone
 
-    const int type = (mode >= 0 && mode < 4) ? (int)pInteraction->m_interactionInfo[(size_t)mode].m_interactionType : -1;
+    const ArkInteractionInfo* pInfo = (mode >= 0 && mode < 4) ? &pInteraction->m_interactionInfo[(size_t)mode] : nullptr;
+    const int type = pInfo ? (int)pInfo->m_interactionType : -1;
     I.lastType = type;
     I.lastMode = mode;
     IEntity* pEntity = (gEnv && gEnv->pEntitySystem && pInteraction->m_usableEntityId) ? gEnv->pEntitySystem->GetEntity(pInteraction->m_usableEntityId) : nullptr;
-    I.lastEntity = pEntity ? (pEntity->GetClass() && pEntity->GetClass()->GetName() ? pEntity->GetClass()->GetName() : "?") : "(none)";
+    I.lastClass = pEntity ? (pEntity->GetClass() && pEntity->GetClass()->GetName() ? pEntity->GetClass()->GetName() : "?") : "";
+    I.lastText = (pInfo && pInfo->m_displayText.c_str()) ? pInfo->m_displayText.c_str() : "";
+    I.lastEntity = pEntity ? I.lastClass : "(none)";
     if (pEntity && pEntity->GetName())
         I.lastEntity += std::string(" '") + pEntity->GetName() + "'";
+    if (!I.lastText.empty())
+        I.lastEntity += " \"" + I.lastText + "\"";
 
     if (!pEntity || type == (int)EArkInteractionType::none || type == (int)EArkInteractionType::unavailable)
     {
@@ -1544,16 +1641,31 @@ bool ModMain::OnInteract(void* pInteractionRaw, int mode)
         I.skipped++;
         return false;
     }
+    const int style = ResolveStyle(type, mode, I.lastClass.c_str(), I.lastText.c_str());
+    if (style == 2)
+    {
+        I.skipReason = "rule: no animation for this";
+        I.skipped++;
+        return false;
+    }
+    // Carrying is animated from PerformInteraction(carry) instead (see OnPerformCarry): that is the call that only
+    // happens when the carry really starts - a short press on something that needs a hold does not get there -
+    // and it carries the delay the game itself waits before picking the object up.
+    if (type == (int)EArkInteractionType::carry)
+    {
+        I.skipReason = "carry: animated when the carry starts";
+        return false;
+    }
 
     Vec3 world;
     const bool haveTarget = m_settings.interactTargetMode != 2 && FindInteractPoint(pEntity, world);
-    StartReach(StyleForInteraction(type, mode), haveTarget ? &world : nullptr);
+    StartReach(style, haveTarget ? &world : nullptr);
 
-    // Defer the game's side so the object reacts when the hand gets there, not before. Not for carrying: the
-    // game already delays that itself (m_carryDelay + its own pickup animation), and the longer the gap between
-    // the press and StartCarrying, the likelier the target is gone by then (see the StartCarrying hook).
-    const bool deferrable = type != (int)EArkInteractionType::carry;
-    if (deferrable && m_settings.interactDefer && m_settings.interactFireDelay > 0.0f)
+    // Defer the game's side so the object reacts when the hand gets there, not before: after a fixed delay, or -
+    // for grabs - when the reach is at its apex (the hand closest to the object).
+    const bool apex = style == 1 && m_settings.interactGrabAtApex;
+    const float fireDelay = apex ? max(CurStyle().reachTime, 0.0f) : m_settings.interactFireDelay;
+    if (m_settings.interactDefer && fireDelay > 0.0f)
     {
         if (I.pending)
         {
@@ -1567,7 +1679,7 @@ bool ModMain::OnInteract(void* pInteractionRaw, int mode)
         I.pInteraction = pInteraction;
         I.mode = mode;
         I.entityId = pInteraction->m_usableEntityId;
-        I.fireIn = clamp_tpl(m_settings.interactFireDelay, 0.0f, 1.0f);
+        I.fireIn = clamp_tpl(fireDelay, 0.0f, 1.0f);
         I.fireNow = false;
         I.deferred++;
         return true;
@@ -1615,18 +1727,23 @@ void ModMain::UpdateHover()
     const ArkPlayerInteraction& in = pPlayer->m_interaction;
     if (!in.m_usableEntityId)
         return; // nothing usable under the crosshair (this is what the game shows its prompt for)
-    // Any of the interaction modes the thing offers with a type we hold the hand up for.
+    IEntity* pEnt = gEnv->pEntitySystem->GetEntity(in.m_usableEntityId);
+    if (!pEnt)
+        return;
+    const char* cls = (pEnt->GetClass() && pEnt->GetClass()->GetName()) ? pEnt->GetClass()->GetName() : "";
+    // Any of the interaction modes the thing offers with a type we hold the hand up for - and no rule against it.
     int type = -1;
     for (size_t m = 0; m < 4 && type < 0; m++)
     {
         const int t = (int)in.m_interactionInfo[m].m_interactionType;
         if (t <= (int)EArkInteractionType::none || t >= 13 || t == (int)EArkInteractionType::unavailable) continue;
-        if ((s.interactHoverTypeMask >> t) & 1) type = t;
+        if (!((s.interactHoverTypeMask >> t) & 1)) continue;
+        bool hover = true;
+        const char* text = in.m_interactionInfo[m].m_displayText.c_str();
+        if (ResolveStyle(t, (int)m, cls, text, &hover) == 2 || !hover) continue;
+        type = t;
     }
     if (type < 0)
-        return;
-    IEntity* pEnt = gEnv->pEntitySystem->GetEntity(in.m_usableEntityId);
-    if (!pEnt)
         return;
     Vec3 world;
     if (!FindInteractPoint(pEnt, world))
@@ -1655,9 +1772,12 @@ void ModMain::ApplyExamineCVars()
     for (int i = 0; i < 4; i++)
     {
         const int want = (Active() && s.interactEnabled && noZoom[i]) ? 0 : 1; // 1 = the game's default for all four
-        if (m_uiExamineApplied[i] == want)
+        ICVar* pVar = gEnv->pConsole->GetCVar(names[i]);
+        if (!pVar)
             continue;
-        if (ICVar* pVar = gEnv->pConsole->GetCVar(names[i]))
+        // The game (re)registers these with their defaults on level load, which undid an earlier write (3.10.2:
+        // "needs to be toggled after every start"). So: whenever the live value is not what we want, write it.
+        if (pVar->GetIVal() != want)
         {
             pVar->Set(want);
             m_uiExamineApplied[i] = want;
@@ -2060,18 +2180,28 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         desired += pW->interact.Pos() * curve; // this weapon's correction (its grip puts the hand somewhere else to start with)
     if (examBlend > 0.0f && SanePose(s.examCorr))
         desired += s.examCorr.Pos() * curve * examBlend;   // screens only: their own correction on top (fading out after)
-    // Reach envelope on the wrist: never behind the camera, and a point beyond the forward limit is pulled in
-    // ALONG THE LINE OF SIGHT (the whole vector scaled) so the hand still covers the target on screen instead of
-    // drifting sideways. Screens sit further away than most interactions, so they get their own limit.
+    // Reach envelope on the wrist: a point outside the box is pulled in ALONG THE LINE FROM THE CAMERA (the whole
+    // vector scaled by one factor) so the hand still points at the target instead of sliding along a wall of the
+    // box (a clamp per axis left the hand at the box's floor but at the object's distance: "stops short" of
+    // things on the ground). Screens sit further away than most interactions, so they get their own forward
+    // limit. The envelope takes effect in proportion to the blend: at the start of a reach or of the resting
+    // blend the hand is still where the animation has it, and that place may well be outside the box (one-handed
+    // weapons keep the support hand off screen) - clamping it there snapped the hand into the box in one frame.
     {
         const Vec3 unclamped = desired;
         const float maxFwd = max(s.interactMaxForward + (s.interactExamMaxForward - s.interactMaxForward) * examBlend, 0.1f);
-        if (desired.y > maxFwd)
-            desired *= maxFwd / desired.y;
-        desired.x = clamp_tpl(desired.x, -max(s.interactMaxSide, 0.05f), max(s.interactMaxSide, 0.05f));
-        desired.y = clamp_tpl(desired.y, max(s.interactMinForward, 0.02f) * 0.5f, maxFwd);
-        desired.z = clamp_tpl(desired.z, -max(s.interactMaxDown, 0.05f), max(s.interactMaxUp, 0.05f));
-        I.clamped = (unclamped - desired).GetLengthSquared() > 1e-6f;
+        const float side = max(s.interactMaxSide, 0.05f), up = max(s.interactMaxUp, 0.05f), down = max(s.interactMaxDown, 0.05f);
+        float sc = 1.0f;
+        if (desired.y > maxFwd) sc = min(sc, maxFwd / desired.y);
+        if (desired.x > side) sc = min(sc, side / desired.x);
+        if (desired.x < -side) sc = min(sc, -side / desired.x);
+        if (desired.z > up) sc = min(sc, up / desired.z);
+        if (desired.z < -down) sc = min(sc, -down / desired.z);
+        Vec3 clamped = desired * clamp_tpl(sc, 0.0f, 1.0f);
+        clamped.y = max(clamped.y, max(s.interactMinForward, 0.02f) * 0.5f);
+        const float k = max(curve, rest);
+        desired = unclamped + (clamped - unclamped) * k;
+        I.clamped = (unclamped - clamped).GetLengthSquared() > 1e-6f;
     }
     I.desiredView = desired;
 
@@ -2368,6 +2498,24 @@ void ModMain::PushHandPose(void* pModifier, void* pSkelPose, const QuatT& camAbs
             I.poseJointsPushed++;
         }
     }
+    // Forearm: a per-weapon twist / bend (rotation about the forearm's own axes, eOp_Additive expressed in model
+    // space with last frame's forearm frame). The hand's orientation is pushed absolutely above, so it does not
+    // inherit this - only the forearm turns under the wrist, which is what fixes an over-rotated-looking wrist.
+    if (const WeaponSettings* pW = InteractWeaponEntry(); pW && SanePose(pW->interactForearm) && !R.leftSubtreeParent.empty() && R.leftSubtreeParent[0] >= 0)
+    {
+        const PoseOffset& f = pW->interactForearm;
+        if (f.pitch != 0.0f || f.yaw != 0.0f || f.roll != 0.0f)
+        {
+            const Quat local = SafeNormalized(f.Rot());
+            const Quat model = SafeNormalized(pForearm->q * local * (!pForearm->q));
+            const Quat q = SafeNormalized(Quat::CreateNlerp(Quat(IDENTITY), model, w));
+            if (SaneQuat(q))
+            {
+                VCall<void>(pModifier, VT_IAnimationOperatorQueue_PushOrientation, R.leftSubtreeParent[0], OP_ADDITIVE, &q);
+                I.poseJointsPushed++;
+            }
+        }
+    }
     // Fingers (and anything else under the hand), parents first: bind pose * adjustment, absolute - the weapon's
     // grip only supplies the start of the blend.
     for (size_t i = 0; i < n; i++)
@@ -2558,16 +2706,68 @@ void ModMain::LoadPoses()
             m_stylePoseAmount[idx] = n.attribute("amount").as_float(1.0f);
             if (!Finite(m_stylePoseAmount[idx])) m_stylePoseAmount[idx] = 1.0f;
         }
-        CryLog("ViewmodelTweaks: loaded {} hand pose(s) from {}", m_poses.size(), path.u8string());
+        m_rules.clear();
+        pugi::xml_node rules = root.child("Rules");
+        if (rules)
+        {
+            for (pugi::xml_node n : rules.children("Rule"))
+            {
+                InteractRule r;
+                r.type = n.attribute("type").as_int(-1);
+                r.mode = n.attribute("mode").as_int(-1);
+                r.classContains = n.attribute("class").as_string("");
+                r.textContains = n.attribute("text").as_string("");
+                r.style = clamp_tpl(n.attribute("style").as_int(0), 0, 2);
+                r.hover = n.attribute("hover").as_int(1);
+                r.note = n.attribute("note").as_string("");
+                m_rules.push_back(r);
+            }
+        }
+        else
+            SeedDefaultRules(); // a file from before the rules existed
+        CryLog("ViewmodelTweaks: loaded {} hand pose(s) and {} rule(s) from {}", m_poses.size(), m_rules.size(), path.u8string());
     }
+    else
+        SeedDefaultRules();
     if (m_poses.empty())
-    {
-        HandPose p;
-        p.name = "point";
-        m_poses.push_back(p);
-    }
+        SeedDefaultPoses(m_poses, m_stylePose);
     m_editPose = clamp_tpl(m_editPose, 0, (int)m_poses.size() - 1);
     m_posesDirty = false;
+}
+
+void ModMain::SeedDefaultPoses(std::vector<HandPose>& poses, std::string* pStylePose)
+{
+    // The poses as shaped in play (3.10.3): the pointing finger for presses, and the relaxed version the resting hand shows.
+    auto joint = [](HandPose& p, const char* n, float pitch, float yaw, float roll) {
+        HandPoseJoint j; j.name = n; j.pitch = pitch; j.yaw = yaw; j.roll = roll; p.joints.push_back(j);
+    };
+    HandPose point;
+    point.name = "point";
+    point.posX = -0.0404f; point.posY = 0.0006f; point.posZ = -0.0573f;
+    point.handPitch = 12.68f; point.handYaw = 83.65f; point.handRoll = -9.05f;
+    joint(point, "l_thumb1_jnt", 47, -26, -11);
+    joint(point, "l_pinky1_jnt", 0, -77, 0);  joint(point, "l_pinky2_jnt", 0, -82, 0);  joint(point, "l_pinky3_jnt", 0, -84, 0);
+    joint(point, "l_ring1_jnt", 0, -76, 0);   joint(point, "l_ring2_jnt", 0, -87, 0);   joint(point, "l_ring3_jnt", 0, -90, 0);
+    joint(point, "l_middle1_jnt", 0, -79, 0); joint(point, "l_middle2_jnt", 0, -84, 0); joint(point, "l_middle3_jnt", 0, -79, 0);
+    joint(point, "l_thumb2_jnt", 0, -55, 0);  joint(point, "l_thumb3_jnt", 0, -84, 0);
+    HandPose rest;
+    rest.name = "point_rest";
+    rest.posX = -0.0404f; rest.posY = -0.0061f; rest.posZ = -0.0573f;
+    rest.handPitch = 68.10f; rest.handYaw = 87.56f; rest.handRoll = -33.24f;
+    joint(rest, "l_thumb1_jnt", 53, -10, -32);
+    joint(rest, "l_pinky1_jnt", 0, 13, 0);   joint(rest, "l_pinky2_jnt", 0, -42, 0);  joint(rest, "l_pinky3_jnt", 0, -47, 0);
+    joint(rest, "l_ring1_jnt", 0, 3, 0);     joint(rest, "l_ring2_jnt", 0, -39, 0);   joint(rest, "l_ring3_jnt", 0, -42, 0);
+    joint(rest, "l_middle1_jnt", 0, -8, 0);  joint(rest, "l_middle2_jnt", 0, -50, 0); joint(rest, "l_middle3_jnt", 0, -53, 0);
+    joint(rest, "l_thumb2_jnt", 0, -21, 8);  joint(rest, "l_thumb3_jnt", 0, -21, 0);
+    joint(rest, "l_index2_jnt", 0, -16, 0);  joint(rest, "l_index3_jnt", 0, -16, 0);
+    poses.push_back(point);
+    poses.push_back(rest);
+    if (pStylePose)
+    {
+        pStylePose[0] = "point";
+        pStylePose[1] = "";
+        pStylePose[2] = "point_rest";
+    }
 }
 
 void ModMain::SavePoses()
@@ -2602,6 +2802,19 @@ void ModMain::SavePoses()
         sn.append_attribute("name") = i == 1 ? "grab" : (i == 2 ? "rest" : "press");
         sn.append_attribute("pose") = m_stylePose[i].c_str();
         sn.append_attribute("amount") = m_stylePoseAmount[i];
+    }
+    pugi::xml_node rules = root.append_child("Rules");
+    rules.append_attribute("comment") = "Which animation an interaction gets; first match wins. type / mode: EArkInteractionType / EArkInteractionMode, -1 = any. class / text: substring of the entity class / prompt text, case-insensitive. style: 0 press, 1 grab, 2 none. hover: 0 = no hovering hand for it.";
+    for (const InteractRule& r : m_rules)
+    {
+        pugi::xml_node rn = rules.append_child("Rule");
+        rn.append_attribute("type") = r.type;
+        rn.append_attribute("mode") = r.mode;
+        rn.append_attribute("class") = r.classContains.c_str();
+        rn.append_attribute("text") = r.textContains.c_str();
+        rn.append_attribute("style") = r.style;
+        rn.append_attribute("hover") = r.hover;
+        rn.append_attribute("note") = r.note.c_str();
     }
     const fs::path path = GetPosesPath();
     if (!doc.save_file(path.c_str()))
@@ -3146,6 +3359,7 @@ void ModMain::SanitizeSettings()
         if (w.wall.Sanitize(d.wall)) fixed++;
         if (w.interact.Sanitize(d.interact)) fixed++;
         if (w.interactRest.Sanitize(d.interactRest)) fixed++;
+        if (w.interactForearm.Sanitize(d.interactForearm)) fixed++;
         fixF(w.wallPush, d.wallPush); fixF(w.wallPoseAmount, d.wallPoseAmount); fixF(w.fireCoupling, d.fireCoupling); fixF(w.fireCouplingTime, d.fireCouplingTime);
         fixF(w.aimRecoilScale, d.aimRecoilScale); fixF(w.aimKickScale, d.aimKickScale); fixF(w.aimSpreadMult, d.aimSpreadMult); fixF(w.hipSpreadMult, d.hipSpreadMult);
     }
@@ -3263,6 +3477,30 @@ namespace
     }
 }
 
+namespace
+{
+    //! Interaction reach correction per weapon (hand position, view space m), as lined up in play (3.10.3): the grip
+    //! decides where the support hand starts, and with it how the fingertip sits relative to the wrist at the end.
+    struct BuiltInInteract { const char* cls; float x, y, z; };
+    const BuiltInInteract s_builtInInteract[] = {
+        { "ArkWeaponEMPGrenade",          0.0f,    -0.1429f, 0.0f },
+        { "ArkWeaponInstalaser",          0.0f,    -0.1429f, 0.0f },
+        { "ArkWeaponLureGrenade",         0.0f,    -0.1485f, 0.0f },
+        { "ArkWeaponNullwaveTransmitter", 0.0f,    -0.1493f, 0.0f },
+        { "ArkWeaponPistol",              0.0f,    -0.1364f, 0.0f },
+        { "ArkWeaponRecyclerGrenade",     0.0f,    -0.1541f, 0.0f },
+        { "ArkWeaponStunGun",             0.0f,    -0.1026f, 0.0f },
+        { "ArkWeaponWrench",              0.0109f, -0.1324f, 0.0092f },
+        { "ArkWeaponExplosiveGrenade",    0.0f,    -0.1429f, 0.0f },
+        { "_none",                       -0.0020f, -0.1479f, 0.0f },
+    };
+    void ApplyBuiltInInteract(const char* cls, WeaponSettings& w)
+    {
+        for (const BuiltInInteract& b : s_builtInInteract)
+            if (strcmp(b.cls, cls) == 0) { w.interact.posX = b.x; w.interact.posY = b.y; w.interact.posZ = b.z; return; }
+    }
+}
+
 const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
 {
     static std::map<std::string, WeaponSettings> s_cache;
@@ -3271,6 +3509,14 @@ const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
     auto it = s_cache.find(weaponClass);
     if (it != s_cache.end())
         return &it->second;
+    if (strcmp(weaponClass, "_none") == 0)
+    {
+        WeaponSettings w; // no weapon: only the interaction correction means anything here
+        w.aim = WeaponSettings::DefaultAim();
+        ApplyBuiltInInteract(weaponClass, w);
+        w.valid = false;
+        return &s_cache.emplace(weaponClass, w).first->second;
+    }
     size_t n = 0;
     const BuiltInWeapon* t = BuiltInTable(n);
     for (size_t i = 0; i < n; i++)
@@ -3278,6 +3524,7 @@ const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
         if (strcmp(t[i].cls, weaponClass) != 0)
             continue;
         WeaponSettings w;
+        ApplyBuiltInInteract(weaponClass, w);
         w.aimAllowed = t[i].aimAllowed;
         w.wallPush = t[i].wallPush;
         w.fireCoupling = t[i].fireCoupling;
@@ -3858,6 +4105,7 @@ void ModMain::LoadWeapons()
         ReadPose(n, "aim_", w.aim, WeaponSettings::DefaultAim());
         ReadPose(n, "interact_", w.interact, PoseOffset());
         ReadPose(n, "interact_rest_", w.interactRest, PoseOffset());
+        ReadPose(n, "interact_forearm_", w.interactForearm, PoseOffset());
         {
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
@@ -3899,6 +4147,7 @@ void ModMain::SaveWeapons()
         n.append_attribute("wall_pose_amount") = kv.second.wallPoseAmount;
         WritePose(n, "interact_", kv.second.interact);
         WritePose(n, "interact_rest_", kv.second.interactRest);
+        WritePose(n, "interact_forearm_", kv.second.interactForearm);
     }
     const fs::path path = GetWeaponsPath();
     if (!doc.save_file(path.c_str()))
@@ -3934,6 +4183,7 @@ void ModMain::InitHooks()
     s_hookFireWeapon.SetHookFunc(&CArkWeapon_FireWeapon_Hook);
     s_hookInteract.SetHookFunc(&ArkPlayerInteraction_Interact_Hook);
     s_hookStartCarrying.SetHookFunc(&ArkPlayerCarry_StartCarrying_Hook);
+    s_hookPerformInteraction.SetHookFunc(&ArkPlayerInteraction_PerformInteraction_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -4097,6 +4347,8 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_nozoom_fabricator", &s.interactNoZoomFabricator, s.interactNoZoomFabricator, VF_DUMPTOCHAIR, "Viewmodel Tweaks: the same for fabricators (ui_examine_fabricator) (0/1)");
     REGISTER_CVAR2("vm_interact_nozoom_security", &s.interactNoZoomSecurity, s.interactNoZoomSecurity, VF_DUMPTOCHAIR, "Viewmodel Tweaks: the same for security stations (ui_examine_securitystation) (0/1)");
     REGISTER_CVAR2("vm_interact_nozoom_workstation", &s.interactNoZoomWorkstation, s.interactNoZoomWorkstation, VF_DUMPTOCHAIR, "Viewmodel Tweaks: the same for workstations (ui_examine_workstation) (0/1)");
+    REGISTER_CVAR2("vm_interact_grab_apex", &s.interactGrabAtApex, s.interactGrabAtApex, VF_DUMPTOCHAIR, "Viewmodel Tweaks: grab-style interactions fire when the reach is at its apex instead of after vm_interact_fire_delay (0/1)");
+    REGISTER_CVAR2("vm_interact_carry_apex", &s.interactCarryAtApex, s.interactCarryAtApex, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carrying starts when the hand gets there - the game's carry delay is stretched to the reach (0/1)");
     REGISTER_CVAR2("vm_interact_exam_gentle", &s.interactExamGentle, s.interactExamGentle, VF_DUMPTOCHAIR, "Viewmodel Tweaks: on screens the press uses its own gentler style, vm_interact_press_exam_* (0/1)");
     REGISTER_CVAR2("vm_interact_show_arms", &s.interactShowArms, s.interactShowArms, VF_DUMPTOCHAIR, "Viewmodel Tweaks: show the arms for the reach where the game hides them - unarmed, screens (0/1)");
     REGISTER_CVAR2("vm_interact_correct", &s.interactCorrGain, s.interactCorrGain, VF_DUMPTOCHAIR, "Viewmodel Tweaks: closed-loop correction of the hand position per frame (0 = off, 0.5 default, 1 = full)");
@@ -4651,9 +4903,7 @@ void ModMain::DrawHandPoseEditor()
     ImGui::Separator();
     // --- pose being edited ------------------------------------------------------------------------------
     if (m_poses.empty())
-    {
-        HandPose p; p.name = "point"; m_poses.push_back(p);
-    }
+        SeedDefaultPoses(m_poses, nullptr);
     m_editPose = clamp_tpl(m_editPose, 0, (int)m_poses.size() - 1);
     HandPose& P = m_poses[(size_t)m_editPose];
     if (ImGui::BeginCombo("Edit pose", P.name.c_str()))
@@ -4731,7 +4981,11 @@ void ModMain::DrawHandPoseEditor()
         ch |= SliderDeg("Wrist pitch##w", w.interact.pitch, 60.0f, "This weapon only: extra wrist pitch.");
         ch |= SliderDeg("Wrist yaw##w", w.interact.yaw, 60.0f, "This weapon only: extra wrist yaw.");
         ch |= SliderDeg("Wrist roll##w", w.interact.roll, 60.0f, "This weapon only: extra wrist roll.");
-        if (ImGui::Button("Reset this weapon's correction")) { w.interact.Reset(); ch = true; }
+        ImGui::TextDisabled("Forearm (turns under the wrist; the hand keeps its orientation)");
+        ch |= SliderDeg("Forearm pitch##w", w.interactForearm.pitch, 90.0f, "This weapon only: rotates the forearm about its own axes while the hand is posed / resting. The wrist is pushed absolutely, so it stays put - use this when the wrist looks over-twisted against the forearm.");
+        ch |= SliderDeg("Forearm yaw##w", w.interactForearm.yaw, 90.0f, nullptr);
+        ch |= SliderDeg("Forearm roll (twist)##w", w.interactForearm.roll, 90.0f, nullptr);
+        if (ImGui::Button("Reset this weapon's correction")) { w.interact.Reset(); w.interactForearm.Reset(); ch = true; }
         ImGui::PopID();
         if (ch)
         {
@@ -4833,8 +5087,13 @@ void ModMain::DrawInteractTab()
             CheckboxInt("Cancel if the crosshair moved to another object", s.interactCancelRetarget,
                 "Off: the interaction happens on whatever is under the crosshair when the delay ends (never loses an input).\n"
                 "On: it is dropped when the target changed in between.");
+            CheckboxInt("Grabs fire at the apex of the reach instead", s.interactGrabAtApex,
+                "Pickups, loot and the like happen when the hand is closest to the object (the grab's reach time), not after the fixed delay above.");
             ImGui::Unindent();
         }
+        CheckboxInt("Pick physics objects up when the hand gets there", s.interactCarryAtApex,
+            "Carrying is animated only when the carry really starts (a short press on something that needs a hold shows nothing), and the game's own "
+            "pickup delay is stretched to the reach so the object leaves the ground at the apex of the grab.");
         const char* targetModes[] = { "Crosshair hit point on the object", "Object centre", "Fixed point ahead (test point)" };
         ImGui::Combo("Hand goes to", &s.interactTargetMode, targetModes, 3);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the hand reaches. The hit point is where the crosshair ray meets the object (a button's face); falls back to the object centre.");
@@ -4862,8 +5121,73 @@ void ModMain::DrawInteractTab()
             SliderCm("Below the eye", s.interactMaxDown, 100.0f, nullptr);
             ImGui::TreePop();
         }
-        if (ImGui::TreeNode("Which interactions animate"))
+        if (ImGui::TreeNode("Which interactions animate, and how"))
         {
+            ImGui::TextWrapped("Built in: pickups, consumables, carrying, equipping, examining and the loot action grab; everything else presses. "
+                               "The rules below override that by what the thing is (first match wins). 'Add from the last interaction' makes a rule "
+                               "for whatever you just used - then pick press / grab / none for it.");
+            ImGui::TextDisabled("Last interaction: %s / %s on %s", InteractionTypeName(I.lastType), InteractionModeName(I.lastMode), I.lastEntity.empty() ? "-" : I.lastEntity.c_str());
+            if (ImGui::Button("Add a rule from the last interaction") && I.lastType >= 0)
+            {
+                InteractRule r;
+                r.type = -1;
+                r.mode = I.lastMode;
+                r.classContains = I.lastClass;
+                r.textContains = I.lastText;
+                r.style = 0;
+                r.note = "";
+                m_rules.insert(m_rules.begin(), r);
+                m_editRule = 0;
+                m_posesDirty = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset the rules to the defaults")) { m_rules.clear(); SeedDefaultRules(); m_posesDirty = true; }
+            const char* styleNames[] = { "press", "grab", "none" };
+            const char* modeNames[] = { "any mode", "use", "hold use", "loot", "special" };
+            for (int i = 0; i < (int)m_rules.size(); i++)
+            {
+                InteractRule& r = m_rules[(size_t)i];
+                ImGui::PushID(i);
+                char label[200];
+                snprintf(label, sizeof(label), "%d. %s -> %s%s%s", i + 1,
+                    r.note.empty() ? (r.classContains.empty() && r.textContains.empty() ? "(any)" : (r.classContains + (r.textContains.empty() ? "" : " \"" + r.textContains + "\"")).c_str()) : r.note.c_str(),
+                    styleNames[clamp_tpl(r.style, 0, 2)], r.hover == 0 && r.style != 2 ? " (no hover)" : "", r.mode >= 0 ? (std::string(" [") + modeNames[clamp_tpl(r.mode + 1, 0, 4)] + "]").c_str() : "");
+                if (ImGui::TreeNode("rule", "%s", label))
+                {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s", r.note.c_str()); ImGui::SetNextItemWidth(260);
+                    if (ImGui::InputText("Note", buf, sizeof(buf))) { r.note = buf; m_posesDirty = true; }
+                    snprintf(buf, sizeof(buf), "%s", r.classContains.c_str()); ImGui::SetNextItemWidth(260);
+                    if (ImGui::InputText("Entity class contains", buf, sizeof(buf))) { r.classContains = buf; m_posesDirty = true; }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Case-insensitive substring of the entity class name (e.g. Container, ArkHuman, ArkHarvestable, ArkWeapon). Empty = any.");
+                    snprintf(buf, sizeof(buf), "%s", r.textContains.c_str()); ImGui::SetNextItemWidth(260);
+                    if (ImGui::InputText("Prompt text contains", buf, sizeof(buf))) { r.textContains = buf; m_posesDirty = true; }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Case-insensitive substring of the interaction's prompt text (e.g. talk). Empty = any.");
+                    int modeSel = clamp_tpl(r.mode + 1, 0, 4);
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Mode", &modeSel, modeNames, 5)) { r.mode = modeSel - 1; m_posesDirty = true; }
+                    int typeSel = r.type < 0 ? 0 : r.type;
+                    const char* typeSelNames[] = { "any type", "none", "scriptDefined", "unavailable", "codeDefined", "pickup", "consume", "carry", "hack", "repair", "fortify", "examine", "equip", "hoover" };
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Type", &typeSel, typeSelNames, 14)) { r.type = typeSel == 0 ? -1 : typeSel; m_posesDirty = true; }
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Animation", &r.style, styleNames, 3)) m_posesDirty = true;
+                    if (r.style != 2)
+                    {
+                        bool hv = r.hover != 0;
+                        if (ImGui::Checkbox("Hovering hand comes up for it", &hv)) { r.hover = hv ? 1 : 0; m_posesDirty = true; }
+                    }
+                    if (ImGui::Button("Up") && i > 0) { std::swap(m_rules[(size_t)i], m_rules[(size_t)i - 1]); m_posesDirty = true; }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Down") && i + 1 < (int)m_rules.size()) { std::swap(m_rules[(size_t)i], m_rules[(size_t)i + 1]); m_posesDirty = true; }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Delete")) { m_rules.erase(m_rules.begin() + i); m_posesDirty = true; ImGui::TreePop(); ImGui::PopID(); break; }
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            ImGui::Spacing();
+            ImGui::Text("Interaction types that animate at all");
             typeMaskEditor(s.interactTypeMask, "types");
             CheckboxInt("Remote manipulation (psi) mode", s.interactRemoteMode);
             ImGui::TreePop();

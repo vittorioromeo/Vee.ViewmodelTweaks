@@ -275,11 +275,18 @@ Version notes at the end.
   re-validating the target. `PerformInteraction`'s own `delay` only feeds the carry type.
   Modes: 0 use, 1 holdUse, 2 loot, 3 special, 4 remoteManipulation. Types: 1 scriptDefined, 3 codeDefined,
   4 pickup, 5 consume, 6 carry, 7 hack, 8 repair, 9 fortify, 10 examine, 11 equip, 12 hoover.
-* Carry is never deferred, and `ArkPlayerCarry::StartCarrying` (`0x122FC50`) is hooked to refuse a null
-  entity: when `m_carryDelay` (`+0x460`) runs out, `ArkPlayerInteraction::Update` (`+0x161A`) calls
-  `StartCarrying(pCurrentTarget, false, false)` with the target selector's *current* entity, null whenever
-  the crosshair has left the object (menu, mimic form, dead) - a vanilla crash (`mov rax,[rsi]` at
-  `+0x122FD2D`) that a longer press-to-pickup window makes real.
+* Carry is never deferred through `Interact`; it is handled at `ArkPlayerInteraction::PerformInteraction`
+  (`0x1566B10`, pre-hook): `PerformInteraction(carry, mode, entity, delay)` with `delay > 0` arms
+  `m_carryDelay` (`+0x460`, plus the entity's `audioTrigger_HoldCarryStart`) and `ArkPlayerInteraction::Update`
+  (`+0x161A`) calls `StartCarrying(pCurrentTarget, false, false)` when it runs out; with `delay <= 0` it picks
+  the object up on the spot. Raising the delay to the grab's reach time puts the pickup at the apex with the
+  game's own bookkeeping. `pCurrentTarget` is the target selector's *current* entity, null whenever the
+  crosshair has left the object (menu, mimic form, dead), and `StartCarrying` (`0x122FC50`) dereferences it -
+  a vanilla crash (`mov rax,[rsi]` at `+0x122FD2D`) that any delay makes real, hence the null-guard hook.
+  `OnActionUse` (`0x1563F60`): press (activation 1) calls `Interact(use)` at once only when the target has no
+  hold-use interaction; otherwise the short press fires `Interact(use)` on release and the hold (activation 4)
+  fires `Interact(holdUse)`. A carry that needs Leverage only reaches `PerformInteraction(carry)` from the hold,
+  which is why the animation hangs off that call and not off `Interact`.
 * "Something usable in front of us" for the hover hand is simply `m_usableEntityId != 0` plus the four
   modes' types - the same data the game shows its prompt from. No extra ray until the point is needed.
 * Auto zoom-in on screens: `ArkInteractiveScreen::OnInteraction` (`0x139B9F0`) asks
@@ -433,6 +440,25 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.10.3: `ui_examine_*` are re-registered by the game on level load (their defaults come back), so
+  `ApplyExamineCVars` now writes whenever the live value differs. The reach envelope scales the whole wrist
+  vector by one factor (direction to the target kept; a per-axis clamp left the hand on the box's floor at the
+  object's distance - "stops short" of things on the ground, default below-eye limit raised to 0.8 m) and takes
+  effect in proportion to the blend (at the start of a hover the hand is where the animation has it, and for
+  one-handed weapons that is outside the box: clamping it there was the remaining "pops in" of the wrench /
+  grenades). Per-weapon forearm rotation (`interact_forearm_*`, additive in model space from last frame's
+  forearm frame; the hand's absolute wrist push keeps the hand where it is). Interaction *rules*
+  (`<Rules>` in the poses file, `InteractRule`, `ResolveStyle`): first match on type / mode / entity class
+  substring / prompt text substring gives press / grab / none and whether the hovering hand comes up; seeded
+  with talk (ArkHuman + "talk") = none, ArkHuman = grab, *Container* = grab, ArkHarvestable = grab, hold-use
+  on ArkWeapon* (take ammo) = grab; "add a rule from the last interaction" in the tab. Carrying moved to a
+  pre-hook of `ArkPlayerInteraction::PerformInteraction` (0x1566B10): the grab plays only when the carry
+  really begins (a short press on something that needs a hold never gets there), and with
+  `vm_interact_carry_apex` the `_delay` argument is raised to the grab's reach time - PerformInteraction then
+  arms `m_carryDelay` itself and `Update` calls StartCarrying when it runs out (with our null guard), so no
+  state of ours can go stale. Grab-style interactions fire at the apex (`vm_interact_grab_apex`). Defaults
+  (timings, envelope, rest spots, drift, hover, no-zoom switches, the point / point_rest poses, per-weapon
+  corrections) updated to the values tuned in play; `_none` has a built-in entry now.
 * 3.10.2 cleanup, no behaviour change: removed the dead ends as options (every-joint / render-side shift,
   own operator queue, right-arm hide, arm extension, cursor source / flip-y / follow test - the click is the
   centre ray, full stop) and their code; the Interact tab regrouped (Reach / Screens and keypads / Resting

@@ -74,24 +74,48 @@ struct PoseOffset
 //! Distances are meters in view space (X right, Y forward, Z up), times in seconds, angles in degrees.
 struct ReachStyle
 {
-    float reachTime = 0.22f;    //!< hand travels to the target
-    float holdTime = 0.08f;     //!< stays there
+    // Defaults are the press as tuned in play (3.10.3).
+    float reachTime = 0.20f;    //!< hand travels to the target
+    float holdTime = 0.06f;     //!< stays there
     float returnTime = 0.30f;   //!< travels back to the animated pose
-    float amount = 1.0f;        //!< fraction of the way to the target (1 = touch it)
-    float offX = 0.0f, offY = -0.05f, offZ = 0.0f;  //!< target offset (e.g. stop a little short of the surface)
-    float arcX = 0.0f, arcZ = 0.0f;                 //!< sideways / vertical bulge of the way out (sine, peaks half-way)
+    float amount = 1.0f;        //!< fraction of the way to the target (1 = touch it, more overshoots)
+    float offX = -0.0067f, offY = -0.0028f, offZ = -0.0013f;  //!< target offset (e.g. stop a little short of the surface)
+    float arcX = -0.0027f, arcZ = 0.0378f;          //!< sideways / vertical bulge of the way out (sine, peaks half-way)
     float retArcX = 0.0f, retArcZ = 0.0f;           //!< the same for the way back
-    float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;    //!< hand rotation at the target (additive, degrees)
+    float pitch = -2.07f, yaw = -2.07f, roll = -1.7f; //!< hand rotation at the target (additive, degrees)
 
     float Duration() const { return reachTime + holdTime + returnTime; }
+    //! The grab: a little slower, overshoots, sweeps in from the side and drops on the way back.
+    static ReachStyle Grab()
+    {
+        ReachStyle r;
+        r.reachTime = 0.25f; r.holdTime = 0.06f; r.returnTime = 0.30f; r.amount = 1.5f;
+        r.offX = 0.0012f; r.offY = 0.0006f; r.offZ = -0.0006f;
+        r.arcX = -0.0324f; r.arcZ = -0.03f; r.retArcX = 0.0f; r.retArcZ = -0.06f;
+        r.pitch = -15.0f; r.yaw = 0.0f; r.roll = 20.0f;
+        return r;
+    }
     //! Softer variant for screens: slower in and out, a shorter way (the hand starts from the resting spot).
     static ReachStyle GentlePress()
     {
         ReachStyle r;
-        r.reachTime = 0.32f; r.holdTime = 0.10f; r.returnTime = 0.40f;
-        r.offY = -0.03f;
+        r.reachTime = 0.31f; r.holdTime = 0.05f; r.returnTime = 0.29f;
+        r.offX = 0.0f; r.offY = -0.03f; r.offZ = 0.0f; r.arcX = r.arcZ = 0.0f; r.pitch = r.yaw = r.roll = 0.0f;
         return r;
     }
+};
+
+//! Which animation an interaction gets, by what it is. First matching rule wins; no match = the built-in choice
+//! (grab for pickups / consumables / carry / equip / examine and the loot mode, press otherwise).
+struct InteractRule
+{
+    int type = -1;              //!< EArkInteractionType, -1 = any
+    int mode = -1;              //!< EArkInteractionMode, -1 = any
+    std::string classContains;  //!< entity class name contains this (case-insensitive), empty = any
+    std::string textContains;   //!< the prompt text (m_displayText) contains this (case-insensitive), empty = any
+    int style = 0;              //!< 0 press, 1 grab, 2 none (no animation, no hovering hand)
+    int hover = 1;              //!< 0 = the hovering hand does not come up for this either
+    std::string note;           //!< what it is for (shown in the list)
 };
 
 //! All user-tunable global settings. Backed by CVars flagged VF_DUMPTOCHAIR so Chairloader
@@ -176,7 +200,7 @@ struct ViewmodelSettings
     float interactFireDelay = 0.15f;//!< seconds from the key press to the actual interaction (when deferring)
     int   interactCancelRetarget = 0; //!< Drop the deferred interaction if the crosshair moved to another object meanwhile.
     int   interactTargetMode = 0;   //!< 0 = the point the crosshair ray hits on the object (fallback: object centre), 1 = object centre, 2 = fixed point ahead
-    int   interactWhileAiming = 0;  //!< Also animate while aiming down sights (default: the sights win).
+    int   interactWhileAiming = 1;  //!< Also animate while aiming down sights (default: the sights win).
     int   interactForceLeftIk = 1;  //!< Force the left arm's IK weight to 1 during the reach (one-handed stances otherwise ignore the target).
     int   interactRotate = 1;       //!< Push the style's hand rotation too (the rig may or may not honour it).
     float interactCorrGain = 0.5f;  //!< closed-loop hand position correction per frame (0 = off)
@@ -186,48 +210,50 @@ struct ViewmodelSettings
     int   interactExamKey2 = 0x11;  //!< second one (default eKI_E)
     PoseOffset examCorr;            //!< extra hand correction applied only while on a screen (m, deg) - big ranges, for tuning
     float interactExamBodyX = 0.0f, interactExamBodyY = 0.0f, interactExamBodyZ = 0.0f; //!< on screens: move the whole arms/torso relative to the camera (view space, m) - brings the shoulder within reach
-    int   interactExamAutoBody = 1; //!< on screens: bring the body forward automatically when the wrist would be beyond the arm's length
-    float interactExamArmLength = 0.55f; //!< shoulder-to-wrist distance the auto body offset keeps (m)
-    float interactExamMinTargetDist = 0.35f; //!< on screens: targets closer than this to the camera (keypads you are nose-to-nose with) are not reached for
+    int   interactExamAutoBody = 0; //!< on screens: bring the body forward automatically when the wrist would be beyond the arm's length
+    float interactExamArmLength = 0.34f; //!< shoulder-to-wrist distance the auto body offset keeps (m)
+    float interactExamMinTargetDist = 0.0f; //!< on screens: targets closer than this to the camera (keypads you are nose-to-nose with) are not reached for
     int   interactExamFovMode = 0;  //!< camera FOV while on a screen: 0 = the game's zoom, 1 = no zoom (regular cl_hfov), 2 = custom (interactExamFov)
-    float interactExamFov = 70.0f;  //!< custom horizontal FOV on screens (deg)
+    float interactExamFov = 60.0f;  //!< custom horizontal FOV on screens (deg)
     int   interactDebugMarker = 0;  //!< draw the reach target (red) and the asked hand position (green) in the world
     int   interactExamRest = 1;     //!< On screens: keep the arms shown and hold the pointing hand at a resting spot between clicks.
-    float interactRestX = -0.14f, interactRestY = 0.42f, interactRestZ = -0.16f; //!< resting spot outside screens (view space, m)
-    float interactRestExamX = -0.14f, interactRestExamY = 0.42f, interactRestExamZ = -0.16f; //!< resting spot on screens (view space, m)
+    float interactRestX = -0.0585f, interactRestY = 0.0433f, interactRestZ = -0.0698f; //!< resting spot outside screens (view space, m)
+    float interactRestExamX = -0.0697f, interactRestExamY = 0.0757f, interactRestExamZ = -0.0901f; //!< resting spot on screens (view space, m)
     int   interactHoverWhileAiming = 0;  //!< hover hand also while aiming down sights (off: the support hand stays on the gun)
     int   interactIkWeightRamp = 1;      //!< blend the left arm's IK weight in with the reach / rest instead of forcing 1 (one-handed weapons animate it at 0: forcing snaps the hand)
-    float interactRestBlendTime = 0.35f; //!< seconds to settle into / out of the resting spot
+    float interactRestBlendTime = 0.20f; //!< seconds to settle into / out of the resting spot
     float interactExamLeaveTime = 0.4f;  //!< seconds over which everything screen-specific (body shift, screen corrections, limits) fades when leaving a screen
-    float interactRestSwayPos = 0.012f;  //!< resting hand: slow drift amplitude (m; vertical 60 % of it, forward 30 %)
-    float interactRestSwayRot = 2.0f;    //!< resting hand: slow drift amplitude (degrees)
-    float interactRestSwayFreq = 0.35f;  //!< Hz of the slow axis
-    int   interactHoverRest = 0;         //!< Outside screens too: hold the resting hand up while looking at something usable within reach
+    float interactRestSwayPos = 0.0034f;  //!< resting hand: slow drift amplitude (m; vertical 60 % of it, forward 30 %)
+    float interactRestSwayRot = 1.6f;    //!< resting hand: slow drift amplitude (degrees)
+    float interactRestSwayFreq = 0.15f;  //!< Hz of the slow axis
+    int   interactHoverRest = 1;         //!< Outside screens too: hold the resting hand up while looking at something usable within reach
     int   interactHoverTypeMask = 0x1FFA;//!< which interaction types (EArkInteractionType bits) bring the hand up
-    float interactHoverMaxDist = 1.6f;   //!< only when the usable thing is closer than this (m, from the camera)
-    float interactHoverTowards = 0.35f;  //!< 0 = plain resting spot, 1 = the hand hovers right at the target (pose offset included)
+    float interactHoverMaxDist = 2.0f;   //!< only when the usable thing is closer than this (m, from the camera)
+    float interactHoverTowards = 0.20f;  //!< 0 = plain resting spot, 1 = the hand hovers right at the target (pose offset included)
     int   interactHoverUnarmed = 1;      //!< also with no weapon out (the arms are shown for it)
     int   interactHoverWeapon = 1;       //!< also with a weapon out (the support hand leaves the grip)
     int   interactNoZoomKeypad = 1;      //!< use keypads from where you stand: no automatic zoom-in (the game's ui_examine_keypad)
-    int   interactNoZoomFabricator = 0;  //!< the same for fabricators (ui_examine_fabricator)
-    int   interactNoZoomSecurity = 0;    //!< ... security stations (ui_examine_securitystation)
-    int   interactNoZoomWorkstation = 0; //!< ... workstations (ui_examine_workstation)
+    int   interactNoZoomFabricator = 1;  //!< the same for fabricators (ui_examine_fabricator)
+    int   interactNoZoomSecurity = 1;    //!< ... security stations (ui_examine_securitystation)
+    int   interactNoZoomWorkstation = 1; //!< ... workstations (ui_examine_workstation)
     int   interactExamGentle = 1;        //!< on screens the press uses its own, gentler style (pressExam)
     int   interactShowArms = 1;     //!< Un-hide the arms while a reach plays in a state where the game hides them (unarmed, screens).
     int   interactWristMode = 2;    //!< how a pose's wrist orientation is applied: 0 = on the IK target joint, 1 = on the hand joint (relative to the forearm), 2 = both
-    int   interactEaseIn = 2;       //!< reach easing: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 ease in-out
-    int   interactEaseOut = 4;      //!< return easing (same list)
+    int   interactEaseIn = 4;       //!< reach easing: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 ease in-out
+    int   interactEaseOut = 2;      //!< return easing (same list)
     int   interactTypeMask = 0x1FFF & ~((1 << 0) | (1 << 2) | (1 << 12)); //!< EArkInteractionType bits that animate (default: all but none/unavailable/hoover)
     int   interactRemoteMode = 0;   //!< Animate the remote-manipulation (psi) mode too.
-    float interactMaxForward = 0.65f; //!< reach envelope, view space (m): furthest the wrist goes forward
-    float interactExamMaxForward = 0.72f; //!< the same on in-world screens (the arms are moved to the examination camera, the arm has its full length)
+    float interactMaxForward = 0.75f; //!< reach envelope, view space (m): furthest the wrist goes forward
+    float interactExamMaxForward = 1.0f; //!< the same on in-world screens (the arms are moved to the examination camera, the arm has its full length)
     float interactMinForward = 0.12f; //!< ... nearest
     float interactMaxSide = 0.40f;    //!< ... left / right of the eye
     float interactMaxUp = 0.30f;      //!< ... above the eye
-    float interactMaxDown = 0.50f;    //!< ... below the eye
+    float interactMaxDown = 0.80f;    //!< ... below the eye
     float interactTestX = 0.0f, interactTestY = 0.45f, interactTestZ = -0.08f; //!< fixed test point (view space, m)
     ReachStyle press;               //!< buttons, switches, terminals, hacking, repairs (scriptDefined / codeDefined / hack / repair / fortify)
-    ReachStyle grab;                //!< pickups, loot, consumables, carry, equip, examine
+    ReachStyle grab = ReachStyle::Grab(); //!< pickups, loot, consumables, carry, equip, examine
+    int   interactGrabAtApex = 1;   //!< grab-style interactions (and carrying) fire at the end of the reach instead of after interactFireDelay
+    int   interactCarryAtApex = 1;  //!< carrying starts when the hand gets there (the game's own carry delay is lengthened to the reach)
     ReachStyle pressExam = ReachStyle::GentlePress(); //!< the press while a screen / keypad is up (close to it, from the resting hand)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
@@ -444,7 +470,8 @@ struct InteractState
 
     // Debug
     int lastType = -1, lastMode = -1;
-    std::string lastEntity;
+    std::string lastEntity;         //!< class 'name' of the last interaction's entity (debug / rule editor)
+    std::string lastClass, lastText;//!< its class and prompt text, for "add a rule from the last interaction"
     int started = 0, deferred = 0, fired = 0, dropped = 0, skipped = 0;
     std::string skipReason;
 };
@@ -496,6 +523,7 @@ struct WeaponSettings
     float hipSpreadMult = 1.0f;     //!< Per-weapon spread multiplier while not aiming (times the global one).
     PoseOffset interact;            //!< Interaction reach correction for this weapon: hand position offset (m, view space) and wrist rotation (deg), on top of the pose.
     PoseOffset interactRest;        //!< Where this weapon's resting / hovering hand waits, relative to the resting spot (position, m, view space; rotation unused).
+    PoseOffset interactForearm;     //!< Extra rotation of the left forearm (about its own axes, degrees) while the hand is posed; the hand keeps its own orientation. Position unused.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
     static PoseOffset DefaultAim()
@@ -870,6 +898,8 @@ public:
     //! ArkPlayerInteraction::Interact pre-hook. Starts the support-hand reach and, when deferring, stores the
     //! call for later. Returns true if the original call must NOT run now (it has been deferred).
     bool OnInteract(void* pInteraction, int mode);
+    //! PerformInteraction(carry) hook: the grab plays and the game's own carry delay is stretched to the apex. Returns the delay to use.
+    float OnPerformCarry(void* pInteraction, int mode, IEntity* pEntity, float delay);
     //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
     void StartReach(int style, const Vec3* pWorld);
     const InteractState& GetInteract() const { return m_interact; }
@@ -903,6 +933,13 @@ private:
 
     // Hand poses (Vee.ViewmodelTweaks.poses.xml)
     std::vector<HandPose> m_poses;
+    std::vector<InteractRule> m_rules;  //!< which animation an interaction gets (poses file, <Rules>)
+    int m_editRule = -1;
+    //! Style for an interaction: 0 press, 1 grab, 2 none. className / text may be null.
+    int ResolveStyle(int type, int mode, const char* className, const char* text, bool* pHover = nullptr) const;
+    void SeedDefaultRules();
+    static void SeedDefaultPoses(std::vector<HandPose>& poses, std::string* pStylePose);
+
     std::string m_stylePose[3] = { "point", "", "" };  //!< pose used by the press / grab styles and the resting hand ("" = fingers keep the animation; rest: "" = the press pose)
     float m_stylePoseAmount[3] = { 1.0f, 1.0f, 1.0f };
     int m_uiExamineApplied[4] = { -1, -1, -1, -1 };    //!< what we last wrote to ui_examine_{keypad,fabricator,securitystation,workstation} (-1 = nothing yet)
