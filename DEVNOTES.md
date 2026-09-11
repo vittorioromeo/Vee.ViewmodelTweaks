@@ -440,6 +440,27 @@ tab: pushes, pushes not applied, chain resets, NaN recoveries.
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 3.10.4: carrying re-done around what testing showed. `OnActionUse` sends `Interact(holdUse)` on the first
+  hold event, i.e. right after the press, and for a heavy object the Lua then calls `PerformInteraction(carry,
+  ..., delay = the hold-to-lift time)`: the game's own "hold" IS `m_carryDelay`, and `StopHoldToUseInteract`
+  (`0x1567640`, on release) ends with `m_carryDelay.Invalidate()` (`m_timeRemaining = -1`), which is why a
+  released key never picked the object up once the delay had been stretched. So now: `OnPerformCarry` only
+  schedules - the grab starts after `max(delay, vm_interact_carry_hold)` and the carry timer is set to that
+  plus the reach - and `UpdateCarry` watches `m_carryDelay.m_timeRemaining`: below zero before
+  `StartCarrying` (our hook sets `carryStarted`) means the key was released -> the pending grab is dropped or
+  the playing one goes straight into its return. A tap shows nothing; a heavy object's grab starts when the
+  hold completes; the pickup is at the apex either way; no entity pointer is kept (the id is looked up when
+  the grab starts). The one-handed "pop" was the *start* of the blend, not the envelope: the support hand is
+  animated off screen when it is not on the weapon (left IK weight 0) and with no weapon, and any blend from
+  there crosses into view in a couple of frames. `vm_interact_hidden_start`: the hand comes up from a fixed
+  spot below the view (global `vm_interact_start_*`, per-weapon `interact_start_*`) with the IK weight on from
+  the first frame; the additive is still computed against the true animated joint. Styles carry
+  `envelope` (limits x this, with the reach) and `along` (target moved along the camera -> object line) for
+  grabs down to the floor. The style's hand rotation is applied inside `PushHandPose` too (a pose owning the
+  wrist skipped the additive route, so it "did nothing" whenever the resting hand was up). Third reach style
+  `punch` (`vm_interact_punch_*`, pose slot "punch", test button) for a later quick-melee key. Forearm and
+  wrist corrections of the shotgun / GooGun / ToyGun baked into the built-ins; seeded rules use the prompt
+  tokens (`@use_npc`) rather than English words.
 * 3.10.3: `ui_examine_*` are re-registered by the game on level load (their defaults come back), so
   `ApplyExamineCVars` now writes whenever the live value differs. The reach envelope scales the whole wrist
   vector by one factor (direction to the target kept; a per-axis clamp left the hand on the box's floor at the

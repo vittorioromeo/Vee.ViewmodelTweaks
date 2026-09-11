@@ -83,8 +83,19 @@ struct ReachStyle
     float arcX = -0.0027f, arcZ = 0.0378f;          //!< sideways / vertical bulge of the way out (sine, peaks half-way)
     float retArcX = 0.0f, retArcZ = 0.0f;           //!< the same for the way back
     float pitch = -2.07f, yaw = -2.07f, roll = -1.7f; //!< hand rotation at the target (additive, degrees)
+    float envelopeScale = 1.0f; //!< the reach envelope's limits times this while this style plays (relax it for grabs down to the floor)
+    float along = 0.0f;         //!< moves the target along the camera -> target line (m; + = beyond the object, into it)
 
     float Duration() const { return reachTime + holdTime + returnTime; }
+    //! Quick melee: fast, straight ahead, snaps back.
+    static ReachStyle Punch()
+    {
+        ReachStyle r;
+        r.reachTime = 0.12f; r.holdTime = 0.04f; r.returnTime = 0.28f; r.amount = 1.0f;
+        r.offX = r.offY = r.offZ = 0.0f; r.arcX = 0.0f; r.arcZ = -0.02f; r.retArcX = 0.0f; r.retArcZ = -0.04f;
+        r.pitch = r.yaw = r.roll = 0.0f;
+        return r;
+    }
     //! The grab: a little slower, overshoots, sweeps in from the side and drops on the way back.
     static ReachStyle Grab()
     {
@@ -255,6 +266,10 @@ struct ViewmodelSettings
     int   interactGrabAtApex = 1;   //!< grab-style interactions (and carrying) fire at the end of the reach instead of after interactFireDelay
     int   interactCarryAtApex = 1;  //!< carrying starts when the hand gets there (the game's own carry delay is lengthened to the reach)
     ReachStyle pressExam = ReachStyle::GentlePress(); //!< the press while a screen / keypad is up (close to it, from the resting hand)
+    ReachStyle punch = ReachStyle::Punch(); //!< quick melee (style 2), for a later melee key; test button for now
+    float interactCarryHoldTime = 0.15f; //!< carrying: the key has to be held this long before the grab starts (a tap does nothing)
+    int   interactHiddenStart = 1;  //!< when the support hand is not on the weapon (one-handed weapons, no weapon), the hand comes up from a fixed spot below the view instead of from wherever the animation has it
+    float interactStartX = -0.15f, interactStartY = 0.35f, interactStartZ = -0.55f; //!< that spot (view space, m)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -469,6 +484,15 @@ struct InteractState
     Vec3 lastReach = Vec3(ZERO);    //!< last frame's reach part of the additive (without the body shift), model space
 
     // Debug
+    // Carrying (see OnPerformCarry): the grab starts once the key has been held, the game's carry delay ends at its apex
+    bool hiddenStartUsed = false;   //!< this frame the hand comes up from the fixed spot (support hand not on the weapon)
+    bool carryPending = false;      //!< waiting for the hold time before the grab starts
+    float carryStartIn = 0.0f;      //!< seconds until it does
+    unsigned carryEntityId = 0;     //!< what is being picked up (looked up again when the grab starts)
+    int carryStyle = 1;             //!< the style the rules gave it
+    bool carryAnimating = false;    //!< the grab is playing for a carry
+    bool carryStarted = false;      //!< StartCarrying happened (our hook)
+    int carryCancelled = 0;         //!< debug: carries the key was released on
     int lastType = -1, lastMode = -1;
     std::string lastEntity;         //!< class 'name' of the last interaction's entity (debug / rule editor)
     std::string lastClass, lastText;//!< its class and prompt text, for "add a rule from the last interaction"
@@ -524,6 +548,7 @@ struct WeaponSettings
     PoseOffset interact;            //!< Interaction reach correction for this weapon: hand position offset (m, view space) and wrist rotation (deg), on top of the pose.
     PoseOffset interactRest;        //!< Where this weapon's resting / hovering hand waits, relative to the resting spot (position, m, view space; rotation unused).
     PoseOffset interactForearm;     //!< Extra rotation of the left forearm (about its own axes, degrees) while the hand is posed; the hand keeps its own orientation. Position unused.
+    PoseOffset interactStart;       //!< This weapon's own "hand comes up from here" spot (view space, m), replaces the global one when non-zero. Rotation unused.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
     static PoseOffset DefaultAim()
@@ -898,8 +923,10 @@ public:
     //! ArkPlayerInteraction::Interact pre-hook. Starts the support-hand reach and, when deferring, stores the
     //! call for later. Returns true if the original call must NOT run now (it has been deferred).
     bool OnInteract(void* pInteraction, int mode);
-    //! PerformInteraction(carry) hook: the grab plays and the game's own carry delay is stretched to the apex. Returns the delay to use.
+    //! PerformInteraction(carry) hook: schedules the grab for when the key has been held, returns the carry delay to use (hold + reach).
     float OnPerformCarry(void* pInteraction, int mode, IEntity* pEntity, float delay);
+    void OnCarryStarted();              //!< ArkPlayerCarry::StartCarrying happened
+    void UpdateCarry(float dt);         //!< the pending / playing carry grab: start it, or call it off when the key was released
     //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
     void StartReach(int style, const Vec3* pWorld);
     const InteractState& GetInteract() const { return m_interact; }
@@ -940,8 +967,9 @@ private:
     void SeedDefaultRules();
     static void SeedDefaultPoses(std::vector<HandPose>& poses, std::string* pStylePose);
 
-    std::string m_stylePose[3] = { "point", "", "" };  //!< pose used by the press / grab styles and the resting hand ("" = fingers keep the animation; rest: "" = the press pose)
-    float m_stylePoseAmount[3] = { 1.0f, 1.0f, 1.0f };
+    std::string m_stylePose[4] = { "point", "", "", "" };  //!< pose slots: 0 press, 1 grab, 2 the resting hand, 3 punch ("" = fingers keep the animation; rest: "" = the press pose)
+    float m_stylePoseAmount[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    static int PoseSlotOfStyle(int style) { return style == 1 ? 1 : (style == 2 ? 3 : 0); } //!< reach style (0 press, 1 grab, 2 punch) -> pose slot
     int m_uiExamineApplied[4] = { -1, -1, -1, -1 };    //!< what we last wrote to ui_examine_{keypad,fabricator,securitystation,workstation} (-1 = nothing yet)
     int m_editPose = 0;                 //!< index of the pose being edited in the UI
     bool m_posesDirty = false;
