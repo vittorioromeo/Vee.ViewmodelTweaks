@@ -2313,7 +2313,11 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     // for a few frames (the weapon pose stacks blending out or in) and the camera frame changes. Reconstructing
     // from the read-back then sees jumps, resets the chain and repeats stale pushes - the hand blinked. During
     // those moments the last stable reconstruction is kept instead, and the hand simply rides the game's sway.
-    const bool transition = m_wsUnequipping || m_wsDrawing || m_wsSwitching || (examBlend > 0.001f && examBlend < 0.999f);
+    // The weapon flags are only meaningful outside screens: while examining, the game keeps the holstered weapon
+    // as "to be equipped" for the whole session, so m_wsUnequipping stays set and would freeze the chain there.
+    const bool weaponBusy = m_wsUnequipping || m_wsDrawing || m_wsSwitching;
+    const bool transition = (examBlend > 0.001f && examBlend < 0.999f) || (weaponBusy && examBlend <= 0.001f);
+    I.chainFrozen = transition;
     if (I.addValid)
     {
         if (!skeletonUpdated || transition)
@@ -6239,8 +6243,8 @@ void ModMain::DrawInteractTab()
         ImGui::TextDisabled("target view (%.2f %.2f %.2f)%s  hand (%.2f %.2f %.2f)  desired (%.2f %.2f %.2f)",
             I.targetView.x, I.targetView.y, I.targetView.z, I.clamped ? " [clamped]" : "", I.handView.x, I.handView.y, I.handView.z,
             I.desiredView.x, I.desiredView.y, I.desiredView.z);
-        ImGui::TextDisabled("left IK joint %d, weight joint %d, pushes %d, chain resets %d, add |t| %.3f m, hand correction (%.3f %.3f %.3f) err %.3f m",
-            m_lock.leftIkJoint, I.weightJoint, I.pushes, I.chainResets, I.lastAdd.t.GetLength(), I.corr.x, I.corr.y, I.corr.z, I.corrError);
+        ImGui::TextDisabled("left IK joint %d, weight joint %d, pushes %d, chain resets %d%s, add |t| %.3f m, hand correction (%.3f %.3f %.3f) err %.3f m",
+            m_lock.leftIkJoint, I.weightJoint, I.pushes, I.chainResets, I.chainFrozen ? " [chain frozen]" : "", I.lastAdd.t.GetLength(), I.corr.x, I.corr.y, I.corr.z, I.corrError);
     }
 }
 

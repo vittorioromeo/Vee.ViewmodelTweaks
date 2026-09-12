@@ -507,6 +507,12 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.0.2: the 4.0.1 transition guard froze the chain for the whole screen session: while examining, the game
+  keeps the holstered weapon as `m_toBeEquippedWeaponId`, so `m_wsUnequipping` (and therefore "switching")
+  stays set until the weapon comes back. The weapon flags now only count while fully out of screen mode
+  (`examBlend <= 0.001`); on screens only the fade itself freezes the chain. The diagnostics show
+  `[chain frozen]` next to the reset count while the guard is active - check that first if the hand sits at
+  the wrong place on a screen.
 * 4.0.1: 3.11.7's "own pose modifier every frame" broke the poses: our modifier was registered in
   `UpdateBeforeSystem`, i.e. *before* the game's context pushed its own, so the context's additive wrist
   offsets landed on top of our wrist override (which, in the same queue after the game's pushes, used to win)

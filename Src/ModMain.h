@@ -448,6 +448,7 @@ struct InteractState
     bool chainJustReset = false;    //!< last frame reset the chain: this frame's reconstruction is the new baseline
     int pushesNotApplied = 0;       //!< debug: frames where the read-back did not fit "animation + what we pushed" -> chain reset
     int chainResets = 0;            //!< debug: those resets (one frame without the reach each)
+    bool chainFrozen = false;       //!< debug: this frame kept the last reconstruction (weapon switch / screen fade)
     int pushes = 0;
     int weightJoint = -1;           //!< "l_hand_spine_blend" (ADIK weight of the left arm), -1 = not found
     int weightJointParent = -1;
