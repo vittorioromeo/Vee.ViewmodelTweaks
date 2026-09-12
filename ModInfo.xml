@@ -2,7 +2,7 @@
 <Mod
 	modName="Vee.ViewmodelTweaks"
 	displayName="Viewmodel Tweaks &amp; Ironsights"
-	version="4.0.0"
+	version="4.0.1"
 	dllName="Vee.ViewmodelTweaks.dll"
 	hasXML="false"
 	hasLevelXML="false"

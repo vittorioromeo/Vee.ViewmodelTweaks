@@ -309,7 +309,7 @@ struct ViewmodelSettings
     PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (about its own axes, deg). Position unused.
     int   meleeLowerEase = 2;
     int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier
-    int   interactOwnQueueAlways = 1;    //!< carry the hand pushes with our own pose modifier every frame (the game's context skips them), instead of only when the context did not run: no gap and no double push around weapon / screen transitions       //!< easing of the weapon lowering (same list as the reach: 0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)
+    int   interactOwnQueueFirst = 0;     //!< carry the hand pushes with our own pose modifier every frame, registered BEFORE the game's context (its additive wrist offsets then land on top of our wrist override - poses look different; 3.11.7's mistake). 0 = the context carries them whenever it runs, ours only when it did not.
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.

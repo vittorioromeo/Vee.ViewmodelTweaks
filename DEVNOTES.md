@@ -507,6 +507,17 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.0.1: 3.11.7's "own pose modifier every frame" broke the poses: our modifier was registered in
+  `UpdateBeforeSystem`, i.e. *before* the game's context pushed its own, so the context's additive wrist
+  offsets landed on top of our wrist override (which, in the same queue after the game's pushes, used to win)
+  and the pushes were computed with the previous frame's camera - different-looking poses, jitter. Back to
+  the context carrying the pushes whenever it runs (ours only when it did not), the other way kept as
+  `vm_interact_own_queue_first` (off, not recommended). The transition blink is handled where it comes from
+  instead: during weapon holster / draw / switch and while `examBlend` is between 0 and 1 the chain keeps its
+  last reconstruction (no read-back reconstruction, no resets) and the hand rides the game's sway; the frame
+  after, the jump test is skipped once. Rule of thumb for the future: anything that changes *where in the
+  frame* or *in which queue* the pushes happen changes what the pose looks like - order matters for
+  orientation ops.
 * 4.0.0: the same build as 3.11.7, renumbered - the interaction animation, the resting / hovering hand, screens
   and keypads, the rules, carrying at the apex and the quick melee together are the 4.x feature set.
 * 3.11.7: impact shake on a landed punch (`vm_melee_shake*`: decaying sine on pitch / yaw / roll in the

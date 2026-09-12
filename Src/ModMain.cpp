@@ -2309,10 +2309,15 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
     const bool skeletonUpdated = !I.finalPrevValid || (anim.t - I.finalPrev).GetLengthSquared() > 1e-8f;
     I.finalPrev = anim.t;
     I.finalPrevValid = true;
+    // Weapon holster / draw and the way into or out of a screen: the game's own additive on the IK target swings
+    // for a few frames (the weapon pose stacks blending out or in) and the camera frame changes. Reconstructing
+    // from the read-back then sees jumps, resets the chain and repeats stale pushes - the hand blinked. During
+    // those moments the last stable reconstruction is kept instead, and the hand simply rides the game's sway.
+    const bool transition = m_wsUnequipping || m_wsDrawing || m_wsSwitching || (examBlend > 0.001f && examBlend < 0.999f);
     if (I.addValid)
     {
-        if (!skeletonUpdated)
-            anim = I.animIk; // nothing new to learn from a stale pose
+        if (!skeletonUpdated || transition)
+            anim = I.animIk; // nothing new to learn from a stale pose / nothing trustworthy in a moving one
         else
         {
             anim.t -= I.lastAdd.t;
@@ -2330,7 +2335,7 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
         }
     }
     I.animIk = anim;
-    I.chainJustReset = chainReset; // the frame after a reset has no trustworthy previous animation to compare with
+    I.chainJustReset = chainReset || transition; // the frame after a reset (or a transition) has no trustworthy previous animation to compare with
     if (chainReset)
     {
         // For this one frame push only what is known exactly: the shift and last frame's reach (repeated, so the
@@ -4881,7 +4886,7 @@ void ModMain::RegisterCVars()
     RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up");
     RegisterPoseCVars(s.interactStartHandRot, "interact_start_hand_", "hand off the weapon - the hand's orientation at the spot (rotation only)");
     RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up (rotation only)");
-    REGISTER_CVAR2("vm_interact_own_queue_always", &s.interactOwnQueueAlways, s.interactOwnQueueAlways, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carry the hand pushes with our own pose modifier every frame (1) or only when the game's context did not run (0)");
+    REGISTER_CVAR2("vm_interact_own_queue_first", &s.interactOwnQueueFirst, s.interactOwnQueueFirst, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carry the hand pushes with our own pose modifier every frame, ahead of the game's context (1; the wrist then gets the game's additive on top) or only when the context did not run (0, default)");
     REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
@@ -5142,7 +5147,7 @@ void ModMain::PushWithOwnQueue()
     // Either every frame (the context hook then skips its copy of the pushes: nothing applied twice, no frame
     // without a push when the context skips one - weapon holster / draw and screen transitions made the hand
     // blink), or only when the context did not run last frame.
-    if (!s.interactOwnQueueAlways && m_diag.ctxUpdatesLastFrame > 0)
+    if (!s.interactOwnQueueFirst && m_diag.ctxUpdatesLastFrame > 0)
         return;
     // Anything to push at all? (The reach, the resting hand, a pose being edited.)
     const bool wanted = I.phase != InteractState::Idle || I.restBlend > 0.0f || I.holdMode != 0 || I.restActive;
@@ -6222,8 +6227,8 @@ void ModMain::DrawInteractTab()
         if (s.interactNoContextFallback)
         {
             ImGui::Indent();
-            CheckboxInt("every frame (the game's context skips its copy)", s.interactOwnQueueAlways,
-                "On: no frame without a push and none with two around weapon holster / draw and screen transitions (the hand blinked there). Off: only when the game's context did not run last frame.");
+            CheckboxInt("every frame, ahead of the game's context (not recommended)", s.interactOwnQueueFirst,
+                "Our pose modifier then runs BEFORE the game's, and the game's additive wrist offsets land on top of our wrist override: poses come out different and jittery (3.11.7). Off: the game's context carries the pushes whenever it runs, ours only when it did not.");
             ImGui::Unindent();
         }
         if (I.bodyShiftActive)
