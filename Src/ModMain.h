@@ -11,6 +11,7 @@ class CArkItem;
 struct IEntity;
 struct SViewParams;
 class CArkWeapon;
+class CArkWeaponInstalaser;
 
 //! A position (meters, view space: X right, Y forward, Z up) + rotation (degrees) offset.
 struct PoseOffset
@@ -367,7 +368,6 @@ struct ViewmodelSettings
     float fov = 55.0f;          //!< Weapon FOV in degrees. Stock game uses 55.
 
     int   showWindow = 1;       //!< Whether the ImGui window is open when the Chairloader GUI is visible.
-    int   spreadDebug = 0;      //!< Log the full spread picture (cone, dispersion, aim offset) on every shotgun/pistol shot.
     int   showAdvanced = 0;     //!< Show diagnostics, self-tests and experimental features (Death tab).
     int   guiMouse = 1;         //!< Show the cursor / block player look input while the window is open (game keeps running).
 
@@ -984,9 +984,6 @@ private:
     void DrawWindow();
     bool DrawPoseSliders(PoseOffset& pose, const char* id, float posRangeCm, float rotRangeDeg);
 public:
-    //! Diagnostics for the shotgun/pistol pellet spread (vm_spread_debug), called from the SpawnPellets hook.
-    void OnSpawnPellets(const void* pWeapon, const Vec3& position, const Vec3& aimPoint, bool bShootStraight);
-
     //! ArkPlayerInteraction::Interact pre-hook. Starts the support-hand reach and, when deferring, stores the
     //! call for later. Returns true if the original call must NOT run now (it has been deferred).
     bool OnInteract(void* pInteraction, int mode);
@@ -999,6 +996,9 @@ public:
     //! Manual reloading: should this CanStartAttack see an empty backpack, so that the stock empty-click
     //! (dry-fire fragment + the weapon UI's "dryFire") plays on an empty magazine as well?
     bool FakeEmptyBackpack(const CArkWeapon* pWeapon);
+    //! Manual reloading, Q-beam only: is its "stopping attack" flag stale (left set by the trigger release
+    //! after the magazine ran dry), so that it would swallow this reload request?
+    bool ClearStaleStoppingAttack(const CArkWeaponInstalaser* pWeapon);
     void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
     void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
     bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot

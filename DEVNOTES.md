@@ -204,8 +204,10 @@ Two independent terms, and for the shotgun only the first one is normally alive:
   modifiers ever applied to a weapon is `ArkStats::m_nextModifierId` at **weapon+0x1AC** (the stats object is
   at +0x1A8: `{uint ownerId; uint nextModifierId; map}`). Re-applying a weapon mod's modifiers therefore
   *stacks* them - useful sanity check when a modded stat looks far too large.
-* `vm_spread_debug 1` logs one line per shot with all of the above, including the angle between the camera
-  axis and the aim point (~0 = the shot was straight, so the pattern is the cone alone).
+* There used to be a `vm_spread_debug` cvar logging one line per shot with all of the above (plus the angle
+  between the camera axis and the aim point: ~0 = the shot was straight, so the pattern is the cone alone). It
+  was removed in 4.1.2 along with the `GetStatInt` and `SpawnPellets` hooks that existed only to feed it; the
+  numbers above are what it printed, should it ever be worth writing again.
 
 ## Reticle and the in-world screen cursor
 
@@ -509,6 +511,9 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.1.2: the Q-beam could not be reloaded after its magazine ran dry with the trigger held (its stale
+  `m_bIsStoppingAttack` swallowed the request, see above); the `vm_spread_debug` log and its two
+  diagnostics-only hooks removed.
 * 4.1.1: `vm_reload_dry_fire` - the stock empty click on an empty magazine, not only on an empty backpack.
 * 4.1.0: manual reloading (`vm_reload_manual`, see [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)).
   No behaviour change to anything else: four new hooks that are inert while the option is off.
@@ -695,6 +700,19 @@ once and disarms. One lie per trigger pull, and an unused one never survives the
 condition matters: pressing fire during a reload takes an earlier branch of `CanStartAttack` that asks
 `CanLoadAmmo()`, which reads the inventory count itself and would eat the lie. Holding the trigger cannot
 repeat the click either - the held-fire path goes through `ContinueAttack`, not `StartAttack`.
+
+One weapon needs help: the Q-beam. `CArkWeaponInstalaser::StartReloadAmmo` (0x16760C0) refuses to do anything
+while `m_bIsStoppingAttack` (+0x584) is set, and `CArkWeaponInstalaser::OnActionAttackPrimary` raises that flag
+when the fire button is *released*, leaving it to `OnAttackStopped` to clear when the beam's attack action
+ends. Run the magazine dry while firing and the beam has already been stopped (`ContinueAttack` ->
+`StopAttack`) before the player lets go, so the release sets a flag that nothing then clears: the reload key
+silently does nothing until the weapon is switched (`OnAttackStopped` / re-equip clear it). Vanilla never hits
+this because the gun has reloaded itself long before the trigger comes up - it is a latent bug that manual
+reloading exposes. The mod hooks that override and clears the flag when a reload is requested while
+`m_bIsAttacking` is false and the weapon is neither malfunctioning nor already reloading, i.e. when the flag
+cannot mean what it says; the original's own guards (`m_bIsUnequipping`, `IsEquipped`) still run. No other
+weapon guards its reload like this - the GLOO gun, shotgun, stun gun and disc rifle all use the base
+`StartReloadAmmo` unchanged.
 
 Useful nearby facts: `HasAmmo()` is `g_infiniteAmmo || GetWeaponAmmoCount() > 0` (the cvar lives at
 `[0x182C09000]+0xB34`, and `ConsumeAmmo` checks it too); `CanLoadAmmo()` is *magazine != clip size and
