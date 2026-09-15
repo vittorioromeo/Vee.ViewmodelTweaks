@@ -480,6 +480,34 @@ static bool CArkWeaponShotgun_ContinueAttack_Hook(CArkWeaponShotgun* const _this
     return r;
 }
 
+// The stock empty click: CArkWeapon::CanStartAttack, on a magazine with nothing in it, calls OnAmmoDepleted
+// (which fires the weapon UI element's "dryFire" and notifies the listeners) and plays the dry-fire fragment -
+// but only when GetInventoryAmmoCount() is 0 as well, because with rounds left in the backpack the gun would
+// have reloaded itself instead. With manual reloading that moment is now common, so the weapon is shown an
+// empty backpack for exactly that one call and the game plays its own empty click, unchanged.
+static bool s_fakeEmptyBackpack = false;
+
+static auto s_hookCanStartAttack = CArkWeapon::FCanStartAttack.MakeHook();
+static bool CArkWeapon_CanStartAttack_Hook(CArkWeapon* const _this)
+{
+    const bool prev = s_fakeEmptyBackpack;
+    s_fakeEmptyBackpack = gMod && gMod->FakeEmptyBackpack(_this);
+    const bool r = s_hookCanStartAttack.InvokeOrig(_this);
+    s_fakeEmptyBackpack = prev; // an unused lie (the branch was not reached) never survives the call
+    return r;
+}
+
+static auto s_hookInventoryAmmo = CArkWeapon::FGetInventoryAmmoCount.MakeHook();
+static int CArkWeapon_GetInventoryAmmoCount_Hook(const CArkWeapon* const _this)
+{
+    if (s_fakeEmptyBackpack)
+    {
+        s_fakeEmptyBackpack = false; // exactly one call per trigger pull: the out-of-ammo test, nothing else
+        return 0;
+    }
+    return s_hookInventoryAmmo.InvokeOrig(_this);
+}
+
 // ArkPlayerInteraction::Interact(mode) is what the use / hold-use / loot / special inputs end in: it takes the
 // target from m_usableEntityId, the interaction type from m_interactionInfo[mode], runs the entity's Lua
 // OnUsed/... and calls PerformInteraction(). Everything it needs lives in the object, so the call can be
@@ -1679,12 +1707,11 @@ static bool IsThrownWeapon(const char* className)
     return className && (strstr(className, "Grenade") != nullptr || strstr(className, "Nullwave") != nullptr);
 }
 
-bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
+//! Is this weapon one the manual-reload rule applies to at all? (the option is on, the player is holding it,
+//! and it is not a grenade unless those were opted in)
+static bool ManualReloadWeapon(const ViewmodelSettings& s, const CArkWeapon* pWeapon)
 {
-    const ViewmodelSettings& s = m_settings;
     if (!s.reloadManual || !pWeapon)
-        return false;
-    if (holdFire && !s.reloadManualHoldFire)
         return false;
     // Turrets and every other weapon the player is not holding run this same code: leave them alone.
     ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
@@ -1697,8 +1724,28 @@ bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
         if (pEntity && pEntity->GetClass() && IsThrownWeapon(pEntity->GetClass()->GetName()))
             return false;
     }
+    return true;
+}
+
+bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
+{
+    if (holdFire && !m_settings.reloadManualHoldFire)
+        return false;
+    if (!ManualReloadWeapon(m_settings, pWeapon))
+        return false;
     m_autoReloadsBlocked++;
     return true;
+}
+
+bool ModMain::FakeEmptyBackpack(const CArkWeapon* pWeapon)
+{
+    if (!m_settings.reloadDryFire || !ManualReloadWeapon(m_settings, pWeapon))
+        return false;
+    // Only the "trigger pulled on an empty magazine" moment. While reloading, CanStartAttack takes an earlier
+    // branch that asks CanLoadAmmo() - which reads the inventory count itself - and never reaches the click.
+    if (pWeapon->m_bIsReloading || pWeapon->GetWeaponAmmoCount() != 0)
+        return false;
+    return pWeapon->GetInventoryAmmoCount() > 0; // with an empty backpack the game already clicks
 }
 
 void ModMain::UpdateCarry(float dt)
@@ -4753,6 +4800,8 @@ void ModMain::InitHooks()
     s_hookStartReloadAmmo.SetHookFunc(&CArkWeapon_StartReloadAmmo_Hook);
     s_hookContinueAttack.SetHookFunc(&CArkWeapon_ContinueAttack_Hook);
     s_hookShotgunContinueAttack.SetHookFunc(&CArkWeaponShotgun_ContinueAttack_Hook);
+    s_hookCanStartAttack.SetHookFunc(&CArkWeapon_CanStartAttack_Hook);
+    s_hookInventoryAmmo.SetHookFunc(&CArkWeapon_GetInventoryAmmoCount_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -4990,6 +5039,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_reload_manual", &s.reloadManual, s.reloadManual, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no automatic reloading - only the reload key refills the magazine, firing an empty weapon does nothing (0/1)");
     REGISTER_CVAR2("vm_reload_manual_hold_fire", &s.reloadManualHoldFire, s.reloadManualHoldFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also when the magazine runs dry with the trigger held (0/1)");
     REGISTER_CVAR2("vm_reload_manual_thrown", &s.reloadManualThrown, s.reloadManualThrown, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also for grenades and the nullwave transmitter, whose reload is pulling out the next one (0/1)");
+    REGISTER_CVAR2("vm_reload_dry_fire", &s.reloadDryFire, s.reloadDryFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - play the game's empty click (dry-fire animation and sound) on an empty magazine, not only when the backpack is empty too (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
     REGISTER_CVAR2("vm_world_fov_enabled", &s.worldFovEnabled, s.worldFovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the game's horizontal FOV, cl_hfov (0/1)");
@@ -6714,6 +6764,8 @@ void ModMain::DrawWindow()
                         "Holding the trigger until the last round: the weapon simply stops firing instead of reloading.\nOff = only the empty-trigger reload is blocked.");
                     CheckboxInt("... also for grenades and the nullwave transmitter", s.reloadManualThrown,
                         "These have a magazine of one, so their \"reload\" is taking the next one out of the inventory:\nwith this on you have to press reload after every throw. Off (default) leaves them automatic.");
+                    CheckboxInt("Empty click on an empty magazine", s.reloadDryFire,
+                        "The game's own dry-fire animation and sound - which it normally only plays when you are out of ammo entirely -\nalso when the magazine is empty but the backpack is not. Nothing else about the shot changes.");
                     ImGui::Unindent();
                     ImGui::EndDisabled();
                     ImGui::TextDisabled("Blocked %d automatic reload(s) this session.", m_autoReloadsBlocked);

@@ -315,6 +315,7 @@ struct ViewmodelSettings
     int   reloadManual = 0;         //!< no automatic reloading: only the reload key refills the magazine. Firing an empty gun does nothing.
     int   reloadManualHoldFire = 1; //!< ... including when the magazine runs dry with the trigger held (the shot just stops)
     int   reloadManualThrown = 0;   //!< ... including grenades and the nullwave transmitter, whose "reload" is pulling the next one out
+    int   reloadDryFire = 1;        //!< ... and the empty click plays on an empty magazine, not only when the backpack is empty too
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -995,6 +996,9 @@ public:
     //! Manual reloading: may this automatic reload of this weapon be dropped? holdFire = the call came from
     //! ContinueAttack (the magazine ran dry with the trigger held) rather than from AutoloadAmmo.
     bool BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire);
+    //! Manual reloading: should this CanStartAttack see an empty backpack, so that the stock empty-click
+    //! (dry-fire fragment + the weapon UI's "dryFire") plays on an empty magazine as well?
+    bool FakeEmptyBackpack(const CArkWeapon* pWeapon);
     void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
     void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
     bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot

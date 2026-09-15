@@ -509,6 +509,7 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.1.1: `vm_reload_dry_fire` - the stock empty click on an empty magazine, not only on an empty backpack.
 * 4.1.0: manual reloading (`vm_reload_manual`, see [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)).
   No behaviour change to anything else: four new hooks that are inert while the option is off.
 * 4.0.2: the 4.0.1 transition guard froze the chain for the whole screen session: while examining, the game
@@ -677,11 +678,23 @@ so they are excluded unless `vm_reload_manual_thrown` says otherwise, matched on
 
 What falls out for free: with `AutoloadAmmo` neutered, `CanStartAttack` on an empty magazine reaches
 `m_bWantsToAttack = false; return false` - no shot, no reload, and no retry from `Update`, because it clears
-the wants-to-attack flag itself. The dry-fire click it plays just before that only happens when
-`GetInventoryAmmoCount()` is 0 as well, which is the stock out-of-ammo feedback and worth keeping. Pressing
+the wants-to-attack flag itself. Pressing
 fire during a manual reload still cannot strand you: `CanStartAttack` sets `m_bShouldFinishReloading` (+0x489)
 from `!m_bAllowInterruptReloading || GetWeaponAmmoCount() == 0` before calling `StopReloadAmmo(true)`, and
 `StopReloadAmmo` does nothing at all while that flag is set - an empty-magazine reload always finishes.
+
+The empty click (`vm_reload_dry_fire`) rides on the same branch. Just before clearing the flag,
+`CanStartAttack` does *if `GetInventoryAmmoCount() == 0`: `OnAmmoDepleted()` and play the fragment at
+`m_pFragmentIDs + 0xd8`* - that is the whole dry-fire feedback (`OnAmmoDepleted` walks the weapon's listeners
+and calls `"dryFire"` on its UI element; the fragment carries the animation and the click). Vanilla gates it on
+an empty backpack because with rounds left the gun would have reloaded itself instead, which with manual
+reloading is exactly the common case. So the weapon is shown an empty backpack for that one call:
+`CanStartAttack` is hooked to arm a lie when the magazine is empty, the weapon is not reloading and the
+backpack is *not* empty (otherwise the game clicks by itself), and the `GetInventoryAmmoCount` hook returns 0
+once and disarms. One lie per trigger pull, and an unused one never survives the call. The "not reloading"
+condition matters: pressing fire during a reload takes an earlier branch of `CanStartAttack` that asks
+`CanLoadAmmo()`, which reads the inventory count itself and would eat the lie. Holding the trigger cannot
+repeat the click either - the held-fire path goes through `ContinueAttack`, not `StartAttack`.
 
 Useful nearby facts: `HasAmmo()` is `g_infiniteAmmo || GetWeaponAmmoCount() > 0` (the cvar lives at
 `[0x182C09000]+0xB34`, and `ConsumeAmmo` checks it too); `CanLoadAmmo()` is *magazine != clip size and

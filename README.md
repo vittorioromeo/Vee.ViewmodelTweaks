@@ -40,8 +40,10 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   sound and a small camera kick. Works with any weapon out or none, as long as a wrench is in the inventory.
 * **Manual reloading.** Optional: the magazine is only refilled when you press the reload key. Pulling the
   trigger on an empty gun does nothing instead of starting a reload, and holding it until the last round just
-  stops the firing - Prey's "shoot to reload" and reload-after-the-last-shot both go away. Off by default;
-  grenades keep reloading themselves unless you say otherwise (`vm_reload_manual*`, *Weapon* tab).
+  stops the firing - Prey's "shoot to reload" and reload-after-the-last-shot both go away. The game's own
+  empty click (dry-fire animation and sound), which vanilla only plays when you have no rounds left anywhere,
+  then plays whenever the magazine is empty. Off by default; grenades keep reloading themselves unless you say
+  otherwise (`vm_reload_*`, *Weapon* tab).
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 
