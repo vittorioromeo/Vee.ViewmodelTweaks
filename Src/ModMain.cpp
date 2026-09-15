@@ -419,6 +419,67 @@ static void CArkWeapon_FireWeapon_Hook(CArkWeapon* const _this)
         gMod->OnWeaponFired(_this);
 }
 
+// --- Manual reloading -----------------------------------------------------------------------------
+// The game reloads by itself in exactly two places, both in CArkWeapon:
+//
+//   * AutoloadAmmo() - "magazine empty and the archetype's bAutoloadAmmo is set -> StartReloadAmmo()".
+//     It is called from CanStartAttack (pressing fire on an empty gun: the shoot-to-reload mechanic),
+//     from ExitAttackAction (the end of each shot's attack action: the reload after the last round) and
+//     from CArkWeaponGrenade::CanStartAttack. No weapon class overrides it - all nine weapon vtables in
+//     the binary carry the base one - so a single hook covers every weapon.
+//   * ContinueAttack() - holding the trigger until the magazine runs dry calls StartReloadAmmo() directly,
+//     bypassing AutoloadAmmo. The shotgun has its own byte-identical copy of the function; the GLOO gun
+//     and the Q-beam call the base one, the grenades' override is a "return false" stub.
+//
+// Everything else that reloads is the player's own doing and has to keep working: OnActionReload (the
+// key), the deferred m_bWantsToReload handling in Update (a reload asked for while the weapon was busy),
+// the shotgun's shell-by-shell continuation in OnPreRender, and PostSerialize (a save made mid-reload
+// restarts it on load). So the block is exactly those two: AutoloadAmmo does nothing, and the one
+// StartReloadAmmo call made from inside ContinueAttack is dropped - gating StartReloadAmmo itself would
+// take the four good callers with it.
+static bool s_inContinueAttack = false;
+
+static auto s_hookAutoloadAmmo = CArkWeapon::FAutoloadAmmo.MakeHook();
+static void CArkWeapon_AutoloadAmmo_Hook(CArkWeapon* const _this)
+{
+    if (gMod && gMod->BlockAutoReload(_this, false))
+        return;
+    s_hookAutoloadAmmo.InvokeOrig(_this);
+}
+
+// Only ever dropped while ContinueAttack is on the stack (see above). The Q-beam's own StartReloadAmmo
+// tail-jumps into this one, so it goes through the hook as well; the grenades' separate override does not,
+// but their ContinueAttack is a stub, so it never reaches this path.
+static auto s_hookStartReloadAmmo = CArkWeapon::FStartReloadAmmo.MakeHook();
+static void CArkWeapon_StartReloadAmmo_Hook(CArkWeapon* const _this)
+{
+    if (s_inContinueAttack && gMod && gMod->BlockAutoReload(_this, true))
+        return;
+    s_hookStartReloadAmmo.InvokeOrig(_this);
+}
+
+// The two ContinueAttack bodies exist only to mark the scope; the original then behaves as it always did
+// minus the reload: with no ammo left it falls through to StopAttack() and the trigger simply stops firing.
+static auto s_hookContinueAttack = CArkWeapon::FContinueAttack.MakeHook();
+static bool CArkWeapon_ContinueAttack_Hook(CArkWeapon* const _this)
+{
+    const bool prev = s_inContinueAttack;
+    s_inContinueAttack = true;
+    const bool r = s_hookContinueAttack.InvokeOrig(_this);
+    s_inContinueAttack = prev;
+    return r;
+}
+
+static auto s_hookShotgunContinueAttack = CArkWeaponShotgun::FContinueAttack.MakeHook();
+static bool CArkWeaponShotgun_ContinueAttack_Hook(CArkWeaponShotgun* const _this)
+{
+    const bool prev = s_inContinueAttack;
+    s_inContinueAttack = true;
+    const bool r = s_hookShotgunContinueAttack.InvokeOrig(_this);
+    s_inContinueAttack = prev;
+    return r;
+}
+
 // ArkPlayerInteraction::Interact(mode) is what the use / hold-use / loot / special inputs end in: it takes the
 // target from m_usableEntityId, the interaction type from m_interactionInfo[mode], runs the entity's Lua
 // OnUsed/... and calls PerformInteraction(). Everything it needs lives in the object, so the call can be
@@ -1609,6 +1670,35 @@ void ModMain::OnCarryStarted()
 {
     m_interact.carryStarted = true;
     m_interact.carryPending = false;
+}
+
+//! Grenades and the nullwave transmitter are weapons with a magazine of one: their "reload" is taking the
+//! next one out of the inventory, so blocking it would mean pressing the reload key after every throw.
+static bool IsThrownWeapon(const char* className)
+{
+    return className && (strstr(className, "Grenade") != nullptr || strstr(className, "Nullwave") != nullptr);
+}
+
+bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
+{
+    const ViewmodelSettings& s = m_settings;
+    if (!s.reloadManual || !pWeapon)
+        return false;
+    if (holdFire && !s.reloadManualHoldFire)
+        return false;
+    // Turrets and every other weapon the player is not holding run this same code: leave them alone.
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    IEntity* pPlayerEntity = pPlayer ? pPlayer->GetEntity() : nullptr;
+    if (!pPlayerEntity || pWeapon->GetOwnerId() != pPlayerEntity->GetId())
+        return false;
+    if (!s.reloadManualThrown)
+    {
+        IEntity* pEntity = const_cast<CArkWeapon*>(pWeapon)->GetEntity();
+        if (pEntity && pEntity->GetClass() && IsThrownWeapon(pEntity->GetClass()->GetName()))
+            return false;
+    }
+    m_autoReloadsBlocked++;
+    return true;
 }
 
 void ModMain::UpdateCarry(float dt)
@@ -4659,6 +4749,10 @@ void ModMain::InitHooks()
     s_hookStartCarrying.SetHookFunc(&ArkPlayerCarry_StartCarrying_Hook);
     s_hookPerformInteraction.SetHookFunc(&ArkPlayerInteraction_PerformInteraction_Hook);
     s_hookWeaponImpulse.SetHookFunc(&ArkWeaponUtils_DoWeaponImpulse_Hook);
+    s_hookAutoloadAmmo.SetHookFunc(&CArkWeapon_AutoloadAmmo_Hook);
+    s_hookStartReloadAmmo.SetHookFunc(&CArkWeapon_StartReloadAmmo_Hook);
+    s_hookContinueAttack.SetHookFunc(&CArkWeapon_ContinueAttack_Hook);
+    s_hookShotgunContinueAttack.SetHookFunc(&CArkWeaponShotgun_ContinueAttack_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -4892,6 +4986,10 @@ void ModMain::RegisterCVars()
     RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up (rotation only)");
     REGISTER_CVAR2("vm_interact_own_queue_first", &s.interactOwnQueueFirst, s.interactOwnQueueFirst, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carry the hand pushes with our own pose modifier every frame, ahead of the game's context (1; the wrist then gets the game's additive on top) or only when the context did not run (0, default)");
     REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
+
+    REGISTER_CVAR2("vm_reload_manual", &s.reloadManual, s.reloadManual, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no automatic reloading - only the reload key refills the magazine, firing an empty weapon does nothing (0/1)");
+    REGISTER_CVAR2("vm_reload_manual_hold_fire", &s.reloadManualHoldFire, s.reloadManualHoldFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also when the magazine runs dry with the trigger held (0/1)");
+    REGISTER_CVAR2("vm_reload_manual_thrown", &s.reloadManualThrown, s.reloadManualThrown, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also for grenades and the nullwave transmitter, whose reload is pulling out the next one (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
     REGISTER_CVAR2("vm_world_fov_enabled", &s.worldFovEnabled, s.worldFovEnabled, VF_DUMPTOCHAIR, "Viewmodel Tweaks: override the game's horizontal FOV, cl_hfov (0/1)");
@@ -6602,6 +6700,25 @@ void ModMain::DrawWindow()
             //------------------------------------------------------------------ Weapon
             if (ImGui::BeginTabItem("Weapon"))
             {
+                if (ImGui::CollapsingHeader("Reloading (all weapons)"))
+                {
+                    ImGui::TextWrapped("Prey reloads by itself: pulling the trigger on an empty gun starts a reload, and so does "
+                                       "the end of the shot that empties the magazine. Turn that off and the magazine is only "
+                                       "refilled when you press the reload key.");
+                    CheckboxInt("Manual reloading only", s.reloadManual,
+                        "Firing an empty weapon does nothing at all (the out-of-ammo click still plays when you have no rounds left anywhere).\n"
+                        "Your reload key keeps working exactly as before, and a reload that was interrupted or saved mid-way still finishes.");
+                    ImGui::BeginDisabled(!s.reloadManual);
+                    ImGui::Indent();
+                    CheckboxInt("... also when the magazine runs dry while firing", s.reloadManualHoldFire,
+                        "Holding the trigger until the last round: the weapon simply stops firing instead of reloading.\nOff = only the empty-trigger reload is blocked.");
+                    CheckboxInt("... also for grenades and the nullwave transmitter", s.reloadManualThrown,
+                        "These have a magazine of one, so their \"reload\" is taking the next one out of the inventory:\nwith this on you have to press reload after every throw. Off (default) leaves them automatic.");
+                    ImGui::Unindent();
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Blocked %d automatic reload(s) this session.", m_autoReloadsBlocked);
+                    ImGui::Spacing();
+                }
                 ImGui::BeginDisabled(!s.enabled);
                 if (m_currentWeaponClass.empty())
                 {

@@ -14,8 +14,9 @@ All offsets are RVAs into that DLL. Read alongside `Src/ModMain.cpp`.
 7. [Reticle and the in-world screen cursor](#reticle-and-the-in-world-screen-cursor)
 8. [Interaction animation](#interaction-animation-support-hand-reach) - the rig, hooks, poses, the closed-loop rules,
    examination mode, what does not work, diagnostics
-9. [Robustness](#robustness)
-10. [Three ABI traps](#three-abi-traps)
+9. [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)
+10. [Robustness](#robustness)
+11. [Three ABI traps](#three-abi-traps)
 
 ## Where things are in `Src/ModMain.cpp`
 
@@ -25,7 +26,8 @@ One file, roughly in this order: hooks, RVAs and vtable slots (top); numeric san
 `StartReach`, `UpdateHover`, `ApplyExamineCVars`, `UpdateInteract`, `FireDeferredInteract`,
 `PushInteractReach`, `PushHandPose`, `CursorWorldPoint`, `UpdateExamZoom`, `UpdateArmsVisibility`, poses
 file); convergence, spread, blend states, feel, sanitizing, camera zoom; weapons lookup, nudge keys, input
-(`OnInputEvent`), weapon FOV, reticle, trace, weapons file; `RegisterCVars`, init / shutdown; the per-frame
+(`OnInputEvent`), weapon FOV, reticle, trace, weapons file; the manual-reload hooks and
+`BlockAutoReload`; `RegisterCVars`, init / shutdown; the per-frame
 entry points (`UpdateBeforeSystem`, `MainUpdate`, `LateUpdate`); the ImGui tabs (`Draw*`). `ModMain.h` holds
 the settings struct (`ViewmodelSettings`, one cvar each), the per-weapon struct (`WeaponSettings`) and the
 runtime state structs (`InteractState`, `RenderLockState`, ...).
@@ -507,6 +509,8 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.1.0: manual reloading (`vm_reload_manual`, see [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)).
+  No behaviour change to anything else: four new hooks that are inert while the option is off.
 * 4.0.2: the 4.0.1 transition guard froze the chain for the whole screen session: while examining, the game
   keeps the holstered weapon as `m_toBeEquippedWeaponId`, so `m_wsUnequipping` (and therefore "switching")
   stays set until the weapon comes back. The weapon flags now only count while fully out of screen mode
@@ -625,6 +629,69 @@ hand".
 
 Open: a Chairloader `ShutdownGame` crash was seen once when quitting the game while a screen was up (not
 reproduced, not investigated).
+
+## Automatic reloading (and how to turn it off)
+
+Everything a weapon does lives on `CArkWeapon`; the nine weapon vtables in the binary (base, disc rifle, stun
+gun, GLOO gun, Q-beam/instalaser, grenade, shotgun and the two turret ones - pistol, toy gun and both wrenches
+share the base one) differ only in a handful of slots. The slots that matter here, as offsets into the vtable:
+`0x88` `CanStartAttack`, `0xb0` `AutoloadAmmo`, `0xb8` `StartReloadAmmo`, `0xc0` `ContinueReloadAmmo`, `0xc8`
+`ReloadAmmo`, `0xd0` `StopReloadAmmo`, `0xe8` `StartAttack`, `0xf0` `ContinueAttack`, `0xf8` `StopAttack`,
+`0x1f8` `ConsumeAmmo`, `0x200` `CanLoadAmmo`, `0x208` `HasAmmo`, `0x210` `OnAmmoDepleted`.
+
+Two paths reload without being asked to, and only two:
+
+* `CArkWeapon::AutoloadAmmo` (0x1664160) is the whole mechanic in one function: *if the magazine is empty and
+  the archetype's `bAutoloadAmmo` is set, `StartReloadAmmo()`*. It is called from `CanStartAttack+0x30f`
+  (pulling the trigger on an empty gun - Prey's "shoot to reload"), from `ExitAttackAction+0x44` (that
+  function sets `m_bIsReadyToAttack` and autoloads, which is what reloads the gun after the shot that empties
+  it) and from `CArkWeaponGrenade::CanStartAttack+0x8b`. **No class overrides it**, so hooking that one
+  function covers every weapon.
+* `CArkWeapon::ContinueAttack+0x4f` (0x16648C0) calls `StartReloadAmmo()` directly when `HasAmmo()` is false,
+  then `StopAttack()` - that is the reload you get by holding the trigger until the magazine runs dry, and it
+  does *not* go through `AutoloadAmmo`. `CArkWeaponShotgun::ContinueAttack` (0x1679EB0) is a byte-identical
+  private copy and needs its own hook; the GLOO gun and Q-beam call the base one, and the grenades' override
+  is the shared `xor al,al; ret` stub at 0xDD23F0.
+
+Every other caller of `StartReloadAmmo` is the player's own doing and must keep working - which is why the
+block is placed on those two paths and *not* on `StartReloadAmmo` itself:
+
+* `OnActionReload` (0x166BC60) is a one-line tailcall to it: the reload key.
+* `CArkWeapon::Update` (and the stun gun's and grenade's copies) runs a deferred request: `StartReloadAmmo`
+  sets `m_bWantsToReload` (+0x2CB) and returns early when the weapon is not ready to attack, and the next
+  update retries it.
+* `CArkWeaponShotgun::OnPreRender+0x6d` continues a shell-by-shell reload.
+* `CArkWeapon::PostSerialize+0x69` clears `m_bIsReloading` and restarts the reload when a save was made in the
+  middle of one.
+
+So the mod (`vm_reload_manual`) hooks `AutoloadAmmo` and returns without calling the original, and hooks
+`StartReloadAmmo` to drop *only* the call made while `ContinueAttack` is on the stack (a `s_inContinueAttack`
+flag set by hooks on both `ContinueAttack` bodies). The Q-beam's own `StartReloadAmmo` (0x16760C0) tail-jumps
+into the base one at 0x16760EC, so the detour catches it too; the grenade's separate override (0x1678850) does
+not, but nothing reaches it from `ContinueAttack`.
+
+Two gates in `ModMain::BlockAutoReload`. Turret weapons run this same code (their vtables carry the base
+`AutoloadAmmo`), so only weapons whose `GetOwnerId()` is the player's entity are affected. And grenades and
+the nullwave transmitter have a magazine of one - their "reload" is taking the next one out of the inventory -
+so they are excluded unless `vm_reload_manual_thrown` says otherwise, matched on the entity class name.
+
+What falls out for free: with `AutoloadAmmo` neutered, `CanStartAttack` on an empty magazine reaches
+`m_bWantsToAttack = false; return false` - no shot, no reload, and no retry from `Update`, because it clears
+the wants-to-attack flag itself. The dry-fire click it plays just before that only happens when
+`GetInventoryAmmoCount()` is 0 as well, which is the stock out-of-ammo feedback and worth keeping. Pressing
+fire during a manual reload still cannot strand you: `CanStartAttack` sets `m_bShouldFinishReloading` (+0x489)
+from `!m_bAllowInterruptReloading || GetWeaponAmmoCount() == 0` before calling `StopReloadAmmo(true)`, and
+`StopReloadAmmo` does nothing at all while that flag is set - an empty-magazine reload always finishes.
+
+Useful nearby facts: `HasAmmo()` is `g_infiniteAmmo || GetWeaponAmmoCount() > 0` (the cvar lives at
+`[0x182C09000]+0xB34`, and `ConsumeAmmo` checks it too); `CanLoadAmmo()` is *magazine != clip size and
+inventory > magazine*; `ReloadAmmo` tops the magazine up by the `ammoPerReload` stat, clamped to the clip size
+and the inventory. `m_bAutoload` sits at +0x328 and comes from the `bAutoloadAmmo` attribute of the archetype's
+`<Weapon>` node; `m_bAllowInterruptReloading` is +0x329 (`bAllowInterruptReloading`). All fourteen weapon
+prototypes in `Libs/EntityArchetypes/ArkPickups.xml` and `arkspecialweapons.xml` ship with
+`bAutoloadAmmo="1"`, so a pure XML mod flipping those to `0` is a data-only way to get the first path
+(Chairloader can merge `Libs/EntityArchetypes`); it cannot touch the `ContinueAttack` one and cannot be
+toggled at runtime.
 
 ## Robustness
 

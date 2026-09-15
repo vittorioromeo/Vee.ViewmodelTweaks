@@ -311,6 +311,11 @@ struct ViewmodelSettings
     int   interactNoContextFallback = 1; //!< with no weapon ever equipped (the game's weapon animation context does not exist yet) drive the hand with our own pose modifier
     int   interactOwnQueueFirst = 0;     //!< carry the hand pushes with our own pose modifier every frame, registered BEFORE the game's context (its additive wrist offsets then land on top of our wrist override - poses look different; 3.11.7's mistake). 0 = the context carries them whenever it runs, ours only when it did not.
 
+    // --- Reloading (all weapons) ------------------------------------------------------------------
+    int   reloadManual = 0;         //!< no automatic reloading: only the reload key refills the magazine. Firing an empty gun does nothing.
+    int   reloadManualHoldFire = 1; //!< ... including when the magazine runs dry with the trigger held (the shot just stops)
+    int   reloadManualThrown = 0;   //!< ... including grenades and the nullwave transmitter, whose "reload" is pulling the next one out
+
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
     int   sprintSensEnabled = 0;//!< Override the look-sensitivity scale the game applies while sprinting.
@@ -812,6 +817,7 @@ public:
     QuatT ComputeAimLocal() const;                       //!< weapon-local extras applied after the aim pose (sway, drag)
     const FeelState& GetFeel() const { return m_feel; }
     bool Active() const { return m_settings.enabled != 0 && m_settings.bypass == 0; } //!< viewmodel features on
+    int m_autoReloadsBlocked = 0;       //!< diagnostics: automatic reloads dropped since the mod was loaded
 
     //! Procedural weapon offsets captured from the game this frame (view space).
     void SetGameOffset(int which, const QuatT& q);
@@ -986,6 +992,9 @@ public:
     //! PerformInteraction(carry) hook: schedules the grab for when the key has been held, returns the carry delay to use (hold + reach).
     float OnPerformCarry(void* pInteraction, int mode, IEntity* pEntity, float delay);
     void OnCarryStarted();              //!< ArkPlayerCarry::StartCarrying happened
+    //! Manual reloading: may this automatic reload of this weapon be dropped? holdFire = the call came from
+    //! ContinueAttack (the magazine ran dry with the trigger held) rather than from AutoloadAmmo.
+    bool BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire);
     void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
     void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
     bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot
