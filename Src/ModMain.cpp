@@ -539,6 +539,22 @@ static inline float SmoothStep01(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
+//! The quick melee camera swing: 0 -> 1 -> past 0 -> 0. u is the progress through the whole movement, rise the
+//! fraction of it spent going out, counter the overshoot on the way back as a fraction of the peak (0 = stops
+//! at neutral, 1 = swings back exactly as far as it went out). The way out is a smoothstep, so it accelerates
+//! instead of jumping; the way back is a cosine lobe that crosses zero a third of the way and rests at the end.
+static inline float MeleeSwingCurve(float u, float rise, float counter)
+{
+    u = clamp_tpl(u, 0.0f, 1.0f);
+    rise = clamp_tpl(rise, 0.05f, 0.95f);
+    if (u <= rise)
+        return SmoothStep01(u / rise);
+    const float x = (u - rise) / (1.0f - rise);
+    const float back = (1.0f - x) * cosf(1.5f * gf_PI * x);
+    // The lobe's own minimum is -0.386, so normalise by it: "counter" then reads as a share of the peak.
+    return back >= 0.0f ? back : back * (clamp_tpl(counter, 0.0f, 1.0f) / 0.386f);
+}
+
 // --- Numeric sanity -------------------------------------------------------------------------------
 // Cheap checks used at the boundaries of the pipeline (what we read from the game, what we write back)
 // and on every accumulated state. A NaN compares false with everything, so "!(x < limit)" catches it.
@@ -1259,8 +1275,8 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         m_nanRecoveries++;
         return;
     }
-    // Quick melee: a small camera kick (pitch down, a touch of yaw) that comes and goes with the punch, and a
-    // decaying shake when it lands (like the wrench's).
+    // Quick melee: a small camera kick (pitch down, a touch of yaw) that comes and goes with the punch, the
+    // slower swing that follows the strike, and a decaying shake when it lands (like the wrench's).
     {
         float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
         if (m_interact.meleeKickTime >= 0.0f && (s.meleeCamKick != 0.0f || s.meleeCamKickYaw != 0.0f))
@@ -1269,6 +1285,20 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
             const float a = sinf(gf_PI * u);
             pitch += -clamp_tpl(s.meleeCamKick, -10.0f, 10.0f) * a;
             yaw += -clamp_tpl(s.meleeCamKickYaw, -10.0f, 10.0f) * a;
+        }
+        // The swing. One curve, three axes: accelerate out to the peak, then come back past neutral once and
+        // settle. The overshoot is what sells the weight - the head carries on a little after the arm stops.
+        if (m_interact.meleeSwingT >= 0.0f)
+        {
+            const float t = m_interact.meleeSwingT - max(s.meleeSwingDelay, 0.0f);
+            if (t >= 0.0f)
+            {
+                const float a = MeleeSwingCurve(t / max(s.meleeSwingTime, 0.02f),
+                    clamp_tpl(s.meleeSwingRise, 0.05f, 0.95f), clamp_tpl(s.meleeSwingCounter, 0.0f, 1.0f));
+                yaw += -clamp_tpl(s.meleeSwingRight, -30.0f, 30.0f) * a; // + = the view turns right
+                pitch += clamp_tpl(s.meleeSwingUp, -30.0f, 30.0f) * a;   // + = up
+                roll += clamp_tpl(s.meleeSwingRoll, -30.0f, 30.0f) * a;
+            }
         }
         if (m_interact.meleeShakeT >= 0.0f && s.meleeShakeAmp != 0.0f)
         {
@@ -1855,6 +1885,7 @@ void ModMain::StartMelee()
     I.meleePending = true;
     I.meleeCooldownLeft = max(s.meleeCooldown, 0.0f);
     I.meleeKickTime = 0.0f;
+    I.meleeSwingT = 0.0f;
     I.meleePunches++;
     if (s.meleeSound && gEnv && gEnv->pConsole)
     {
@@ -2256,6 +2287,11 @@ void ModMain::UpdateInteract(float dt)
     {
         I.meleeKickTime += dt;
         if (I.meleeKickTime > max(s.meleeCamKickTime, 0.01f)) I.meleeKickTime = -1.0f;
+    }
+    if (I.meleeSwingT >= 0.0f)
+    {
+        I.meleeSwingT += dt;
+        if (I.meleeSwingT > max(s.meleeSwingDelay, 0.0f) + max(s.meleeSwingTime, 0.02f)) I.meleeSwingT = -1.0f;
     }
     if (I.meleeShakeT >= 0.0f)
     {
@@ -3859,6 +3895,8 @@ void ModMain::SanitizeSettings()
     fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
     fixF(s.meleeShakeAmp, def.meleeShakeAmp); fixF(s.meleeShakeTime, def.meleeShakeTime); fixF(s.meleeShakeFreq, def.meleeShakeFreq); fixF(s.meleeShakeEnemy, def.meleeShakeEnemy);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
+    fixF(s.meleeSwingRight, def.meleeSwingRight); fixF(s.meleeSwingUp, def.meleeSwingUp); fixF(s.meleeSwingRoll, def.meleeSwingRoll);
+    fixF(s.meleeSwingTime, def.meleeSwingTime); fixF(s.meleeSwingDelay, def.meleeSwingDelay); fixF(s.meleeSwingRise, def.meleeSwingRise); fixF(s.meleeSwingCounter, def.meleeSwingCounter);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
     fixF(s.interactExamLeaveTime, def.interactExamLeaveTime); fixF(s.interactRestSwayPos, def.interactRestSwayPos); fixF(s.interactRestSwayRot, def.interactRestSwayRot);
     fixF(s.interactRestSwayFreq, def.interactRestSwayFreq); fixF(s.interactHoverMaxDist, def.interactHoverMaxDist); fixF(s.interactHoverTowards, def.interactHoverTowards);
@@ -4972,6 +5010,13 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_melee_cam_kick", &s.meleeCamKick, s.meleeCamKick, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera pitch kick (deg)");
     REGISTER_CVAR2("vm_melee_cam_kick_yaw", &s.meleeCamKickYaw, s.meleeCamKickYaw, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee camera yaw kick (deg)");
     REGISTER_CVAR2("vm_melee_cam_kick_time", &s.meleeCamKickTime, s.meleeCamKickTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the camera kick takes");
+    REGISTER_CVAR2("vm_melee_swing_right", &s.meleeSwingRight, s.meleeSwingRight, VF_DUMPTOCHAIR, "Viewmodel Tweaks: quick melee - how far the camera swings to the right with the punch (deg, negative = left)");
+    REGISTER_CVAR2("vm_melee_swing_up", &s.meleeSwingUp, s.meleeSwingUp, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... and up (deg, negative = down)");
+    REGISTER_CVAR2("vm_melee_swing_roll", &s.meleeSwingRoll, s.meleeSwingRoll, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... and rolled clockwise (deg)");
+    REGISTER_CVAR2("vm_melee_swing_time", &s.meleeSwingTime, s.meleeSwingTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the swing takes");
+    REGISTER_CVAR2("vm_melee_swing_delay", &s.meleeSwingDelay, s.meleeSwingDelay, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds after the punch starts before the swing begins");
+    REGISTER_CVAR2("vm_melee_swing_rise", &s.meleeSwingRise, s.meleeSwingRise, VF_DUMPTOCHAIR, "Viewmodel Tweaks: fraction of the swing spent accelerating out to the peak (0.05..0.95)");
+    REGISTER_CVAR2("vm_melee_swing_counter", &s.meleeSwingCounter, s.meleeSwingCounter, VF_DUMPTOCHAIR, "Viewmodel Tweaks: how far the swing comes back past neutral (0 = not at all, 1 = a third of the peak)");
     REGISTER_CVAR2("vm_melee_shake", &s.meleeShakeAmp, s.meleeShakeAmp, VF_DUMPTOCHAIR, "Viewmodel Tweaks: camera shake on a landed punch (deg)");
     REGISTER_CVAR2("vm_melee_shake_time", &s.meleeShakeTime, s.meleeShakeTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... seconds");
     REGISTER_CVAR2("vm_melee_shake_freq", &s.meleeShakeFreq, s.meleeShakeFreq, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... Hz");
@@ -6054,10 +6099,36 @@ void ModMain::DrawInteractTab()
         ImGui::SliderFloat("Length##ms", &s.meleeShakeTime, 0.05f, 1.0f, "%.2f s");
         ImGui::SliderFloat("Frequency##ms", &s.meleeShakeFreq, 4.0f, 40.0f, "%.0f Hz");
         ImGui::SliderFloat("On an enemy, times##ms", &s.meleeShakeEnemy, 0.0f, 3.0f, "x %.2f");
-        ImGui::Text("Camera kick (with the swing)");
+        ImGui::Text("Camera kick (short, at the start of the punch)");
         ImGui::SliderFloat("Pitch##mk", &s.meleeCamKick, -5.0f, 5.0f, "%.1f deg");
         ImGui::SliderFloat("Yaw##mk", &s.meleeCamKickYaw, -5.0f, 5.0f, "%.1f deg");
         ImGui::SliderFloat("Time##mk", &s.meleeCamKickTime, 0.05f, 1.0f, "%.2f s");
+        if (ImGui::TreeNodeEx("Camera swing (follows the punch)", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::TextWrapped("A second, slower turn layered on the kick: the view accelerates the way the arm goes, then comes "
+                               "back past neutral once and settles. The punch itself is 0.33 s of windup, 0.10 s of strike and "
+                               "0.27 s back, so a delay near 0.3 s puts the peak on the impact.");
+            ImGui::SliderFloat("Right / left##msw", &s.meleeSwingRight, -10.0f, 10.0f, "%.2f deg");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How far the view is turned at the peak. Positive turns right, negative left.");
+            ImGui::SliderFloat("Up / down##msw", &s.meleeSwingUp, -10.0f, 10.0f, "%.2f deg");
+            ImGui::SliderFloat("Roll##msw", &s.meleeSwingRoll, -10.0f, 10.0f, "%.2f deg");
+            ImGui::SliderFloat("Duration##msw", &s.meleeSwingTime, 0.05f, 1.5f, "%.2f s");
+            ImGui::SliderFloat("Delay##msw", &s.meleeSwingDelay, 0.0f, 0.6f, "%.2f s");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Measured from the moment the punch starts (the beginning of the windup).");
+            ImGui::SliderFloat("Snap##msw", &s.meleeSwingRise, 0.05f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Share of the duration spent going out, so where the peak sits. Small = the view whips out and\ndrifts back; large = it leans out with the windup and snaps back. Peak at duration x this;\nthe punch lands 0.43 s in (+ any delay), which is where the default puts it.");
+            ImGui::SliderFloat("Bounce##msw", &s.meleeSwingCounter, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How far the way back overshoots past neutral before settling. 0 = stops dead at neutral.");
+            if (ImGui::Button("Test swing##msw"))
+                I.meleeSwingT = 0.0f;
+            ImGui::SameLine();
+            ImGui::TextDisabled(I.meleeSwingT >= 0.0f ? "now %.2f s" : "idle", I.meleeSwingT);
+            ImGui::TreePop();
+        }
         ImGui::TextDisabled("punches %d, hits %d, without a wrench %d%s | timing and path: Reach -> Punch; pose: Hand pose -> Punch uses pose",
             I.meleePunches, I.meleeHits, I.meleeNoWrench, I.meleeCooldownLeft > 0.0f ? " | cooling down" : "");
     }

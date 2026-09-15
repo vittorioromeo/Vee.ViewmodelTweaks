@@ -289,6 +289,16 @@ struct ViewmodelSettings
     float meleeCamKick = 3.3f;      //!< camera pitch kick (degrees, down then back) with the punch
     float meleeCamKickYaw = 1.2f;   //!< ... and yaw (degrees, to the right then back)
     float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
+    // The swing: a second, slower camera turn layered on the kick - the body going with the punch. It snaps
+    // out in the direction below, then comes back past neutral once (the "bounce") and settles.
+    float meleeSwingRight = 2.6f;   //!< how far the camera is turned to the right at the peak (deg; negative = left)
+    float meleeSwingUp = 0.9f;      //!< ... and up (deg; negative = down)
+    float meleeSwingRoll = 1.1f;    //!< ... and rolled clockwise (deg)
+    float meleeSwingTime = 0.62f;   //!< seconds the whole movement takes (punch animation: windup 0.33 + strike 0.10 + return)
+    float meleeSwingDelay = 0.0f;   //!< seconds after the punch starts before it begins
+    float meleeSwingRise = 0.70f;   //!< fraction of that time spent accelerating out to the peak (the rest comes back);
+                                    //!< 0.70 of 0.62 s puts the peak on the impact (the punch strikes 0.43 s in)
+    float meleeSwingCounter = 0.25f;//!< how far past neutral the way back swings, as a share of the peak (0 = stops at neutral)
     float meleeShakeAmp = 0.9f;     //!< camera shake on a landed punch (degrees, decaying)
     float meleeShakeTime = 0.25f;   //!< ... seconds it lasts
     float meleeShakeFreq = 18.0f;   //!< ... Hz
@@ -538,6 +548,7 @@ struct InteractState
     bool meleePending = false;      //!< a punch is playing and its hit has not landed yet
     float meleeCooldownLeft = 0.0f;
     float meleeKickTime = -1.0f;    //!< seconds into the camera kick, < 0 = none
+    float meleeSwingT = -1.0f;      //!< seconds into the camera swing (includes its delay), < 0 = none
     float meleeShakeT = -1.0f;      //!< seconds into the impact shake, < 0 = none
     float meleeShakeScale = 1.0f;   //!< 1, or the enemy multiplier
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug

@@ -439,6 +439,21 @@ Version notes at the end.
   `wind = 1 - curve`. `ApexTime() = windup + reach` is what the deferred fire, the carry delay and the melee hit
   use. The hit lands on the transition into the hold phase (`meleePending`).
 
+The camera side of the punch is three layers added to `params.rotation` in `OnCameraUpdated`, all of them
+independent timers started by `StartMelee` (`meleeKickTime`, `meleeSwingT`, and `meleeShakeT` which starts at
+the hit instead): a short `sin(pi*u)` kick out and back over `vm_melee_cam_kick_time`, the swing (below), and
+the decaying impact shake. They simply sum, so each can be tuned or zeroed on its own.
+
+The swing (4.1.3, `vm_melee_swing_*`) is the one that carries the weight: one curve driving yaw, pitch and
+roll together, `MeleeSwingCurve(u, rise, counter)` - a smoothstep out to the peak over `rise` of the duration
+(so it accelerates instead of jumping), then `(1-x)*cos(1.5*pi*x)` back, which crosses zero a third of the way
+and dips to -0.386 before resting at the end. That dip is normalised by its own minimum so `counter` reads
+directly as "the overshoot, as a share of the peak". The punch animation is 0.33 s of windup + 0.10 s of
+strike (impact at `ReachStyle::Punch().ApexTime()` = 0.43 s) + 0.27 s back, and the default 0.62 s duration
+with `rise` 0.70 puts the peak on the impact; `vm_melee_swing_delay` shifts the whole thing later. Note that
+this rotates the actual view, so a large swing also deflects where the punch's own hit ray goes - keep it
+small, or give it a delay so the peak lands after the hit.
+
 ### Arms visibility
 
 * States in which the game keeps the arms out of sight: unarmed and examining. While a reach or the resting
@@ -511,6 +526,7 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.1.3: quick melee camera swing (`vm_melee_swing_*`), layered on the old kick.
 * 4.1.2: the Q-beam could not be reloaded after its magazine ran dry with the trigger held (its stale
   `m_bIsStoppingAttack` swallowed the request, see above); the `vm_spread_debug` log and its two
   diagnostics-only hooks removed.

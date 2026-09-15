@@ -37,7 +37,7 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   stand instead of zooming in (the game's own per-screen-type switches, exposed).
 * **Quick melee.** A punch on its own key (V by default): the support hand winds up and strikes, and at the apex
   the wrench's own hit lands at a configurable fraction of its damage (0.5 by default), with a cooldown, a swing
-  sound and a small camera kick. Works with any weapon out or none, as long as a wrench is in the inventory.
+  sound and a camera swing that accelerates the way the arm goes, peaks on the impact and settles back. Works with any weapon out or none, as long as a wrench is in the inventory.
 * **Manual reloading.** Optional: the magazine is only refilled when you press the reload key. Pulling the
   trigger on an empty gun does nothing instead of starting a reload, and holding it until the last round just
   stops the firing - Prey's "shoot to reload" and reload-after-the-last-shot both go away. The game's own
