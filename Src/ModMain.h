@@ -330,6 +330,10 @@ struct ViewmodelSettings
     int   reloadCancelFire = 1;     //!< ... and a reload in progress can be aborted by pulling the trigger
     int   reloadCancelSwitch = 1;   //!< ... or by switching to another weapon
     float reloadCancelTime = 0.20f; //!< seconds between aborting a reload and the shot that aborted it (the reload-out plays)
+    float reloadCancelMin = 0.15f;  //!< a reload can only be cancelled after it has been running this long
+    float reloadCancelMax = -0.35f; //!< ... and only while at least this much is left of it (negative: seconds before the end)
+    float reloadBlendTime = 0.20f;  //!< after a cancel, the weapon eases from where the reload had it into the live animation over this
+    float reloadBlendAmount = 1.0f; //!< how much of that pose is held at the start (0 = no blending, 1 = full)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -628,6 +632,9 @@ struct WeaponSettings
     PoseOffset interactStartElbow;    //!< ... and its elbow offset (added to the global one). Rotation unused.
     PoseOffset interactStartHandRot;  //!< ... the hand's orientation at the spot (added to the global one, deg). Position unused.
     PoseOffset interactStartForearmRot; //!< ... extra forearm rotation while the hand is up (added to the global one, deg). Position unused.
+    float reloadDuration = 0.0f;    //!< Measured length of one reload of this weapon (s, 0 = not seen yet). Learned from an uninterrupted reload; the cancel window's "seconds before the end" counts back from it.
+    float reloadNoReturn = 0.0f;    //!< Point of no return: no cancelling once the reload has been running this long (s, 0 = off). For animations that eject the magazine part-way.
+    int reloadCancelOutAnim = 1;    //!< Play the game's reload-out animation when a reload of this weapon is cancelled (the shotgun's is the slide pump, which reads wrong).
     int interactHandOff = 2;        //!< Is the support hand off the weapon (animated out of view)? 0 no, 1 yes, 2 auto (from the left IK weight and where the animated hand is). Decides whether the hand comes up from the hidden spot.
     bool valid = false;     //!< Has been touched by the user (only valid entries are saved).
 
@@ -835,6 +842,16 @@ public:
     int m_autoReloadsBlocked = 0;       //!< diagnostics: automatic reloads dropped since the mod was loaded
     int m_reloadsCancelled = 0;         //!< diagnostics: reloads aborted by firing or switching
     float m_reloadCancelTimer = 0.0f;   //!< > 0: a reload was just aborted by firing, the shot waits this long
+    // Reload watch: how long the reload running right now has been going, and how long this weapon's reloads
+    // take (learned from one that was allowed to finish). Both feed the cancel window.
+    bool  m_reloadRunning = false;
+    float m_reloadElapsed = 0.0f;
+    float m_reloadLastLen = 0.0f;       //!< diagnostics: the last completed reload's measured length
+    std::string m_reloadClass;          //!< weapon class the running reload belongs to
+    float m_reloadBlendT = 0.0f;        //!< > 0: easing the weapon out of the cancelled reload pose
+    QuatT m_reloadBlendFrom = QuatT(IDENTITY); //!< ... the pose it had when the reload was cut (camera space)
+    bool  m_reloadBlendValid = false;
+    bool  m_reloadCancelledThis = false; //!< the reload running now was cancelled: its length teaches us nothing
 
     //! Procedural weapon offsets captured from the game this frame (view space).
     void SetGameOffset(int which, const QuatT& q);
@@ -1020,6 +1037,8 @@ public:
     bool AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch);
     void OnReloadCancelled(bool bySwitch);  //!< one was: start the settle before the shot, count it
     bool HoldShotAfterReloadCancel(const CArkWeapon* pWeapon); //!< the shot that aborted a reload is still settling
+    bool PlayReloadOutOnCancel() const; //!< does the weapon being cancelled want the game's reload-out animation?
+    void UpdateReloadWatch(float dt);   //!< times reloads (for the cancel window) and learns how long each weapon takes
     void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
     void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
     bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot

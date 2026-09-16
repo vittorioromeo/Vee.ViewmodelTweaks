@@ -526,6 +526,9 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.3.0: the cancel window (`vm_reload_cancel_min` / `_max` + the measured reload length), per-weapon points
+  of no return, the pose blend over the cut (`vm_reload_blend_*`), and the shotgun's pump suppressed on a
+  cancelled reload.
 * 4.2.0: a reload can be cancelled by firing or by switching weapons (`vm_reload_cancel_*`); quick melee
   camera defaults are the values tuned in play.
 * 4.1.3: quick melee camera swing (`vm_melee_swing_*`), layered on the old kick.
@@ -741,6 +744,39 @@ starts. Neither `CanEquip` nor `CanWeaponBeEquipped` looks at the reload at all,
 blocked. Hooking `OnUnequip` and aborting the reload properly first (clear the flag, `StopReloadAmmo(true)`
 through vtable slot 0xD0, so the Q-beam's and grenade's overrides run) leaves the weapon in the state the
 game expects.
+
+Four things sit on top of that basic switch (4.3.0). **The window**: `m_reloadElapsed` is measured by watching
+the equipped weapon's `m_bIsReloading` from the frame loop - no hook needed, and a weapon switched away
+mid-reload has the flag cleared by `OnUnequip` anyway - and `vm_reload_cancel_min` refuses a cancel before it.
+The far end needs to know how long a reload *is*, which nothing in the weapon exposes: the length lives in the
+mannequin fragment and is scaled by a reload-speed stat. So it is measured instead - a reload that ends
+without having been cancelled is a complete one, and its length is written to the weapon's entry in the
+weapons file (`reload_duration`) and edited there or in the Weapon tab. `vm_reload_cancel_max` is negative and
+counts back from it. Until a weapon has been seen reloading once the rule simply does not apply, which is the
+safe direction. The shotgun is the awkward case: its shell-by-shell reload makes the measured length depend on
+how many shells went in, so the learned number is whatever the last complete one took - use the per-weapon
+point of no return there instead.
+
+**Points of no return** are per weapon (`reload_no_return`, seconds from the start, 0 = off): once the
+animation has visibly committed - the stun gun ejects its batteries, the pistol drops its magazine - a cancel
+that leaves the weapon loaded reads as a cheat. Nothing in the game marks that moment, so it is a number the
+player finds by watching the elapsed-time counter in the Reloading section.
+
+**The reload-out animation** (`reload_cancel_out_anim`, per weapon) is the one `StopReloadAmmo` plays through
+`CArkWeapon::PlayAction` (0x166CB50). For most weapons it is the right thing; for the shotgun it is the slide
+pump, which chambers a shell - showing it after an aborted reload reads as the gun doing something it did not,
+so it is off for the shotgun by default. Dropping it means dropping that one `PlayAction` call, and since a
+by-value class argument belongs to the callee on this ABI (and the SDK's `IAction::Release` is an empty stub),
+the action's reference has to be given back by hand: decrement the count at `IAction+0x50`, release through
+vtable slot 0xD0 at zero - the same sequence the game uses wherever it drops an action.
+
+**The seam**: cutting a reload mid-animation makes the weapon jump, because the pose it had has nothing to do
+with the one the next animation starts from. There is no cross-fade to ask for, but the mod is already able to
+place the weapon exactly (that is the whole render side of the aim lock), so it captures `weaponRelCam` at the
+cut and, for `vm_reload_blend_time`, blends the live pose back towards it with a smoothstep that decays to
+zero - the weapon does not move on the cut and catches up smoothly. The hands come along through the same
+rigid delta `D` the aim lock uses on the hand subtrees, so the grip holds. It hides the weapon's jump, not the
+arms' own animation change, which no amount of rigid-delta work can smooth.
 
 One weapon needs help: the Q-beam. `CArkWeaponInstalaser::StartReloadAmmo` (0x16760C0) refuses to do anything
 while `m_bIsStoppingAttack` (+0x584) is set, and `CArkWeaponInstalaser::OnActionAttackPrimary` raises that flag
