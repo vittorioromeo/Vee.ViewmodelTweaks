@@ -284,7 +284,7 @@ struct ViewmodelSettings
     int   meleeEnabled = 1;         //!< quick melee on a key: the punch plays and a wrench hit lands at its apex
     int   meleeKey = 0x2E;          //!< EKeyId (default eKI_V)
     int   meleeConsumeKey = 1;      //!< swallow the key so the game's own binding on it does nothing
-    float meleeDamage = 0.5f;       //!< damage scale relative to a wrench hit
+    float meleeDamage = 1.0f;       //!< damage scale relative to a wrench hit
     float meleeCooldown = 0.8f;     //!< seconds between punches
     float meleeCamKick = 0.7f;      //!< camera pitch kick (degrees, down then back) with the punch
     float meleeCamKickYaw = 0.8f;   //!< ... and yaw (degrees, to the right then back)
@@ -329,11 +329,12 @@ struct ViewmodelSettings
     int   reloadDryFire = 1;        //!< ... and the empty click plays on an empty magazine, not only when the backpack is empty too
     int   reloadCancelFire = 1;     //!< ... and a reload in progress can be aborted by pulling the trigger
     int   reloadCancelSwitch = 1;   //!< ... or by switching to another weapon
+    int   reloadCancelMelee = 1;    //!< ... or by throwing a quick melee punch (which the game otherwise refuses during a reload)
     float reloadCancelTime = 0.20f; //!< seconds between aborting a reload and the shot that aborted it (the reload-out plays)
-    float reloadCancelMin = 0.15f;  //!< a reload can only be cancelled after it has been running this long
-    float reloadCancelMax = -0.35f; //!< ... and only while at least this much is left of it (negative: seconds before the end)
-    float reloadBlendTime = 0.20f;  //!< after a cancel, the weapon eases from where the reload had it into the live animation over this
-    float reloadBlendAmount = 1.0f; //!< how much of that pose is held at the start (0 = no blending, 1 = full)
+    float reloadCancelMin = 0.30f;  //!< a reload can only be cancelled after it has been running this long
+    float reloadCancelMax = -0.30f; //!< ... and only while at least this much is left of it (negative: seconds before the end)
+    float reloadBlendTime = 0.30f;  //!< after a cancel, the weapon eases from where the reload had it into the live animation over this
+    float reloadBlendAmount = 0.85f; //!< how much of that pose is held at the start (0 = no blending, 1 = full)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -1034,8 +1035,12 @@ public:
     bool ClearStaleStoppingAttack(const CArkWeaponInstalaser* pWeapon);
     //! Manual reloading: may this reload be aborted (the game normally forbids it)? bySwitch = the weapon is
     //! being put away rather than fired.
-    bool AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch);
-    void OnReloadCancelled(bool bySwitch);  //!< one was: start the settle before the shot, count it
+    //! What is asking for the reload to be cut short. Each has its own switch, and the shot is the only one
+    //! that has to be held back afterwards (the holster and the punch's own windup are their own settle).
+    enum ReloadCancelReason { RC_Fire = 0, RC_Switch = 1, RC_Melee = 2 };
+    bool AllowReloadCancel(const CArkWeapon* pWeapon, int reason);
+    void OnReloadCancelled(int reason);     //!< one was: start the settle / the pose blend, count it
+    bool CancelReloadForMelee();            //!< quick melee: cut the reload short, true if there is none left in the way
     bool HoldShotAfterReloadCancel(const CArkWeapon* pWeapon); //!< the shot that aborted a reload is still settling
     bool PlayReloadOutOnCancel() const; //!< does the weapon being cancelled want the game's reload-out animation?
     void UpdateReloadWatch(float dt);   //!< times reloads (for the cancel window) and learns how long each weapon takes

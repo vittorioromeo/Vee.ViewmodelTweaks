@@ -526,6 +526,11 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.4.0: a quick melee punch can cancel a reload too (`vm_reload_cancel_melee`) - the game refuses to punch at
+  all while one is running, so the punch aborts it first and then plays. Defaults are the values tuned in play - the cancel window and blend, and the per-weapon reload table
+  (points of no return for the GLOO gun, stun gun, toy gun, Q-beam and shotgun, and each weapon's measured
+  reload length as a starting value; the mod re-measures on the first reload it sees finish). Quick melee does
+  a full wrench hit by default now (`vm_melee_damage` 1.0, was 0.5).
 * 4.3.0: the cancel window (`vm_reload_cancel_min` / `_max` + the measured reload length), per-weapon points
   of no return, the pose blend over the cut (`vm_reload_blend_*`), and the shotgun's pump suppressed on a
   cancelled reload.

@@ -459,7 +459,7 @@ static bool CArkWeaponShotgun_ContinueAttack_Hook(CArkWeaponShotgun* const _this
 // plays its own reload-out fragment ("Wpn_Reload_Out"), tells the weapon UI ("reloadEnd") and its listeners,
 // and puts the weapon back to ready - no state of ours to keep. The shot then waits out vm_reload_cancel_time
 // (see the CanStartAttack hook) so the abort is visible instead of the gun firing mid-animation.
-static bool s_reloadCancelBySwitch = false;
+static int s_reloadCancelReason = ModMain::RC_Fire;
 static_assert(offsetof(CArkWeapon, m_bShouldFinishReloading) == 0x489, "CArkWeapon layout mismatch");
 static_assert(offsetof(CArkWeapon, m_bIsReloading) == 0x48C, "CArkWeapon layout mismatch");
 // The reload-out fragment StopReloadAmmo plays on an abort is the right thing for most weapons and wrong for
@@ -491,10 +491,10 @@ static auto s_hookStopReloadAmmo = CArkWeapon::FStopReloadAmmo.MakeHook();
 static void CArkWeapon_StopReloadAmmo_Hook(CArkWeapon* const _this, const bool _bInterrupted)
 {
     bool cancelling = false;
-    if (_bInterrupted && _this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, s_reloadCancelBySwitch))
+    if (_bInterrupted && _this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, s_reloadCancelReason))
     {
         _this->m_bShouldFinishReloading = false; // ... and the original does the rest
-        gMod->OnReloadCancelled(s_reloadCancelBySwitch);
+        gMod->OnReloadCancelled(s_reloadCancelReason);
         cancelling = true;
         s_dropWeaponActions = !gMod->PlayReloadOutOnCancel();
     }
@@ -510,12 +510,12 @@ static void CArkWeapon_StopReloadAmmo_Hook(CArkWeapon* const _this, const bool _
 static auto s_hookOnUnequip = CArkWeapon::FOnUnequip.MakeHook();
 static void CArkWeapon_OnUnequip_Hook(CArkWeapon* const _this, const bool _bUnselect)
 {
-    if (_this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, true))
+    if (_this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, ModMain::RC_Switch))
     {
-        s_reloadCancelBySwitch = true;
+        s_reloadCancelReason = ModMain::RC_Switch;
         _this->m_bShouldFinishReloading = false;
         VCall<void>(_this, PreyInternals::VT_CArkWeapon_StopReloadAmmo, true); // through the vtable: the Q-beam and grenade override it
-        s_reloadCancelBySwitch = false;
+        s_reloadCancelReason = ModMain::RC_Fire;
     }
     s_hookOnUnequip.InvokeOrig(_this, _bUnselect);
 }
@@ -1847,10 +1847,11 @@ bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
     return true;
 }
 
-bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch)
+bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, int reason)
 {
     const ViewmodelSettings& s = m_settings;
-    if (!(bySwitch ? s.reloadCancelSwitch : s.reloadCancelFire))
+    const int on = reason == RC_Switch ? s.reloadCancelSwitch : (reason == RC_Melee ? s.reloadCancelMelee : s.reloadCancelFire);
+    if (!on)
         return false;
     if (!ManualReloadWeapon(s, pWeapon))
         return false;
@@ -1867,6 +1868,24 @@ bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch)
     if (len > 0.0f && m_reloadElapsed > len + min(s.reloadCancelMax, 0.0f))
         return false;   // less than |reloadCancelMax| left of the animation
     return true;
+}
+
+// The game refuses a punch while the weapon is reloading (StartMelee's own guard, and the reach would fight
+// the reload animation anyway). With the option on, the punch cuts the reload short first - the same abort the
+// trigger does, minus the settle, because the windup is already a third of a second long.
+bool ModMain::CancelReloadForMelee()
+{
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    CArkWeapon* pWeapon = pPlayer ? pPlayer->m_weaponComponent.GetEquippedWeapon() : nullptr;
+    if (!pWeapon || !pWeapon->m_bIsReloading)
+        return true;    // nothing in the way
+    if (!m_settings.reloadCancelMelee || !AllowReloadCancel(pWeapon, RC_Melee))
+        return false;
+    s_reloadCancelReason = RC_Melee;
+    pWeapon->m_bShouldFinishReloading = false;
+    VCall<void>(pWeapon, PreyInternals::VT_CArkWeapon_StopReloadAmmo, true);
+    s_reloadCancelReason = RC_Fire;
+    return !pWeapon->m_bIsReloading;
 }
 
 bool ModMain::PlayReloadOutOnCancel() const
@@ -1932,15 +1951,15 @@ void ModMain::UpdateReloadWatch(float dt)
     }
 }
 
-void ModMain::OnReloadCancelled(bool bySwitch)
+void ModMain::OnReloadCancelled(int reason)
 {
     m_reloadsCancelled++;
     m_reloadCancelledThis = true;  // this reload taught us nothing about how long a full one takes
-    if (!bySwitch) // the holster animation is the settle for a switch; only the shot needs holding back
+    if (reason == RC_Fire) // the holster animation and the punch's windup are their own settle
         m_reloadCancelTimer = clamp_tpl(m_settings.reloadCancelTime, 0.0f, 2.0f);
     // Where the weapon is right now, in camera space: the render side eases out of this pose into whatever
     // the animation does next, which is what hides the cut between the two states.
-    if (!bySwitch && m_settings.reloadBlendTime > 0.0f && m_render.attachValid && SaneQuatT(m_render.weaponRelCam, 50.0f))
+    if (reason != RC_Switch && m_settings.reloadBlendTime > 0.0f && m_render.attachValid && SaneQuatT(m_render.weaponRelCam, 50.0f))
     {
         m_reloadBlendFrom = m_render.weaponRelCam;
         m_reloadBlendT = clamp_tpl(m_settings.reloadBlendTime, 0.0f, 2.0f);
@@ -2079,8 +2098,10 @@ void ModMain::StartMelee()
         return;
     if (!s.meleeWhileAiming && s.aimEnabled && m_aimBlend > 0.3f)
         return;
-    if (I.examining || m_wsReloading || m_wsSwitching || m_wsDrawing || m_wsUnequipping)
+    if (I.examining || m_wsSwitching || m_wsDrawing || m_wsUnequipping)
         return;
+    if (m_wsReloading && !CancelReloadForMelee())
+        return;     // reloading and the punch is not allowed to cut it short
     StartReach(2, nullptr);
     I.meleePending = true;
     I.meleeCooldownLeft = max(s.meleeCooldown, 0.0f);
@@ -4241,6 +4262,35 @@ namespace
 
 namespace
 {
+    //! Reloading per weapon, as timed in play (4.4.0). "noReturn" is the moment the animation visibly commits -
+    //! the stun gun ejects its batteries, the GLOO gun swings the canister in - after which a cancel that leaves
+    //! the weapon loaded reads as a cheat; 0 = no such moment. "duration" is how long one reload takes, the
+    //! starting value for the "cannot cancel within N seconds of the end" rule; the mod re-measures it the first
+    //! time the player lets a reload finish, so a different animation speed corrects itself. "outAnim" is the
+    //! game's abort animation: right for every weapon except the shotgun, whose reload-out is the slide pump.
+    struct BuiltInReload { const char* cls; float noReturn; float duration; int outAnim; };
+    const BuiltInReload s_builtInReload[] = {
+        { "ArkWeaponPistol",      0.00f, 2.39f, 1 },
+        { "ArkWeaponShotgun",     0.35f, 1.92f, 0 },  // per shell, and the reload-out is the pump
+        { "ArkWeaponGooGun",      0.75f, 2.73f, 1 },
+        { "ArkWeaponStunGun",     0.49f, 2.48f, 1 },  // the batteries are out by then
+        { "ArkWeaponToyGun",      0.60f, 1.85f, 1 },
+        { "ArkWeaponInstalaser",  1.00f, 3.89f, 1 },
+    };
+    void ApplyBuiltInReload(const char* cls, WeaponSettings& w)
+    {
+        if (!cls)
+            return;
+        for (const BuiltInReload& r : s_builtInReload)
+            if (strcmp(r.cls, cls) == 0)
+            {
+                w.reloadNoReturn = r.noReturn;
+                w.reloadDuration = r.duration;
+                w.reloadCancelOutAnim = r.outAnim;
+                return;
+            }
+    }
+
     //! Interaction reach correction per weapon (hand position, view space m), as lined up in play (3.10.3): the grip
     //! decides where the support hand starts, and with it how the fingertip sits relative to the wrist at the end.
     struct BuiltInInteract { const char* cls; float x, y, z, pitch, yaw, roll; float faPitch, faYaw, faRoll; };
@@ -4315,11 +4365,7 @@ const WeaponSettings* WeaponSettings::BuiltIn(const char* weaponClass)
         w.hip = t[i].hip;
         w.aim = t[i].aim;
         w.wall = t[i].wall;
-        // The shotgun's reload-out fragment is the slide pump - it chambers a shell, so playing it after an
-        // aborted reload shows the gun doing something it did not do. Cut straight to idle instead (the pose
-        // blend covers the seam).
-        if (strcmp(weaponClass, "ArkWeaponShotgun") == 0)
-            w.reloadCancelOutAnim = 0;
+        ApplyBuiltInReload(weaponClass, w);
         w.valid = false; // built-in: not written to the XML until the user changes it
         return &s_cache.emplace(weaponClass, w).first->second;
     }
@@ -4920,7 +4966,7 @@ void ModMain::LoadWeapons()
             // Files written before the near-wall pose existed keep the built-in pose for that weapon.
             const WeaponSettings* pB = WeaponSettings::BuiltIn(cls);
             w.interactHandOff = clamp_tpl(n.attribute("interact_hand_off").as_int(pB ? pB->interactHandOff : 2), 0, 2);
-            w.reloadDuration = n.attribute("reload_duration").as_float(0.0f);
+            w.reloadDuration = n.attribute("reload_duration").as_float(pB ? pB->reloadDuration : 0.0f);
             w.reloadNoReturn = n.attribute("reload_no_return").as_float(pB ? pB->reloadNoReturn : 0.0f);
             w.reloadCancelOutAnim = n.attribute("reload_cancel_out_anim").as_int(pB ? pB->reloadCancelOutAnim : 1) ? 1 : 0;
             ReadPose(n, "wall_", w.wall, pB ? pB->wall : PoseOffset());
@@ -5263,6 +5309,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_reload_cancel_fire", &s.reloadCancelFire, s.reloadCancelFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - pulling the trigger aborts a reload in progress instead of queueing the shot (0/1)");
     REGISTER_CVAR2("vm_reload_cancel_switch", &s.reloadCancelSwitch, s.reloadCancelSwitch, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - switching weapons aborts a reload in progress cleanly (0/1)");
     REGISTER_CVAR2("vm_reload_cancel_time", &s.reloadCancelTime, s.reloadCancelTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds between aborting a reload and the shot that aborted it");
+    REGISTER_CVAR2("vm_reload_cancel_melee", &s.reloadCancelMelee, s.reloadCancelMelee, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - a quick melee punch aborts a reload in progress (the game otherwise refuses to punch while reloading) (0/1)");
     REGISTER_CVAR2("vm_reload_cancel_min", &s.reloadCancelMin, s.reloadCancelMin, VF_DUMPTOCHAIR, "Viewmodel Tweaks: a reload can only be cancelled once it has been running this long (s)");
     REGISTER_CVAR2("vm_reload_cancel_max", &s.reloadCancelMax, s.reloadCancelMax, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... and only while at least this much of it is left (negative seconds, e.g. -0.5; needs the weapon's reload length, learned from one that finished)");
     REGISTER_CVAR2("vm_reload_blend_time", &s.reloadBlendTime, s.reloadBlendTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the weapon takes to ease out of a cancelled reload's pose into the live animation (0 = off)");
@@ -7041,6 +7088,8 @@ void ModMain::DrawWindow()
                         ImGui::SetTooltip("Negative: how much of the animation must still be left. -0.50 means the last half second cannot be\ncancelled. Needs the weapon's reload length, which is measured the first time you let one finish\n(shown per weapon below); until then this rule does not apply.");
                     ImGui::EndDisabled();
                     ImGui::Unindent();
+                    CheckboxInt("... or by a quick melee punch", s.reloadCancelMelee,
+                        "The game refuses to punch at all while a reload is running. With this on the punch cuts the reload short\nand plays; off, the punch is simply ignored until the reload is done.");
                     CheckboxInt("... or by switching weapons", s.reloadCancelSwitch,
                         "The reload is ended properly when the weapon is put away, instead of the holster animation starting\nwhile the reload action is still running.");
                     ImGui::SliderFloat("Cancel blend", &s.reloadBlendTime, 0.0f, 1.0f, "%.2f s");

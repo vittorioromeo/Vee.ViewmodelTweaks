@@ -47,7 +47,8 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   it and remembers the shot for afterwards - with a short settle so the abort is visible before the shot
   - and a window, so a reload cannot be thrown away the instant it starts nor in its last moments, with a
   per-weapon "point of no return" for animations that visibly commit (the stun gun's batteries) and the
-  shotgun's slide pump left out of an aborted reload (`vm_reload_*`, *Weapon* tab).
+  shotgun's slide pump left out of an aborted reload. A quick melee punch cancels one too, and the weapon eases
+  out of the pose the reload was in instead of snapping (`vm_reload_*`, *Weapon* tab).
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 
