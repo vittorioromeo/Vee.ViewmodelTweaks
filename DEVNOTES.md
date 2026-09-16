@@ -5,32 +5,39 @@ All offsets are RVAs into that DLL. Read alongside `Src/ModMain.cpp`.
 
 ## Contents
 
-1. [Building from source](#building-from-source)
-2. [The weapon / camera pipeline](#the-weapon--camera-pipeline) - offsets, aim lock (skeleton + render side), FOV
-3. [Fire animation while locked](#fire-animation-while-locked)
-4. [Feel layer](#feel-layer-sprint-pose-aim-sway-view-drag) - sprint pose, aim sway, view drag
-5. [Wall pull-back and the near-wall pose](#wall-pull-back-and-the-near-wall-pose)
-6. [Bullet spread](#bullet-spread-shotgun-and-pistol-share-carkweaponshotgun)
-7. [Reticle and the in-world screen cursor](#reticle-and-the-in-world-screen-cursor)
-8. [Interaction animation](#interaction-animation-support-hand-reach) - the rig, hooks, poses, the closed-loop rules,
-   examination mode, what does not work, diagnostics
-9. [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)
-10. [Robustness](#robustness)
-11. [Three ABI traps](#three-abi-traps)
+1. [Where things are in `Src/ModMain.cpp`](#where-things-are-in-srcmodmaincpp)
+2. [Building from source](#building-from-source)
+3. [The weapon / camera pipeline](#the-weapon--camera-pipeline) - offsets, aim lock (skeleton + render side), FOV
+4. [Fire animation while locked](#fire-animation-while-locked)
+5. [Feel layer](#feel-layer-sprint-pose-aim-sway-view-drag) - sprint pose, aim sway, view drag, hold breath
+6. [Wall pull-back, convergence and the near-wall pose](#wall-pull-back-convergence-and-the-near-wall-pose)
+7. [Bullet spread](#bullet-spread-shotgun-and-pistol-share-carkweaponshotgun)
+8. [Reticle and the in-world screen cursor](#reticle-and-the-in-world-screen-cursor)
+9. [Interaction animation](#interaction-animation-support-hand-reach) - the rig, hooks, target space, hand poses,
+   the closed-loop rules, screens and keypads, quick melee, arms visibility, what does not work, diagnostics
+10. [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off) - the two automatic paths, manual
+    reloading, cancelling, the Q-beam
+11. [Robustness](#robustness)
+12. [Four ABI traps](#four-abi-traps)
+13. [Version notes](#version-notes)
+14. [Open questions](#open-questions)
 
 ## Where things are in `Src/ModMain.cpp`
 
-One file, roughly in this order: hooks, RVAs and vtable slots (top); numeric sanity helpers; the offset hook
-(`OnProceduralContextUpdated`, skeleton side of the aim lock, `PushAimLock`); the skeleton cache
-(`UpdateSkeletonCache`); the render side (`OnCameraUpdated`); the interaction reach (`OnInteract`,
-`StartReach`, `UpdateHover`, `ApplyExamineCVars`, `UpdateInteract`, `FireDeferredInteract`,
-`PushInteractReach`, `PushHandPose`, `CursorWorldPoint`, `UpdateExamZoom`, `UpdateArmsVisibility`, poses
-file); convergence, spread, blend states, feel, sanitizing, camera zoom; weapons lookup, nudge keys, input
-(`OnInputEvent`), weapon FOV, reticle, trace, weapons file; the manual-reload hooks and
-`BlockAutoReload`; `RegisterCVars`, init / shutdown; the per-frame
-entry points (`UpdateBeforeSystem`, `MainUpdate`, `LateUpdate`); the ImGui tabs (`Draw*`). `ModMain.h` holds
-the settings struct (`ViewmodelSettings`, one cvar each), the per-weapon struct (`WeaponSettings`) and the
-runtime state structs (`InteractState`, `RenderLockState`, ...).
+`ModMain.h` holds the settings struct (`ViewmodelSettings`, one cvar each), the per-weapon struct
+(`WeaponSettings`), the reach styles (`ReachStyle`) and the runtime state (`InteractState`, `RenderLockState`,
+`AimLockState`, `FeelState`). `ModMain.cpp` is the whole mod, in this order:
+
+| Part | What is there |
+| --- | --- |
+| Top | RVAs, vtable slots, every hook and its handler (all of them thin: they call a `ModMain::` method) |
+| Aim lock | `OnProceduralContextUpdated` and `PushAimLock` (skeleton side), `UpdateSkeletonCache`, `OnCameraUpdated` (render side) |
+| Interaction | `OnInteract`, `StartReach`, `UpdateInteract`, `UpdateHover`, `PushInteractReach`, `PushHandPose`, `UpdateArmsVisibility`, `CursorWorldPoint`, `UpdateExamZoom`, `ApplyExamineCVars`, the poses file |
+| Melee and reloading | `StartMelee`, `DoMeleeHit`, `BlockAutoReload`, `AllowReloadCancel`, `UpdateReloadWatch`, `CancelReloadForMelee` |
+| Feel and hip path | `ApplyOffset`, `UpdateFeel`, `UpdateConvergence`, `UpdateBlendStates`, spread, camera zoom, sanitizing |
+| Plumbing | weapons lookup and file, nudge keys, `OnInputEvent`, weapon FOV, reticle, the pop tracer, `RegisterCVars`, init / shutdown |
+| Per frame | `UpdateBeforeSystem`, `MainUpdate`, `LateUpdate` |
+| UI | the ImGui tabs (`Draw*`), at the end |
 
 ## Building from source
 
@@ -76,8 +83,9 @@ Additive offsets inherit whatever the body animation does with camera pitch (aim
 the look-sway, which makes real ironsights impossible. The lock works in two steps, both deterministic
 (no prediction filters, no feedback loops):
 
-1. **Skeleton side.** After the context has pushed its additive operators, the mod pushes `eOp_Override`
-   position/orientation for the weapon-hand IK joint (`IAnimationOperatorQueue` vtable slots 8/9, joint
+1. **Skeleton side.** After the context has pushed its additive operators, the mod pushes its own
+   position/orientation for the weapon-hand IK joint (`eOp_Additive`, see
+   [Fire animation while locked](#fire-animation-while-locked) for why it is not an override) (`IAnimationOperatorQueue` vtable slots 8/9, joint
    index at `ctx+0x18`): `camera(model space) * aimPose * (weapon relative to IK joint)^-1`. This brings
    hands, weapon bone and all effects attached to it (muzzle flash, projectile origin) to the aim pose.
    The camera is not known yet at this point - Prey evaluates the first-person skeleton first and then
@@ -153,9 +161,17 @@ game's "near FOV locked" state (used when the weapon must share the world FOV).
   (sub-stepped at 8 ms) towards the rate; the offset is proportional to the spring state, clamped.
 * Aim sway rotates the weapon about its own pivot (post-multiplied), so the sights leave the crosshair while the
   shot still follows the camera - which is what makes it matter with the reticle hidden.
+* Cvars: `vm_sprint_*` (pose, sway, zero-G, block aiming), `vm_sway_*` (amplitude, rates, how much comes from
+  moving / from the sights coming up, settle time), `vm_drag_*` (spring, clamp, lead or lag) and `vm_steady_*`
+  for hold-breath - a key that scales the sway down for `vm_steady_duration` seconds and then needs
+  `vm_steady_recover` before it works again. Nothing in the feel layer touches the game; it is all our own
+  state on top of the two output paths above.
 
-## Wall pull-back and the near-wall pose
+## Wall pull-back, convergence and the near-wall pose
 
+* **Convergence** (`vm_converge_*`) yaws and pitches the weapon so its barrel points at whatever the view ray
+  hit, scaled down as the target gets close and off entirely while aiming (the sights *are* the alignment).
+  It shares the ray below.
 * One `RayWorldIntersection` along the view ray per frame (`rwi_stop_at_pierceable`, skipping the player) gives
   the hit distance used by convergence, the pull-back and the aim block. The pull-back target is
   `SmoothStep01((start - dist) / (start - full)) * weapon.wallPush`, exponentially smoothed.
@@ -214,6 +230,9 @@ Two independent terms, and for the shotgun only the first one is normally alive:
 * `hud_reticleSetting` (SCVars+0x930; 0 off, 1 default, 2 dot) is exactly what the options menu writes
   (`gameOptions.xml`, Action="hud_reticleSetting"). Its only readers are in `CArkUIHUD` (4 sites); at 0 the
   HUD is sent `reticleDisplay("none")` *and* `interactIconDisplay("none")`.
+* The mod's own settings here are `vm_reticle_mode` (weapon reticle / dot / hidden / hidden while aiming),
+  `vm_reticle_y` (the vanilla `g_reticleYPercentage`, which moves the whole reticle down the screen) and
+  `vm_reticle_style`.
 * On in-world screens the cursor is the HUD reticle: `ArkExaminationMode::UpdateReticlePos` (`+0x157EBA0`)
   moves `m_reticlePos` (+0x60) and sends `reticlePosition` to the HUD, so a hidden reticle means no cursor.
   The mod therefore un-hides the reticle while `ArkPlayer::m_examinationMode.m_examinationState != inactive`
@@ -223,9 +242,9 @@ Two independent terms, and for the shotgun only the first one is normally alive:
 
 ## Interaction animation (support-hand reach)
 
-Written as a reference rather than a diary: the facts about the rig first, then the rules that fell out of
-getting it stable (each one cost a release), then what does *not* work, then how to read the diagnostics.
-Version notes at the end.
+The support hand is driven by pushing the arms' IK target around on top of the live animation. What follows is
+the rig it runs on, the rules that fell out of getting it stable, what does *not* work, and how to read the
+diagnostics.
 
 ### The rig
 
@@ -253,7 +272,13 @@ Version notes at the end.
   once-only part at `0x17D5B60`: store the *IScope* at `+0x38`, `scope->GetCharInst()` (slot 3), create the
   queue, resolve the three joints), and `Update` calls `m_pScope->GetCharInst()` before anything else - a
   context cannot be initialised without a real scope, which is why the own queue and not a hand-made
-  Initialize.
+  Initialize. Two earlier attempts at that queue crashed (3.8.2 "read at -1", 3.11.2 "Pure function call" on
+  the second push) for the same reason: `PushPoseModifier` takes the `shared_ptr` **by value and consumes the
+  reference** (the context increments the control block's use count for the temporary it passes and never
+  releases it; MSVC x64 hands the copy to the callee), so passing our single reference let the skeleton
+  destroy the queue at the end of the frame and the next frame went through a destroyed object's vtable. One
+  `lock inc [ctrl+8]` per push fixes it; the vtable-in-module checks, the SEH around the push and the
+  self-disable on a failed check stay as guards.
 * `IAnimationOperatorQueue` vtable: `PushPosition` slot 8 (`+0x40`), `PushOrientation` slot 9 (`+0x48`);
   ops 0 = Override, 1 = OverrideRelative, 3 = Additive. Positions are model space.
 * **A position pushed on a joint travels down to its children.** Pushing the same shift on the root moves the
@@ -384,6 +409,17 @@ Version notes at the end.
 7. Gate every screen-only quantity on a *blend* (`examBlend`: in 0.1 s, out over `vm_interact_exam_leave_time`),
    not on the raw flag - body shift, screen corrections, forward limit, arm extension - or leaving a screen
    snaps the arm to the weapon (3.10.0).
+8. **Do not reconstruct through a transition.** While a weapon is being holstered, drawn or switched, or while
+   `examBlend` is between 0 and 1, the game's own additive on the IK target swings for a few frames and the
+   camera frame changes: reconstructing then sees jumps, resets the chain and repeats stale pushes (the hand
+   blinks). Keep the last reconstruction instead and let the hand ride the game's sway; skip the jump test the
+   frame after. The weapon flags only count while fully out of screen mode - the game keeps the holstered
+   weapon as `m_toBeEquippedWeaponId` for the whole screen session, so "unequipping" stays set there and would
+   freeze the chain for as long as the screen is up (4.0.1 / 4.0.2).
+9. **Order matters for orientation ops.** Anything that changes *where in the frame* or *in which queue* the
+   pushes happen changes what the pose looks like: pushed ahead of the game's context, its additive wrist
+   offsets land on top of our wrist override instead of under it, and the pushes use the previous frame's
+   camera. The context carries them whenever it runs; our own queue only fills in when it did not (4.0.1).
 
 ### Examination mode (in-world screens and keypads)
 
@@ -399,10 +435,11 @@ Version notes at the end.
   `ArkPlayerInput::GetRotation` accumulates into `m_localRotation` (clamped to a FOV-based limit times
   `m_maxCameraRotation`): **the camera turns, the click is the centre of the view**. `m_reticlePos` is the
   gamepad cursor and sits at (0.5, 0.5) with a mouse; the hardware cursor is in desktop coordinates. Aiming
-  the hand at either was wrong (3.8.1-3.8.3); the centre ray is right (`vm_interact_exam_cursor 0`).
+  the hand at either was wrong (3.8.1-3.8.3); the centre ray is right, and is now the only path (the
+  alternatives were dropped as options in 3.10.2).
 * The arms stay with the body at the head, so a hand reaching in front of the *view* is beyond the arm and
   behind the camera. The body is brought along by a root-joint additive `realCam.t - camBone.t + bodyOffset`
-  (`vm_interact_exam_shift_mode 1`, rules 1-5 above). Even then the shoulder sits ~0.45 m behind and 0.3 m
+  (root-joint additive, rules 1-5 above). Even then the shoulder sits ~0.45 m behind and 0.3 m
   below the view: `vm_interact_exam_auto_body` slides the body forward until shoulder-to-wrist equals the arm
   length (`vm_interact_exam_arm_length`), needed for monitors, idle on keypads. Below
   `vm_interact_exam_min_dist` there is no reach (a hand touching a keypad 22 cm away would sit on the lens;
@@ -416,7 +453,7 @@ Version notes at the end.
 * Clicks on screens do not go through `Interact`; they are taken from the raw input listener
   (`vm_interact_exam_key*`, bindable) while `active && worldUI`.
 
-### Quick melee (3.11.0)
+### Quick melee
 
 * `ArkWrenchComponent::OnHit(dir, CArkWeapon&, damageScale, bCharged)` (`0x13926D0`) is the whole wrench hit:
   `GetHits` (`0x13905C0`) casts from the *player's* view with the wrench's range stats, then per hit the damage
@@ -470,14 +507,6 @@ small, or give it a delay so the peak lands after the hit.
   shown, but the ImGui frame is live every frame (`NewFrame` in `ChairImGui::UpdateBeforeSystem`, `Render`
   at `RenderEnd`), so `ImGui::GetForegroundDrawList()` from `MainUpdate` is the way to draw overlays
   (`DrawInteractMarkers`).
-* Own `AnimationPoseModifier_OperatorQueue` - works since 3.11.3, see "No weapon animation context yet" in the
-  rig section. Both earlier attempts (3.8.2 "read at -1", 3.11.2 "Pure function call" on the second push) had
-  the same cause: `ISkeletonAnim::PushPoseModifier` takes the `shared_ptr` **by value and consumes the
-  reference** (the context increments the control block's use count for the temporary it passes and never
-  releases it; MSVC x64 hands the copy to the callee), so passing our single reference let the skeleton
-  destroy the queue at the end of the frame, and the next frame's calls went through a destroyed object's
-  vtable. One `lock inc [ctrl+8]` per push fixes it; the rest (vtable-in-module checks, SEH around the push,
-  self-disable on a failed check) stays as a guard.
 * Render-side body shift (writing the abs buffer after the camera is final, 3.8.1-3.9.2): inconsistent with
   the read-back, see rule 5.
 * Every-joint body shift: multiplies down the hierarchy, see "The rig".
@@ -487,7 +516,7 @@ small, or give it a delay so the peak lands after the hit.
 
 ### Reading the diagnostics
 
-The overlay (`vm_interact_debug`, ImGui): red = target, green = where the wrist is asked, cyan = where the
+The overlay (`vm_interact_debug_marker`, ImGui): red = target, green = where the wrist is asked, cyan = where the
 wrist joint really is (last frame), magenta = shoulder, plus a line of numbers. Log lines in `Game.log` with
 the overlay on: "screen click ...", "reach at target ...", "quick melee hit ...", "quick melee impulse ..."
 (raw impulse direction against the view forward), "screen ray hit ...". Readouts in the Interact tab:
@@ -517,150 +546,7 @@ hand".
 | nothing at all on a fresh game before the wrench | the own operator queue did not engage: look for "fallback disabled" in the log and the reason on the same line |
 | "Pure function call" fatal error | a virtual called on a destroyed object - for the own queue, a lost reference (see "What does not work") |
 | a tap on a physics object plays a grab | `vm_interact_carry_hold` is 0, or the game's carry timer was not read (offset 0x460 static_assert) |
-
-### Version notes
-
-* 3.6.0 first version (deferral, tween styles); 3.6.1 carry crash (null `StartCarrying`).
-* 3.7.x absolute bind-pose finger/wrist poses, wrist via IK target, closed loop, per-weapon correction.
-* 3.8.x no weapon + screens: arms shown by slot flags, centre-ray click, envelope on the wrist, rest hand,
-  ImGui overlay, screen FOV override; own-queue crash disabled.
-* 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
-  reconstruction with reset, loop measured in its own camera - first stable screens.
-* 4.4.0: a quick melee punch can cancel a reload too (`vm_reload_cancel_melee`) - the game refuses to punch at
-  all while one is running, so the punch aborts it first and then plays. Defaults are the values tuned in play - the cancel window and blend, and the per-weapon reload table
-  (points of no return for the GLOO gun, stun gun, toy gun, Q-beam and shotgun, and each weapon's measured
-  reload length as a starting value; the mod re-measures on the first reload it sees finish). Quick melee does
-  a full wrench hit by default now (`vm_melee_damage` 1.0, was 0.5).
-* 4.3.0: the cancel window (`vm_reload_cancel_min` / `_max` + the measured reload length), per-weapon points
-  of no return, the pose blend over the cut (`vm_reload_blend_*`), and the shotgun's pump suppressed on a
-  cancelled reload.
-* 4.2.0: a reload can be cancelled by firing or by switching weapons (`vm_reload_cancel_*`); quick melee
-  camera defaults are the values tuned in play.
-* 4.1.3: quick melee camera swing (`vm_melee_swing_*`), layered on the old kick.
-* 4.1.2: the Q-beam could not be reloaded after its magazine ran dry with the trigger held (its stale
-  `m_bIsStoppingAttack` swallowed the request, see above); the `vm_spread_debug` log and its two
-  diagnostics-only hooks removed.
-* 4.1.1: `vm_reload_dry_fire` - the stock empty click on an empty magazine, not only on an empty backpack.
-* 4.1.0: manual reloading (`vm_reload_manual`, see [Automatic reloading](#automatic-reloading-and-how-to-turn-it-off)).
-  No behaviour change to anything else: four new hooks that are inert while the option is off.
-* 4.0.2: the 4.0.1 transition guard froze the chain for the whole screen session: while examining, the game
-  keeps the holstered weapon as `m_toBeEquippedWeaponId`, so `m_wsUnequipping` (and therefore "switching")
-  stays set until the weapon comes back. The weapon flags now only count while fully out of screen mode
-  (`examBlend <= 0.001`); on screens only the fade itself freezes the chain. The diagnostics show
-  `[chain frozen]` next to the reset count while the guard is active - check that first if the hand sits at
-  the wrong place on a screen.
-* 4.0.1: 3.11.7's "own pose modifier every frame" broke the poses: our modifier was registered in
-  `UpdateBeforeSystem`, i.e. *before* the game's context pushed its own, so the context's additive wrist
-  offsets landed on top of our wrist override (which, in the same queue after the game's pushes, used to win)
-  and the pushes were computed with the previous frame's camera - different-looking poses, jitter. Back to
-  the context carrying the pushes whenever it runs (ours only when it did not), the other way kept as
-  `vm_interact_own_queue_first` (off, not recommended). The transition blink is handled where it comes from
-  instead: during weapon holster / draw / switch and while `examBlend` is between 0 and 1 the chain keeps its
-  last reconstruction (no read-back reconstruction, no resets) and the hand rides the game's sway; the frame
-  after, the jump test is skipped once. Rule of thumb for the future: anything that changes *where in the
-  frame* or *in which queue* the pushes happen changes what the pose looks like - order matters for
-  orientation ops.
-* 4.0.0: the same build as 3.11.7, renumbered - the interaction animation, the resting / hovering hand, screens
-  and keypads, the rules, carrying at the apex and the quick melee together are the 4.x feature set.
-* 3.11.7: impact shake on a landed punch (`vm_melee_shake*`: decaying sine on pitch / yaw / roll in the
-  `UpdateView` post-hook, same place as the kick; scaled for enemy hits). The hand blinked for a moment on the way into and out of a screen (and around weapon holster /
-  draw): the fallback queue engaged one frame after the context stopped running (a frame with no push - the
-  hand at the animation) and, the frame the context ran again, both pushed (applied twice - the hand past the
-  target). Now our own pose modifier carries the interaction pushes *every* frame
-  (`vm_interact_own_queue_always`, default on) and `OnProceduralContextUpdated` skips its copy when
-  `ownQueueFrame == m_frameIndex`; the aim lock still goes through the context. Cost: the pushes are computed
-  in `UpdateBeforeSystem`, i.e. with the previous frame's camera rotation (one frame of lag on the hand while
-  turning; the loop is measured in `camReachPrev` so it does not drift). Off = the old way (fallback only when
-  the context did not run last frame), still with the double-push guard.
-* 3.11.6: arms forced on whenever the game clears the flag while we want them, not only on the first time -
-  hovering hand out, screen, exit, screen again left the hand invisible (the second entry cleared the flag
-  while `armsForced` was still true from the first).
-* 3.11.5: defaults = the values tuned in play through 3.11.4 (grab and punch styles incl. windup, envelope,
-  rest / start spots, start arm pose, melee cooldown / kick / lowering, punch pose, door rule, wrench shoulder).
-  The way to refresh them: dump `vm_interact_*` / `vm_melee_*` from `Chairloader_CVars.xml`, the `interact_*`
-  attributes from the weapons file and the poses file, and copy into `ViewmodelSettings`, the `ReachStyle`
-  factories, `SeedDefaultPoses`, `SeedDefaultRules` and `s_builtInInteract`.
-* 3.11.4: hand off the weapon - orientation too: the wrist blends from the spot's orientation
-  (`vm_interact_start_hand_*`, per weapon `interact_start_hand_*`) instead of from the off-screen animated hand,
-  and an extra forearm rotation while the hand is up (`vm_interact_start_forearm_*`, per weapon
-  `interact_start_forearm_*`) on top of the per-weapon twist. `hiddenStartUsed` is decided before the pose push.
-* 3.11.3: the own operator queue crashed on its second frame ("Pure function call"): the reference handed to
-  `PushPoseModifier` is consumed, see "What does not work". One extra reference per push.
-* 3.11.2: the hand before the first weapon (own operator queue, above). The 1.5 m sanity limit on the additive
-  dropped the push for a frame at the apex of a punch from an off-screen hand (hand popped to the animation and
-  back): 3 m now. Arms are shown during the windup too (`reachActive` includes `wind`). Hand off the weapon: a
-  shoulder / elbow offset (global + per weapon) applied while the hand is up, so the IK does not solve the arm
-  from wherever the one-handed animation left the shoulder. Weapon lowering eased (`vm_melee_lower_ease`).
-* 3.11.1: the one-handed flag was not reaching `SupportHandOffWeapon()`: the user's weapons file has an entry
-  for every weapon, and those entries read the new attribute as "auto", so the built-in answer never applied.
-  A missing attribute now takes the built-in value on load, and "auto" consults the built-in table before the
-  heuristic. Windup gained shoulder / elbow / forearm offsets (additive on the upper-arm and forearm joints,
-  forearm rotation as for the per-weapon twist; `windup_keep` carries them through the strike). The quick
-  melee's physics impulse pulled objects in: `ArkWeaponUtils::DoWeaponImpulse` (`0x1680A10`) is hooked while
-  our OnHit call is on the stack (`meleeHitInProgress`) and the direction flipped (`vm_melee_impulse_flip`) /
-  scaled, with the raw direction logged against the view forward when the overlay is on - the wrench passes
-  the player *entity's* forward rotated by the swipe angle and DoWeaponImpulse negates it before
-  DoHitImpulse; why the sign comes out wrong for a straight punch and right for the wrench's swipes is not
-  understood, the log line is there to find out. The equipped weapon is lowered during the punch through
-  the hip offset (`vm_melee_lower_*`, blend `meleeLowerBlend` in from the windup and out from the return).
-* 3.11.0: quick melee (above). One-handed weapons did not take the hidden start because their left IK weight
-  is animated at 1 (only the target is off screen): `SupportHandOffWeapon()` now uses a per-weapon flag
-  (`interact_hand_off`, built in for the wrench / grenades / Nullwave = off, two-handed = on, else auto from the
-  weight and the animated hand's position, shown in the tab). Windup keyframe on every style; target offset
-  sliders to +-80 cm.
-* 3.10.4: carrying re-done around what testing showed. `OnActionUse` sends `Interact(holdUse)` on the first
-  hold event, i.e. right after the press, and for a heavy object the Lua then calls `PerformInteraction(carry,
-  ..., delay = the hold-to-lift time)`: the game's own "hold" IS `m_carryDelay`, and `StopHoldToUseInteract`
-  (`0x1567640`, on release) ends with `m_carryDelay.Invalidate()` (`m_timeRemaining = -1`), which is why a
-  released key never picked the object up once the delay had been stretched. So now: `OnPerformCarry` only
-  schedules - the grab starts after `max(delay, vm_interact_carry_hold)` and the carry timer is set to that
-  plus the reach - and `UpdateCarry` watches `m_carryDelay.m_timeRemaining`: below zero before
-  `StartCarrying` (our hook sets `carryStarted`) means the key was released -> the pending grab is dropped or
-  the playing one goes straight into its return. A tap shows nothing; a heavy object's grab starts when the
-  hold completes; the pickup is at the apex either way; no entity pointer is kept (the id is looked up when
-  the grab starts). The one-handed "pop" was the *start* of the blend, not the envelope: the support hand is
-  animated off screen when it is not on the weapon (left IK weight 0) and with no weapon, and any blend from
-  there crosses into view in a couple of frames. `vm_interact_hidden_start`: the hand comes up from a fixed
-  spot below the view (global `vm_interact_start_*`, per-weapon `interact_start_*`) with the IK weight on from
-  the first frame; the additive is still computed against the true animated joint. Styles carry
-  `envelope` (limits x this, with the reach) and `along` (target moved along the camera -> object line) for
-  grabs down to the floor. The style's hand rotation is applied inside `PushHandPose` too (a pose owning the
-  wrist skipped the additive route, so it "did nothing" whenever the resting hand was up). Third reach style
-  `punch` (`vm_interact_punch_*`, pose slot "punch", test button) for a later quick-melee key. Forearm and
-  wrist corrections of the shotgun / GooGun / ToyGun baked into the built-ins; seeded rules use the prompt
-  tokens (`@use_npc`) rather than English words.
-* 3.10.3: `ui_examine_*` are re-registered by the game on level load (their defaults come back), so
-  `ApplyExamineCVars` now writes whenever the live value differs. The reach envelope scales the whole wrist
-  vector by one factor (direction to the target kept; a per-axis clamp left the hand on the box's floor at the
-  object's distance - "stops short" of things on the ground, default below-eye limit raised to 0.8 m) and takes
-  effect in proportion to the blend (at the start of a hover the hand is where the animation has it, and for
-  one-handed weapons that is outside the box: clamping it there was the remaining "pops in" of the wrench /
-  grenades). Per-weapon forearm rotation (`interact_forearm_*`, additive in model space from last frame's
-  forearm frame; the hand's absolute wrist push keeps the hand where it is). Interaction *rules*
-  (`<Rules>` in the poses file, `InteractRule`, `ResolveStyle`): first match on type / mode / entity class
-  substring / prompt text substring gives press / grab / none and whether the hovering hand comes up; seeded
-  with talk (ArkHuman + "talk") = none, ArkHuman = grab, *Container* = grab, ArkHarvestable = grab, hold-use
-  on ArkWeapon* (take ammo) = grab; "add a rule from the last interaction" in the tab. Carrying moved to a
-  pre-hook of `ArkPlayerInteraction::PerformInteraction` (0x1566B10): the grab plays only when the carry
-  really begins (a short press on something that needs a hold never gets there), and with
-  `vm_interact_carry_apex` the `_delay` argument is raised to the grab's reach time - PerformInteraction then
-  arms `m_carryDelay` itself and `Update` calls StartCarrying when it runs out (with our null guard), so no
-  state of ours can go stale. Grab-style interactions fire at the apex (`vm_interact_grab_apex`). Defaults
-  (timings, envelope, rest spots, drift, hover, no-zoom switches, the point / point_rest poses, per-weapon
-  corrections) updated to the values tuned in play; `_none` has a built-in entry now.
-* 3.10.2 cleanup, no behaviour change: removed the dead ends as options (every-joint / render-side shift,
-  own operator queue, right-arm hide, arm extension, cursor source / flip-y / follow test - the click is the
-  centre ray, full stop) and their code; the Interact tab regrouped (Reach / Screens and keypads / Resting
-  hand / Hand pose / Test / Advanced). Persisted cvars of the removed options are simply ignored.
-* 3.10.1 IK weight ramp for one-handed weapons, resting spot per mode (outside / on screens,
-  `vm_interact_rest_exam_*`) plus a per-weapon offset (`interact_rest_*` in the weapons file), hover off while
-  aiming unless `vm_interact_hover_aiming`.
-* 3.10.0 arms-invisible-after-screen fix, `examBlend` fade, chain reset repeats last reach, rest pose slot +
-  drift + hover outside screens (`vm_interact_hover_*`), gentle press style on screens
-  (`vm_interact_press_exam_*`), `ui_examine_*` exposed as `vm_interact_nozoom_*`.
-
-Open: a Chairloader `ShutdownGame` crash was seen once when quitting the game while a screen was up (not
-reproduced, not investigated).
+| the hand sits in the wrong place on a screen | `[chain frozen]` next to the reset count: rule 8's guard is stuck on (check the weapon state flags) |
 
 ## Automatic reloading (and how to turn it off)
 
@@ -670,6 +556,8 @@ share the base one) differ only in a handful of slots. The slots that matter her
 `0x88` `CanStartAttack`, `0xb0` `AutoloadAmmo`, `0xb8` `StartReloadAmmo`, `0xc0` `ContinueReloadAmmo`, `0xc8`
 `ReloadAmmo`, `0xd0` `StopReloadAmmo`, `0xe8` `StartAttack`, `0xf0` `ContinueAttack`, `0xf8` `StopAttack`,
 `0x1f8` `ConsumeAmmo`, `0x200` `CanLoadAmmo`, `0x208` `HasAmmo`, `0x210` `OnAmmoDepleted`.
+
+### The two automatic paths
 
 Two paths reload without being asked to, and only two:
 
@@ -696,6 +584,8 @@ block is placed on those two paths and *not* on `StartReloadAmmo` itself:
 * `CArkWeapon::PostSerialize+0x69` clears `m_bIsReloading` and restarts the reload when a save was made in the
   middle of one.
 
+### Manual reloading
+
 So the mod (`vm_reload_manual`) hooks `AutoloadAmmo` and returns without calling the original, and hooks
 `StartReloadAmmo` to drop *only* the call made while `ContinueAttack` is on the stack (a `s_inContinueAttack`
 flag set by hooks on both `ContinueAttack` bodies). The Q-beam's own `StartReloadAmmo` (0x16760C0) tail-jumps
@@ -709,10 +599,10 @@ so they are excluded unless `vm_reload_manual_thrown` says otherwise, matched on
 
 What falls out for free: with `AutoloadAmmo` neutered, `CanStartAttack` on an empty magazine reaches
 `m_bWantsToAttack = false; return false` - no shot, no reload, and no retry from `Update`, because it clears
-the wants-to-attack flag itself. Pressing
-fire during a manual reload still cannot strand you: `CanStartAttack` sets `m_bShouldFinishReloading` (+0x489)
-from `!m_bAllowInterruptReloading || GetWeaponAmmoCount() == 0` before calling `StopReloadAmmo(true)`, and
-`StopReloadAmmo` does nothing at all while that flag is set - an empty-magazine reload always finishes.
+the wants-to-attack flag itself. Pressing fire during a manual reload cannot strand you either: the reload
+finishes by itself, for the reason the next section but one is built on.
+
+### The empty click
 
 The empty click (`vm_reload_dry_fire`) rides on the same branch. Just before clearing the flag,
 `CanStartAttack` does *if `GetInventoryAmmoCount() == 0`: `OnAmmoDepleted()` and play the fragment at
@@ -727,8 +617,9 @@ condition matters: pressing fire during a reload takes an earlier branch of `Can
 `CanLoadAmmo()`, which reads the inventory count itself and would eat the lie. Holding the trigger cannot
 repeat the click either - the held-fire path goes through `ContinueAttack`, not `StartAttack`.
 
-**Cancelling a reload** (4.2.0, `vm_reload_cancel_*`) needs no new machinery either - the game has it and keeps
-it switched off. `CanStartAttack`, when the trigger is pulled during a reload, sets `m_bShouldFinishReloading`
+### Cancelling a reload
+
+Cancelling (`vm_reload_cancel_*`) needs no new machinery either - the game has it and keeps it switched off. `CanStartAttack`, when the trigger is pulled during a reload, sets `m_bShouldFinishReloading`
 (+0x489) from `!m_bAllowInterruptReloading || GetWeaponAmmoCount() == 0` and calls `StopReloadAmmo(true)`,
 whose entire body is skipped while that flag is set (its guard is `m_bIsReloading && m_bIsReadyToAttack &&
 !m_bShouldFinishReloading`). Only two archetypes in the whole game set `bAllowInterruptReloading`, so for every
@@ -741,6 +632,12 @@ addition is the settle: `vm_reload_cancel_time` holds `CanStartAttack` back (ret
 the original) so the shot does not go off inside the abort animation - `m_bWantsToAttack` stays set and
 `Update` retries every frame, so the shot fires by itself the moment the hold ends.
 
+Three things can ask for the abort, each with its own switch (`_fire`, `_melee`, `_switch`) and its own entry
+point, all of them ending in the same hooked `StopReloadAmmo`. A quick melee punch is the odd one: the game
+refuses to punch at all while a reload runs (`StartMelee`'s own guard), so `CancelReloadForMelee` cuts the
+reload short first and the punch then plays - without the settle, since the windup is a third of a second of
+its own.
+
 Weapon switching reaches the same place from a different direction. Both `ArkPlayerWeaponComponent::Equip`
 (input and inventory) and `::EquipWeapon` (everything else) call `OnUnequip(true)` on the weapon being put
 away, and `CArkWeapon::OnUnequip` writes `m_bIsReloading = false` and `m_bWantsToReload = false` directly -
@@ -750,7 +647,9 @@ blocked. Hooking `OnUnequip` and aborting the reload properly first (clear the f
 through vtable slot 0xD0, so the Q-beam's and grenade's overrides run) leaves the weapon in the state the
 game expects.
 
-Four things sit on top of that basic switch (4.3.0). **The window**: `m_reloadElapsed` is measured by watching
+### The cancel window, points of no return, the seam
+
+Four things sit on top of that basic switch. **The window**: `m_reloadElapsed` is measured by watching
 the equipped weapon's `m_bIsReloading` from the frame loop - no hook needed, and a weapon switched away
 mid-reload has the flag cleared by `OnUnequip` anyway - and `vm_reload_cancel_min` refuses a cancel before it.
 The far end needs to know how long a reload *is*, which nothing in the weapon exposes: the length lives in the
@@ -782,6 +681,8 @@ cut and, for `vm_reload_blend_time`, blends the live pose back towards it with a
 zero - the weapon does not move on the cut and catches up smoothly. The hands come along through the same
 rigid delta `D` the aim lock uses on the hand subtrees, so the grip holds. It hides the weapon's jump, not the
 arms' own animation change, which no amount of rigid-delta work can smooth.
+
+### The Q-beam's stale flag
 
 One weapon needs help: the Q-beam. `CArkWeaponInstalaser::StartReloadAmmo` (0x16760C0) refuses to do anything
 while `m_bIsStoppingAttack` (+0x584) is set, and `CArkWeaponInstalaser::OnActionAttackPrimary` raises that flag
@@ -821,7 +722,7 @@ toggled at runtime.
 * Mod cvars are unregistered in `ShutdownSystem`: the console keeps raw pointers to the names and storage,
   which vanish with the DLL, and touches them again at engine shutdown (crash on exit otherwise).
 
-## Three ABI traps
+## Four ABI traps
 
 1. Member functions returning a struct larger than 8 bytes (`QuatT`, `std::vector`, `std::pair`) take the
    hidden return pointer AFTER `this`. Never hook or call them through an SDK declaration that returns the
@@ -840,4 +741,62 @@ toggled at runtime.
    smoothed value that tracks its target instantly or not at all while the code is provably right means
    the *step* is garbage, and a garbage step in a value that was fine a call earlier means a callee
    trashed a callee-saved register - look for a stack struct the callee writes into.
+4. **A by-value class argument belongs to the callee.** A `_smart_ptr<T>` (or any non-trivially-copyable type)
+   passed by value is passed as a pointer to the caller's object, and the *callee* destroys it. Hook such a
+   function and pass the argument through and everything balances; hook it and **drop** the call, and the
+   reference is leaked - the SDK's `Release()` for these types is an empty stub, so the smart pointer going
+   out of scope in the hook does nothing. Give it back the way the game does: decrement the refcount and call
+   the release vtable slot at zero (`IAction`: count at `+0x50`, release at `+0xD0`). The same rule read from
+   the other side is what bit the own operator queue three times - see the rig section.
 
+## Version notes
+
+Newest first. Older entries are one line each: what is still load-bearing from them has been promoted into
+the reference sections above.
+
+* 4.4.0: a quick melee punch can cancel a reload (`vm_reload_cancel_melee`). Defaults are the values tuned in
+  play, including a built-in per-weapon reload table (points of no return, measured reload lengths); quick
+  melee does a full wrench hit (`vm_melee_damage` 1.0).
+* 4.4.1: cleanup pass, no behaviour change. The render-time placement self-test, the write-only diagnostics
+  counters and the pose cvars nothing read are gone; the pop tracer only records while the diagnostics are
+  open and no longer writes a CSV by itself; the README is rewritten and these notes reorganised; release
+  archives are no longer tracked in the repository.
+* 4.3.0: the cancel window (`vm_reload_cancel_min` / `_max` and the measured reload length), per-weapon points
+  of no return, the pose blend over the cut (`vm_reload_blend_*`), the shotgun's pump left out of a cancel.
+* 4.2.0: a reload can be cancelled by firing or by switching weapons (`vm_reload_cancel_*`).
+* 4.1.3: quick melee camera swing (`vm_melee_swing_*`), layered on the old kick.
+* 4.1.2: the Q-beam could not be reloaded after its magazine ran dry with the trigger held (stale
+  `m_bIsStoppingAttack`); the `vm_spread_debug` log and its two diagnostics-only hooks removed.
+* 4.1.1: `vm_reload_dry_fire` - the empty click on an empty magazine, not only on an empty backpack.
+* 4.1.0: manual reloading (`vm_reload_manual`).
+* 4.0.2: the 4.0.1 transition guard froze the chain for the whole screen session (rule 8).
+* 4.0.1: 3.11.7's "own pose modifier every frame" broke the poses and had to be reverted (rule 9).
+* 4.0.0: the same build as 3.11.7, renumbered.
+* 3.11.x: quick melee (punch, wrench hit at the apex, sound, camera kick, impact shake, weapon lowered), the
+  hand before the first weapon out of our own operator queue, the hidden start for one-handed weapons
+  including its orientation, the windup keyframe, arms re-forced whenever the game clears the flag.
+* 3.10.x: the rule list by interaction type / entity class / prompt text, carrying re-done around the game's
+  own hold timer, `ui_examine_*` exposed as `vm_interact_nozoom_*` and re-applied on level load, per-mode rest
+  spots, the IK weight ramp, the `examBlend` fade, the dead ends dropped as options.
+* 3.9.3 / 3.9.4: body shift into the queue, then root-only shift, shift-aware reach base, exact chain
+  reconstruction with reset, loop measured in its own camera - the first stable screens.
+* 3.8.x: no weapon and screens: arms shown by slot flags, centre-ray click, envelope on the wrist, resting
+  hand, ImGui overlay, screen FOV override.
+* 3.7.x: absolute bind-pose finger and wrist poses, wrist via the IK target, the closed loop, per-weapon
+  corrections.
+* 3.6.x: first version - deferral, tween styles; the null `StartCarrying` crash guard.
+
+### Refreshing the defaults from a tuned config
+
+The shipped defaults are whatever was tuned in play, so after a tuning session: read the values out of
+`Prey/Mods/config/Chairloader_CVars.xml` (globals) and `Vee.ViewmodelTweaks.weapons.xml` / `.poses.xml`
+(per weapon), write them into the initialisers in `ModMain.h` and the built-in tables in `ModMain.cpp`
+(`BuiltInTable`, `s_builtInInteract`, `s_builtInReload`, `SeedDefaultPoses`), and check that a config with no
+file present now plays the same.
+
+## Open questions
+
+* A Chairloader `ShutdownGame` crash was seen once when quitting the game while a screen was up. Not
+  reproduced, not investigated.
+* The shotgun's measured reload length depends on how many shells went in, so the "seconds before the end"
+  rule is only ever permissive for it. A per-shell length would need the mannequin fragment's own duration.

@@ -17,7 +17,8 @@
 //        user's offset into the QuatT(s) before the context consumes them.
 //      - Aim lock, skeleton side: additive offsets inherit everything the body animation does with
 //        camera pitch and look-sway, which ruins ironsights. So while aiming we post-hook the *context*
-//        update and push an eOp_Override for the weapon-hand IK joint: camera(model space) * userPose *
+//        update and push an eOp_Additive for the weapon-hand IK joint (an override would wipe out the
+//        fire animation): camera(model space) * userPose *
 //        (weaponBone relative to IK joint)^-1, so hands, weapon bone and effects end up near the pose.
 //        The camera is not known yet at that point (the skeleton is evaluated BEFORE the camera is
 //        built from it), so this uses last frame's exact camera + this frame's mouse delta.
@@ -597,7 +598,12 @@ static bool ArkPlayerCarry_StartCarrying_Hook(ArkPlayerCarry* const _this, IEnti
 {
     if (!_pEntity)
     {
-        CryLog("ViewmodelTweaks: ArkPlayerCarry::StartCarrying called with no entity (target lost during the carry delay) - ignored instead of crashing");
+        static bool s_warned = false;   // ordinary player behaviour, so say it once and stop
+        if (!s_warned)
+        {
+            s_warned = true;
+            CryLog("ViewmodelTweaks: ArkPlayerCarry::StartCarrying called with no entity (target lost during the carry delay) - ignored instead of crashing");
+        }
         return false;
     }
     if (gMod)
@@ -725,7 +731,7 @@ float ModMain::Now() const
 }
 
 //---------------------------------------------------------------------------------
-// Additive offsets (global standing / crouch + per-weapon hip + legacy aim)
+// Additive offsets (global standing / crouch + per-weapon hip)
 //---------------------------------------------------------------------------------
 void ModMain::SetGameOffset(int which, const QuatT& q)
 {
@@ -1303,8 +1309,15 @@ void ModMain::UpdateSkeletonCache(void* pCharInst, void* pAttachment)
                 break;
             }
         }
-        CryLog("ViewmodelTweaks: arms skeleton {} joints, hand subtree {} joints, bind pose accessors {}", count, (int)R.leftSubtree.size(),
-            R.defaultPoseValid ? "verified" : "NOT found (hand poses fall back to identity rotations)");
+        // Once per session: the cache is rebuilt on every weapon change, and the interesting part (are the bind
+        // pose accessors there?) cannot change afterwards.
+        static bool s_logged = false;
+        if (!s_logged || !R.defaultPoseValid)
+        {
+            s_logged = true;
+            CryLog("ViewmodelTweaks: arms skeleton {} joints, hand subtree {} joints, bind pose accessors {}", count, (int)R.leftSubtree.size(),
+                R.defaultPoseValid ? "verified" : "NOT found (hand poses fall back to identity rotations)");
+        }
     }
 }
 
@@ -1553,11 +1566,6 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
         desiredModel = camModel * desiredRelCam;
         changed = true;
     }
-    if (Active() && s.testOffsetUp != 0.0f)
-    {
-        desiredModel.t += (camModel.q * Vec3(0.0f, 0.0f, s.testOffsetUp));
-        changed = true;
-    }
     // Cancelled reload: the animation cuts from the reload straight to whatever comes next, and the weapon
     // jumps. Hold the pose it had at the cut (in camera space, so it still follows the view) and ease out of
     // it - the hands come along below, by the same rigid delta the aim lock uses.
@@ -1616,7 +1624,7 @@ void ModMain::OnCameraUpdated(ArkPlayerCamera* pCamera, SViewParams& params)
     *pModelRel = desiredModel;
 
     // --- Hands: move the final hand poses by the same rigid delta so they stay on the grip. ----------
-    const bool wantHands = (ab > 0.0f && s.aimRenderLock) ? (s.aimHandsFollow != 0) : (s.testHands != 0 || cancelBlend);
+    const bool wantHands = (ab > 0.0f && s.aimRenderLock) ? (s.aimHandsFollow != 0) : cancelBlend;
     if (!wantHands)
         return;
     void* pSkelPose = VCall<void*>(pCharInst, VT_ICharacterInstance_GetISkeletonPose);
@@ -1943,7 +1951,7 @@ void ModMain::UpdateReloadWatch(float dt)
         w.valid = false;
         it = m_weapons.emplace(m_reloadClass, w).first;
     }
-    if (fabsf(it->second.reloadDuration - m_reloadElapsed) > 0.02f)
+    if (fabsf(it->second.reloadDuration - m_reloadElapsed) > 0.15f) // not every few ms of animation jitter
     {
         it->second.reloadDuration = m_reloadElapsed;
         it->second.valid = true;   // so it is written to the weapons file and survives a restart
@@ -2399,7 +2407,6 @@ void ModMain::ApplyExamineCVars()
         if (pVar->GetIVal() != want)
         {
             pVar->Set(want);
-            m_uiExamineApplied[i] = want;
         }
     }
 }
@@ -2718,7 +2725,6 @@ void ModMain::PushInteractReach(void* pModifier, void* pSkelPose, const QuatT& c
             // chain is wrong: reset it
             if (!I.chainJustReset && (anim.t - I.animIk.t).GetLengthSquared() > 0.3f * 0.3f)
             {
-                I.pushesNotApplied++;
                 I.chainResets++;
                 chainReset = true;
                 anim = *pAbs; // best available: only the shift is known to be in there (pushed again below, alone)
@@ -4826,6 +4832,18 @@ void ModMain::UpdateReticle()
 //---------------------------------------------------------------------------------
 void ModMain::RecordTrace()
 {
+    // A development tool, not something to run behind a player's back: it keeps a 30 s ring buffer of every
+    // update and can write a CSV into the config folder. Only while the diagnostics are actually open.
+    if (!m_settings.showAdvanced)
+    {
+        if (!m_trace.empty())
+        {
+            m_trace.clear();
+            m_trace.shrink_to_fit();
+            m_traceHead = m_traceCount = 0;
+        }
+        return;
+    }
     constexpr size_t N = 1500; // ~30 s at 50 updates/s
     if (m_trace.size() != N)
     {
@@ -5064,7 +5082,11 @@ void ModMain::InitHooks()
     s_hookOnUnequip.SetHookFunc(&CArkWeapon_OnUnequip_Hook);
 }
 
-static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
+//! Registers a pose offset's cvars. Several of these offsets are position-only or rotation-only by nature
+//! (a spot the hand comes up from has no orientation of its own; a forearm twist has no position), so
+//! `axes` says which half to register - the other half would be a cvar nothing reads.
+enum PoseCVarAxes { POSE_ALL, POSE_POS_ONLY, POSE_ROT_ONLY };
+static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what, PoseCVarAxes axes = POSE_ALL)
 {
     // Names: vm_<prefix>pos_x ... e.g. vm_pos_x, vm_crouch_pos_x, vm_aim_pos_x.
     // The console keeps the name/help pointers, so they must outlive this call.
@@ -5077,12 +5099,18 @@ static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* wha
         s_strings.push_back(std::string("Viewmodel Tweaks (") + what + "): " + text);
         return s_strings.back().c_str();
     };
-    REGISTER_CVAR2(name("pos_x"), &p.posX, p.posX, VF_DUMPTOCHAIR, help("right(+)/left(-) offset in meters"));
-    REGISTER_CVAR2(name("pos_y"), &p.posY, p.posY, VF_DUMPTOCHAIR, help("forward(+)/back(-) offset in meters"));
-    REGISTER_CVAR2(name("pos_z"), &p.posZ, p.posZ, VF_DUMPTOCHAIR, help("up(+)/down(-) offset in meters"));
-    REGISTER_CVAR2(name("rot_pitch"), &p.pitch, p.pitch, VF_DUMPTOCHAIR, help("pitch offset in degrees (tilt up/down)"));
-    REGISTER_CVAR2(name("rot_yaw"), &p.yaw, p.yaw, VF_DUMPTOCHAIR, help("yaw offset in degrees (turn left/right)"));
-    REGISTER_CVAR2(name("rot_roll"), &p.roll, p.roll, VF_DUMPTOCHAIR, help("roll offset in degrees"));
+    if (axes != POSE_ROT_ONLY)
+    {
+        REGISTER_CVAR2(name("pos_x"), &p.posX, p.posX, VF_DUMPTOCHAIR, help("right(+)/left(-) offset in meters"));
+        REGISTER_CVAR2(name("pos_y"), &p.posY, p.posY, VF_DUMPTOCHAIR, help("forward(+)/back(-) offset in meters"));
+        REGISTER_CVAR2(name("pos_z"), &p.posZ, p.posZ, VF_DUMPTOCHAIR, help("up(+)/down(-) offset in meters"));
+    }
+    if (axes != POSE_POS_ONLY)
+    {
+        REGISTER_CVAR2(name("rot_pitch"), &p.pitch, p.pitch, VF_DUMPTOCHAIR, help("pitch offset in degrees (tilt up/down)"));
+        REGISTER_CVAR2(name("rot_yaw"), &p.yaw, p.yaw, VF_DUMPTOCHAIR, help("yaw offset in degrees (turn left/right)"));
+        REGISTER_CVAR2(name("rot_roll"), &p.roll, p.roll, VF_DUMPTOCHAIR, help("roll offset in degrees"));
+    }
 }
 
 static void RegisterReachStyleCVars(ReachStyle& r, const char* prefix, const char* what)
@@ -5296,10 +5324,10 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_interact_start_x", &s.interactStartX, s.interactStartX, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, right (m)");
     REGISTER_CVAR2("vm_interact_start_y", &s.interactStartY, s.interactStartY, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, forward (m)");
     REGISTER_CVAR2("vm_interact_start_z", &s.interactStartZ, s.interactStartZ, VF_DUMPTOCHAIR, "Viewmodel Tweaks: that spot, up (m)");
-    RegisterPoseCVars(s.interactStartShoulder, "interact_start_shoulder_", "hand off the weapon - shoulder moved while the hand is up");
-    RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up");
-    RegisterPoseCVars(s.interactStartHandRot, "interact_start_hand_", "hand off the weapon - the hand's orientation at the spot (rotation only)");
-    RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up (rotation only)");
+    RegisterPoseCVars(s.interactStartShoulder, "interact_start_shoulder_", "hand off the weapon - shoulder moved while the hand is up", POSE_POS_ONLY);
+    RegisterPoseCVars(s.interactStartElbow, "interact_start_elbow_", "hand off the weapon - elbow moved while the hand is up", POSE_POS_ONLY);
+    RegisterPoseCVars(s.interactStartHandRot, "interact_start_hand_", "hand off the weapon - the hand's orientation at the spot", POSE_ROT_ONLY);
+    RegisterPoseCVars(s.interactStartForearmRot, "interact_start_forearm_", "hand off the weapon - forearm rotation while the hand is up", POSE_ROT_ONLY);
     REGISTER_CVAR2("vm_interact_own_queue_first", &s.interactOwnQueueFirst, s.interactOwnQueueFirst, VF_DUMPTOCHAIR, "Viewmodel Tweaks: carry the hand pushes with our own pose modifier every frame, ahead of the game's context (1; the wrist then gets the game's additive on top) or only when the context did not run (0, default)");
     REGISTER_CVAR2("vm_interact_no_context_fallback", &s.interactNoContextFallback, s.interactNoContextFallback, VF_DUMPTOCHAIR, "Viewmodel Tweaks: before any weapon was ever equipped, drive the hand with our own pose modifier (0/1)");
 
@@ -5656,7 +5684,6 @@ void ModMain::PushWithOwnQueue()
     PushInteractReach(m_ownQueue, pSkelPose, camAbs);
     I.ownQueueUsed = true;
     I.ownQueueFrame = m_frameIndex;
-    I.ownQueuePushes++;
 }
 
 void ModMain::MainUpdate(unsigned updateFlags)
@@ -6242,7 +6269,7 @@ void ModMain::DrawInteractTab()
             DrawReachStyle(s.grab, "grab");
             ImGui::TreePop();
         }
-        if (ImGui::TreeNode("Punch timing and path (quick melee - test button below for now)"))
+        if (ImGui::TreeNode("Punch timing and path (quick melee; the Test section plays one)"))
         {
             ImGui::TextWrapped("Goes to the fixed test point ahead unless its pose has an absolute position (the default punch pose does: 75 cm ahead).");
             DrawReachStyle(s.punch, "punch");
@@ -6275,7 +6302,6 @@ void ModMain::DrawInteractTab()
                 r.style = 0;
                 r.note = "";
                 m_rules.insert(m_rules.begin(), r);
-                m_editRule = 0;
                 m_posesDirty = true;
             }
             ImGui::SameLine();
@@ -7420,15 +7446,6 @@ void ModMain::DrawWindow()
                         m_lock.kickPos * 100, RAD2DEG(m_lock.kickRot), m_lock.kick.t.GetLength() * 100, m_lock.pushesNotApplied, m_nanRecoveries);
                     TextQuatT("Game recoil", m_gameOffsets[2]);
                     TextQuatT("Game bump", m_gameOffsets[3]);
-                    ImGui::Separator();
-                    ImGui::TextWrapped("Self-test (works while not aiming too): raise the weapon at render time. If the weapon moves, the attachment write works; "
-                                       "if the hands move with it, the joint write works.");
-                    ImGui::SliderFloat("Test: raise weapon", &s.testOffsetUp, 0.0f, 0.2f, "%.2f m");
-                    ImGui::SameLine();
-                    CheckboxInt("hands too", s.testHands);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Reset##test"))
-                        s.testOffsetUp = 0.0f;
                     ImGui::TreePop();
                 }
                 if (s.showAdvanced && ImGui::TreeNode("Input debug"))
@@ -7513,7 +7530,7 @@ void ModMain::DrawWindow()
                 CheckboxInt("Capture mouse while this window is open", s.guiMouse,
                     "Shows the cursor and stops the camera from turning while you drag sliders.\nThe game keeps running. Close this window or press F1 to give the mouse back.");
                 CheckboxInt("Show advanced and experimental features", s.showAdvanced,
-                    "Diagnostics, self-tests and the experimental Death tab. Not needed for normal use.");
+                    "Diagnostics, live numbers and the test buttons. Not needed for normal use.");
                 if (ImGui::Button("Save weapon settings now"))
                     SaveWeapons();
                 ImGui::SameLine();

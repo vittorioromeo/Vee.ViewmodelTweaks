@@ -93,7 +93,6 @@ struct ReachStyle
     float windFaPitch = 0.0f, windFaYaw = 0.0f, windFaRoll = 0.0f; //!< windup: forearm rotation (deg, about its own axes)
     float windKeep = 0.0f;      //!< how much of the shoulder / elbow / forearm windup is kept through the strike (0..1)
 
-    float Duration() const { return windupTime + reachTime + holdTime + returnTime; }
     float ApexTime() const { return max(windupTime, 0.0f) + max(reachTime, 0.0f); } //!< from the start to the hand at the target
     //! Quick melee: fast, straight ahead, snaps back.
     static ReachStyle Punch()
@@ -386,12 +385,9 @@ struct ViewmodelSettings
     float fov = 55.0f;          //!< Weapon FOV in degrees. Stock game uses 55.
 
     int   showWindow = 1;       //!< Whether the ImGui window is open when the Chairloader GUI is visible.
-    int   showAdvanced = 0;     //!< Show diagnostics, self-tests and experimental features (Death tab).
+    int   showAdvanced = 0;     //!< Show the diagnostics and test sections in the window.
     int   guiMouse = 1;         //!< Show the cursor / block player look input while the window is open (game keeps running).
 
-    // Not persisted: render-time placement self-test (moves the weapon/hands by this much, always).
-    float testOffsetUp = 0.0f;  //!< meters
-    int   testHands = 1;
 
     ViewmodelSettings()
     {
@@ -470,7 +466,6 @@ struct InteractState
     Vec3 finalPrev = Vec3(ZERO);    //!< last frame's final IK target joint as read back (detects a skeleton that did not update)
     bool finalPrevValid = false;
     bool chainJustReset = false;    //!< last frame reset the chain: this frame's reconstruction is the new baseline
-    int pushesNotApplied = 0;       //!< debug: frames where the read-back did not fit "animation + what we pushed" -> chain reset
     int chainResets = 0;            //!< debug: those resets (one frame without the reach each)
     bool chainFrozen = false;       //!< debug: this frame kept the last reconstruction (weapon switch / screen fade)
     int pushes = 0;
@@ -548,7 +543,6 @@ struct InteractState
     Quat swayRot = Quat(IDENTITY);  //!< this frame's drift (view space)
     Vec3 lastReach = Vec3(ZERO);    //!< last frame's reach part of the additive (without the body shift), model space
 
-    // Debug
     // Carrying (see OnPerformCarry): the grab starts once the key has been held, the game's carry delay ends at its apex
     bool hiddenStartUsed = false;   //!< this frame the hand comes up from the fixed spot (support hand not on the weapon)
     float wind = 0.0f;              //!< 0..1: the windup keyframe (hand pulled to the style's windup offset); fades out during the reach
@@ -562,7 +556,7 @@ struct InteractState
     int meleePunches = 0, meleeHits = 0, meleeNoWrench = 0; //!< debug
     bool ownQueueUsed = false;      //!< our own pose modifier carried the pushes this frame
     int ownQueueFrame = -1;         //!< the frame (m_frameIndex) it did
-    int ownQueuePushes = 0;
+
     bool meleeSoundWarned = false;
     bool meleeHitInProgress = false; //!< inside our OnHit call (the impulse hook looks at this)
     float meleeLowerBlend = 0.0f;   //!< 0..1: the equipped weapon's lowering
@@ -838,7 +832,6 @@ public:
     void SanitizeFeel();                                 //!< resets the feel state if any number went bad
     void SanitizeSettings();                             //!< replaces non-finite persisted settings with defaults
     QuatT ComputeAimLocal() const;                       //!< weapon-local extras applied after the aim pose (sway, drag)
-    const FeelState& GetFeel() const { return m_feel; }
     bool Active() const { return m_settings.enabled != 0 && m_settings.bypass == 0; } //!< viewmodel features on
     int m_autoReloadsBlocked = 0;       //!< diagnostics: automatic reloads dropped since the mod was loaded
     int m_reloadsCancelled = 0;         //!< diagnostics: reloads aborted by firing or switching
@@ -862,7 +855,6 @@ public:
 
     //! ADS sensitivity multiplier the game should use for the current call (0 = leave alone).
     float GetAimSensitivityMultiplier(float currentMultiplier, float zoomedMultiplier);
-    int GetCameraZoomHandle() const { return m_cameraZoomHandle; }
 
     //! IInputEventListener: raw input for the aim key binding and nudge keys.
     virtual bool OnInputEvent(const SInputEvent& event) override;
@@ -1003,7 +995,7 @@ private:
     size_t m_traceCount = 0;
     float m_traceLastSave = -100.0f;
     int m_traceSaves = 0;
-    bool m_traceAuto = true;
+    bool m_traceAuto = false;   //!< save a CSV by itself when the weapon jumps (the diagnostics have to be open at all)
     std::string m_traceStatus;
     void RecordTrace();
     void SaveTrace(const char* reason);
@@ -1050,7 +1042,6 @@ public:
     void UpdateCarry(float dt);         //!< the pending / playing carry grab: start it, or call it off when the key was released
     //! Starts a reach animation towards a world point (or the fixed test point when pWorld is null).
     void StartReach(int style, const Vec3* pWorld);
-    const InteractState& GetInteract() const { return m_interact; }
     bool MeleeHitInProgress() const { return m_interact.meleeHitInProgress; }
 private:
     InteractState m_interact;
@@ -1093,7 +1084,6 @@ private:
     // Hand poses (Vee.ViewmodelTweaks.poses.xml)
     std::vector<HandPose> m_poses;
     std::vector<InteractRule> m_rules;  //!< which animation an interaction gets (poses file, <Rules>)
-    int m_editRule = -1;
     //! Style for an interaction: 0 press, 1 grab, 2 none. className / text may be null.
     int ResolveStyle(int type, int mode, const char* className, const char* text, bool* pHover = nullptr) const;
     void SeedDefaultRules();
@@ -1102,7 +1092,6 @@ private:
     std::string m_stylePose[4] = { "point", "", "", "" };  //!< pose slots: 0 press, 1 grab, 2 the resting hand, 3 punch ("" = fingers keep the animation; rest: "" = the press pose)
     float m_stylePoseAmount[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     static int PoseSlotOfStyle(int style) { return style == 1 ? 1 : (style == 2 ? 3 : 0); } //!< reach style (0 press, 1 grab, 2 punch) -> pose slot
-    int m_uiExamineApplied[4] = { -1, -1, -1, -1 };    //!< what we last wrote to ui_examine_{keypad,fabricator,securitystation,workstation} (-1 = nothing yet)
     int m_editPose = 0;                 //!< index of the pose being edited in the UI
     bool m_posesDirty = false;
     float m_posesSaveTimer = 0.0f;

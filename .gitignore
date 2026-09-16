@@ -10,3 +10,8 @@ out/
 *.lib
 *.user
 CMakeUserPresets.json
+
+# Release archives and notes: the assets live on the GitHub release, not in the tree
+dist/*.zip
+dist/*.bundle
+dist/RELEASE-*.md
