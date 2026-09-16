@@ -632,11 +632,14 @@ addition is the settle: `vm_reload_cancel_time` holds `CanStartAttack` back (ret
 the original) so the shot does not go off inside the abort animation - `m_bWantsToAttack` stays set and
 `Update` retries every frame, so the shot fires by itself the moment the hold ends.
 
-Three things can ask for the abort, each with its own switch (`_fire`, `_melee`, `_switch`) and its own entry
-point, all of them ending in the same hooked `StopReloadAmmo`. A quick melee punch is the odd one: the game
-refuses to punch at all while a reload runs (`StartMelee`'s own guard), so `CancelReloadForMelee` cuts the
-reload short first and the punch then plays - without the settle, since the windup is a third of a second of
-its own.
+Four things can ask for the abort, each with its own switch (`_fire`, `_melee`, `_aim`, `_switch`) and its own
+entry point, all of them ending in the same hooked `StopReloadAmmo`. The trigger and the weapon switch arrive
+through the game's own calls; the punch and the sights do not, because both are *refused* outright while a
+reload runs rather than queued like a shot - `StartMelee`'s own guard for one, `vm_aim_block_reload` for the
+other. Those two go through `CancelReloadFor(reason)`, which ends the reload and then lets the action happen.
+Neither takes the settle: the punch's windup and the sights coming up are each a transition already. The aim
+cancel only fires when aiming *was* blocked by the reload, so turning `vm_aim_block_reload` off leaves it
+inert rather than cancelling reloads nobody asked it to.
 
 Weapon switching reaches the same place from a different direction. Both `ArkPlayerWeaponComponent::Equip`
 (input and inventory) and `::EquipWeapon` (everything else) call `OnUnequip(true)` on the weapon being put
@@ -757,6 +760,7 @@ the reference sections above.
 * 4.4.0: a quick melee punch can cancel a reload (`vm_reload_cancel_melee`). Defaults are the values tuned in
   play, including a built-in per-weapon reload table (points of no return, measured reload lengths); quick
   melee does a full wrench hit (`vm_melee_damage` 1.0).
+* 4.5.0: raising the sights can cancel a reload too (`vm_reload_cancel_aim`), the fourth of the four ways.
 * 4.4.1: cleanup pass, no behaviour change. The render-time placement self-test, the write-only diagnostics
   counters and the pose cvars nothing read are gone; the pop tracer only records while the diagnostics are
   open and no longer writes a CSV by itself; the README is rewritten and these notes reorganised; release

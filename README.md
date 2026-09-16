@@ -44,11 +44,11 @@ empty gun does nothing, and holding the trigger until the last round simply stop
 to reload" and reload-after-the-last-shot both go away. The empty click, which vanilla only plays when you are
 out of ammo entirely, then plays whenever the magazine is empty.
 
-**Cancelling a reload** (part of the above). A reload in progress can be thrown away by firing, by a quick
-melee punch or by switching weapons - each its own switch, where stock Prey commits you to the animation and
-remembers the shot for afterwards. It has a window: not in the first moments, not in the last, and each weapon
-has a *point of no return* for animations that visibly commit, like the stun gun ejecting its batteries. The
-weapon eases out of the pose the reload was in instead of snapping.
+**Cancelling a reload** (part of the above). A reload in progress can be thrown away by firing, by raising the
+sights, by a quick melee punch or by switching weapons - each its own switch, where stock Prey commits you to
+the animation and remembers the shot for afterwards. It has a window: not in the first moments, not in the
+last, and each weapon has a *point of no return* for animations that visibly commit, like the stun gun
+ejecting its batteries. The weapon eases out of the pose the reload was in instead of snapping.
 
 **Weapon feel.** Head-bob coupling while aiming (still sights, or a little lag), the game's procedural recoil
 and the fire animation's own kick, both per weapon, with a per-shot boost. Bullet-spread multipliers for

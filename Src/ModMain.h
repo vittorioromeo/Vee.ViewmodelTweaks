@@ -329,6 +329,7 @@ struct ViewmodelSettings
     int   reloadCancelFire = 1;     //!< ... and a reload in progress can be aborted by pulling the trigger
     int   reloadCancelSwitch = 1;   //!< ... or by switching to another weapon
     int   reloadCancelMelee = 1;    //!< ... or by throwing a quick melee punch (which the game otherwise refuses during a reload)
+    int   reloadCancelAim = 1;      //!< ... or by raising the sights (which vm_aim_block_reload otherwise refuses during a reload)
     float reloadCancelTime = 0.20f; //!< seconds between aborting a reload and the shot that aborted it (the reload-out plays)
     float reloadCancelMin = 0.30f;  //!< a reload can only be cancelled after it has been running this long
     float reloadCancelMax = -0.30f; //!< ... and only while at least this much is left of it (negative: seconds before the end)
@@ -1029,10 +1030,12 @@ public:
     //! being put away rather than fired.
     //! What is asking for the reload to be cut short. Each has its own switch, and the shot is the only one
     //! that has to be held back afterwards (the holster and the punch's own windup are their own settle).
-    enum ReloadCancelReason { RC_Fire = 0, RC_Switch = 1, RC_Melee = 2 };
+    enum ReloadCancelReason { RC_Fire = 0, RC_Switch = 1, RC_Melee = 2, RC_Aim = 3 };
     bool AllowReloadCancel(const CArkWeapon* pWeapon, int reason);
     void OnReloadCancelled(int reason);     //!< one was: start the settle / the pose blend, count it
-    bool CancelReloadForMelee();            //!< quick melee: cut the reload short, true if there is none left in the way
+    //! Cut the reload short for something that is not the trigger (the punch, the sights). True when there is
+    //! no reload left in the way - either there was none, or this one was allowed to end it.
+    bool CancelReloadFor(int reason);
     bool HoldShotAfterReloadCancel(const CArkWeapon* pWeapon); //!< the shot that aborted a reload is still settling
     bool PlayReloadOutOnCancel() const; //!< does the weapon being cancelled want the game's reload-out animation?
     void UpdateReloadWatch(float dt);   //!< times reloads (for the cancel window) and learns how long each weapon takes

@@ -1858,7 +1858,10 @@ bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
 bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, int reason)
 {
     const ViewmodelSettings& s = m_settings;
-    const int on = reason == RC_Switch ? s.reloadCancelSwitch : (reason == RC_Melee ? s.reloadCancelMelee : s.reloadCancelFire);
+    const int on = reason == RC_Switch ? s.reloadCancelSwitch
+                 : reason == RC_Melee  ? s.reloadCancelMelee
+                 : reason == RC_Aim    ? s.reloadCancelAim
+                                       : s.reloadCancelFire;
     if (!on)
         return false;
     if (!ManualReloadWeapon(s, pWeapon))
@@ -1878,18 +1881,20 @@ bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, int reason)
     return true;
 }
 
-// The game refuses a punch while the weapon is reloading (StartMelee's own guard, and the reach would fight
-// the reload animation anyway). With the option on, the punch cuts the reload short first - the same abort the
-// trigger does, minus the settle, because the windup is already a third of a second long.
-bool ModMain::CancelReloadForMelee()
+// Two things are refused outright while the weapon reloads rather than queued like a shot: a quick melee punch
+// (StartMelee's own guard - the reach would fight the reload animation) and raising the sights
+// (vm_aim_block_reload - the reload is not authored for the aim pose). Both can instead cut the reload short
+// first, the same abort the trigger does; neither takes the settle, since the punch's windup and the sights
+// coming up are each a transition of their own.
+bool ModMain::CancelReloadFor(int reason)
 {
     ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
     CArkWeapon* pWeapon = pPlayer ? pPlayer->m_weaponComponent.GetEquippedWeapon() : nullptr;
     if (!pWeapon || !pWeapon->m_bIsReloading)
         return true;    // nothing in the way
-    if (!m_settings.reloadCancelMelee || !AllowReloadCancel(pWeapon, RC_Melee))
+    if (!AllowReloadCancel(pWeapon, reason))
         return false;
-    s_reloadCancelReason = RC_Melee;
+    s_reloadCancelReason = reason;
     pWeapon->m_bShouldFinishReloading = false;
     VCall<void>(pWeapon, PreyInternals::VT_CArkWeapon_StopReloadAmmo, true);
     s_reloadCancelReason = RC_Fire;
@@ -2108,7 +2113,7 @@ void ModMain::StartMelee()
         return;
     if (I.examining || m_wsSwitching || m_wsDrawing || m_wsUnequipping)
         return;
-    if (m_wsReloading && !CancelReloadForMelee())
+    if (m_wsReloading && !CancelReloadFor(RC_Melee))
         return;     // reloading and the punch is not allowed to cut it short
     StartReach(2, nullptr);
     I.meleePending = true;
@@ -3868,6 +3873,13 @@ void ModMain::UpdateBlendStates(float dt)
         // character (no cursor on screen: menus, inventory, our own settings window...).
         const WeaponSettings* pW = FindCurrentWeapon();
         const bool weaponAllows = !m_currentWeaponClass.empty() && (!pW || pW->aimAllowed);
+        // Raising the sights during a reload: the aim key is normally ignored until the reload ends
+        // (aimBlockReload). With the cancel on, it ends the reload instead and the sights come up.
+        if (m_wsReloading && m_aimKeyHeld && m_settings.aimBlockReload && m_settings.reloadCancelAim
+            && Active() && m_settings.aimEnabled && weaponAllows && !m_mouseCaptured && !dead && CancelReloadFor(RC_Aim))
+        {
+            m_wsReloading = false;
+        }
         aiming = Active() && m_settings.aimEnabled && m_aimKeyHeld && weaponAllows && !m_mouseCaptured && !IsHardwareCursorVisible()
                  && !(m_settings.aimWallBlockEnabled && m_aimBlockedByWall) && !dead && m_reviveGuard <= 0.0f
                  && !(m_settings.sprintPoseEnabled && m_settings.sprintBlocksAim && m_feel.sprinting)
@@ -5338,6 +5350,7 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_reload_cancel_switch", &s.reloadCancelSwitch, s.reloadCancelSwitch, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - switching weapons aborts a reload in progress cleanly (0/1)");
     REGISTER_CVAR2("vm_reload_cancel_time", &s.reloadCancelTime, s.reloadCancelTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds between aborting a reload and the shot that aborted it");
     REGISTER_CVAR2("vm_reload_cancel_melee", &s.reloadCancelMelee, s.reloadCancelMelee, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - a quick melee punch aborts a reload in progress (the game otherwise refuses to punch while reloading) (0/1)");
+    REGISTER_CVAR2("vm_reload_cancel_aim", &s.reloadCancelAim, s.reloadCancelAim, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - raising the sights aborts a reload in progress instead of waiting for it (needs vm_aim_block_reload) (0/1)");
     REGISTER_CVAR2("vm_reload_cancel_min", &s.reloadCancelMin, s.reloadCancelMin, VF_DUMPTOCHAIR, "Viewmodel Tweaks: a reload can only be cancelled once it has been running this long (s)");
     REGISTER_CVAR2("vm_reload_cancel_max", &s.reloadCancelMax, s.reloadCancelMax, VF_DUMPTOCHAIR, "Viewmodel Tweaks: ... and only while at least this much of it is left (negative seconds, e.g. -0.5; needs the weapon's reload length, learned from one that finished)");
     REGISTER_CVAR2("vm_reload_blend_time", &s.reloadBlendTime, s.reloadBlendTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds the weapon takes to ease out of a cancelled reload's pose into the live animation (0 = off)");
@@ -7114,6 +7127,8 @@ void ModMain::DrawWindow()
                         ImGui::SetTooltip("Negative: how much of the animation must still be left. -0.50 means the last half second cannot be\ncancelled. Needs the weapon's reload length, which is measured the first time you let one finish\n(shown per weapon below); until then this rule does not apply.");
                     ImGui::EndDisabled();
                     ImGui::Unindent();
+                    CheckboxInt("... or by raising the sights", s.reloadCancelAim,
+                        "With \"No aiming while reloading\" on (the Aim tab), the aim key does nothing until the reload is over.\nWith this on it ends the reload and the sights come up; off, it waits as before.");
                     CheckboxInt("... or by a quick melee punch", s.reloadCancelMelee,
                         "The game refuses to punch at all while a reload is running. With this on the punch cuts the reload short\nand plays; off, the punch is simply ignored until the reload is done.");
                     CheckboxInt("... or by switching weapons", s.reloadCancelSwitch,
