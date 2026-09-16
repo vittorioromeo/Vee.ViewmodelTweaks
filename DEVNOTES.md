@@ -526,6 +526,8 @@ hand".
   ImGui overlay, screen FOV override; own-queue crash disabled.
 * 3.9.3 body shift moved into the queue; 3.9.4 root-only shift, shift-aware reach base, exact chain
   reconstruction with reset, loop measured in its own camera - first stable screens.
+* 4.2.0: a reload can be cancelled by firing or by switching weapons (`vm_reload_cancel_*`); quick melee
+  camera defaults are the values tuned in play.
 * 4.1.3: quick melee camera swing (`vm_melee_swing_*`), layered on the old kick.
 * 4.1.2: the Q-beam could not be reloaded after its magazine ran dry with the trigger held (its stale
   `m_bIsStoppingAttack` swallowed the request, see above); the `vm_spread_debug` log and its two
@@ -716,6 +718,29 @@ once and disarms. One lie per trigger pull, and an unused one never survives the
 condition matters: pressing fire during a reload takes an earlier branch of `CanStartAttack` that asks
 `CanLoadAmmo()`, which reads the inventory count itself and would eat the lie. Holding the trigger cannot
 repeat the click either - the held-fire path goes through `ContinueAttack`, not `StartAttack`.
+
+**Cancelling a reload** (4.2.0, `vm_reload_cancel_*`) needs no new machinery either - the game has it and keeps
+it switched off. `CanStartAttack`, when the trigger is pulled during a reload, sets `m_bShouldFinishReloading`
+(+0x489) from `!m_bAllowInterruptReloading || GetWeaponAmmoCount() == 0` and calls `StopReloadAmmo(true)`,
+whose entire body is skipped while that flag is set (its guard is `m_bIsReloading && m_bIsReadyToAttack &&
+!m_bShouldFinishReloading`). Only two archetypes in the whole game set `bAllowInterruptReloading`, so for every
+weapon the player carries the flag is always true: the reload runs to the end and the shot is merely
+remembered in `m_bWantsToAttack`, going off when it finishes. Clearing the flag inside a hook on
+`StopReloadAmmo`, at that exact moment, hands the job back to the game - it plays its own reload-out fragment
+("Wpn_Reload_Out"), calls `"reloadEnd"` on the weapon UI element, notifies the listeners and puts the weapon
+back to ready. There is no state of ours to keep, and nothing to undo if the option is switched off. The one
+addition is the settle: `vm_reload_cancel_time` holds `CanStartAttack` back (returning false without calling
+the original) so the shot does not go off inside the abort animation - `m_bWantsToAttack` stays set and
+`Update` retries every frame, so the shot fires by itself the moment the hold ends.
+
+Weapon switching reaches the same place from a different direction. Both `ArkPlayerWeaponComponent::Equip`
+(input and inventory) and `::EquipWeapon` (everything else) call `OnUnequip(true)` on the weapon being put
+away, and `CArkWeapon::OnUnequip` writes `m_bIsReloading = false` and `m_bWantsToReload = false` directly -
+behind the reload's back, so the reload action is never told and is still running when the holster animation
+starts. Neither `CanEquip` nor `CanWeaponBeEquipped` looks at the reload at all, so the switch itself is not
+blocked. Hooking `OnUnequip` and aborting the reload properly first (clear the flag, `StopReloadAmmo(true)`
+through vtable slot 0xD0, so the Q-beam's and grenade's overrides run) leaves the weapon in the state the
+game expects.
 
 One weapon needs help: the Q-beam. `CArkWeaponInstalaser::StartReloadAmmo` (0x16760C0) refuses to do anything
 while `m_bIsStoppingAttack` (+0x584) is set, and `CArkWeaponInstalaser::OnActionAttackPrimary` raises that flag

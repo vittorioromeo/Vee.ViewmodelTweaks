@@ -286,19 +286,19 @@ struct ViewmodelSettings
     int   meleeConsumeKey = 1;      //!< swallow the key so the game's own binding on it does nothing
     float meleeDamage = 0.5f;       //!< damage scale relative to a wrench hit
     float meleeCooldown = 0.8f;     //!< seconds between punches
-    float meleeCamKick = 3.3f;      //!< camera pitch kick (degrees, down then back) with the punch
-    float meleeCamKickYaw = 1.2f;   //!< ... and yaw (degrees, to the right then back)
-    float meleeCamKickTime = 0.28f; //!< seconds for the kick to come and go
+    float meleeCamKick = 0.7f;      //!< camera pitch kick (degrees, down then back) with the punch
+    float meleeCamKickYaw = 0.8f;   //!< ... and yaw (degrees, to the right then back)
+    float meleeCamKickTime = 0.75f; //!< seconds for the kick to come and go
     // The swing: a second, slower camera turn layered on the kick - the body going with the punch. It snaps
     // out in the direction below, then comes back past neutral once (the "bounce") and settles.
-    float meleeSwingRight = 2.6f;   //!< how far the camera is turned to the right at the peak (deg; negative = left)
-    float meleeSwingUp = 0.9f;      //!< ... and up (deg; negative = down)
-    float meleeSwingRoll = 1.1f;    //!< ... and rolled clockwise (deg)
+    float meleeSwingRight = 7.05f;  //!< how far the camera is turned to the right at the peak (deg; negative = left)
+    float meleeSwingUp = -2.96f;    //!< ... and up (deg; negative = down)
+    float meleeSwingRoll = 3.72f;   //!< ... and rolled clockwise (deg)
     float meleeSwingTime = 0.62f;   //!< seconds the whole movement takes (punch animation: windup 0.33 + strike 0.10 + return)
     float meleeSwingDelay = 0.0f;   //!< seconds after the punch starts before it begins
     float meleeSwingRise = 0.70f;   //!< fraction of that time spent accelerating out to the peak (the rest comes back);
                                     //!< 0.70 of 0.62 s puts the peak on the impact (the punch strikes 0.43 s in)
-    float meleeSwingCounter = 0.25f;//!< how far past neutral the way back swings, as a share of the peak (0 = stops at neutral)
+    float meleeSwingCounter = 0.20f;//!< how far past neutral the way back swings, as a share of the peak (0 = stops at neutral)
     float meleeShakeAmp = 0.9f;     //!< camera shake on a landed punch (degrees, decaying)
     float meleeShakeTime = 0.25f;   //!< ... seconds it lasts
     float meleeShakeFreq = 18.0f;   //!< ... Hz
@@ -327,6 +327,9 @@ struct ViewmodelSettings
     int   reloadManualHoldFire = 1; //!< ... including when the magazine runs dry with the trigger held (the shot just stops)
     int   reloadManualThrown = 0;   //!< ... including grenades and the nullwave transmitter, whose "reload" is pulling the next one out
     int   reloadDryFire = 1;        //!< ... and the empty click plays on an empty magazine, not only when the backpack is empty too
+    int   reloadCancelFire = 1;     //!< ... and a reload in progress can be aborted by pulling the trigger
+    int   reloadCancelSwitch = 1;   //!< ... or by switching to another weapon
+    float reloadCancelTime = 0.20f; //!< seconds between aborting a reload and the shot that aborted it (the reload-out plays)
 
     int   worldFovEnabled = 0;  //!< Override the game's horizontal FOV (cl_hfov).
     float worldFov = 85.0f;     //!< Horizontal FOV in degrees when worldFovEnabled.
@@ -830,6 +833,8 @@ public:
     const FeelState& GetFeel() const { return m_feel; }
     bool Active() const { return m_settings.enabled != 0 && m_settings.bypass == 0; } //!< viewmodel features on
     int m_autoReloadsBlocked = 0;       //!< diagnostics: automatic reloads dropped since the mod was loaded
+    int m_reloadsCancelled = 0;         //!< diagnostics: reloads aborted by firing or switching
+    float m_reloadCancelTimer = 0.0f;   //!< > 0: a reload was just aborted by firing, the shot waits this long
 
     //! Procedural weapon offsets captured from the game this frame (view space).
     void SetGameOffset(int which, const QuatT& q);
@@ -1010,6 +1015,11 @@ public:
     //! Manual reloading, Q-beam only: is its "stopping attack" flag stale (left set by the trigger release
     //! after the magazine ran dry), so that it would swallow this reload request?
     bool ClearStaleStoppingAttack(const CArkWeaponInstalaser* pWeapon);
+    //! Manual reloading: may this reload be aborted (the game normally forbids it)? bySwitch = the weapon is
+    //! being put away rather than fired.
+    bool AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch);
+    void OnReloadCancelled(bool bySwitch);  //!< one was: start the settle before the shot, count it
+    bool HoldShotAfterReloadCancel(const CArkWeapon* pWeapon); //!< the shot that aborted a reload is still settling
     void StartMelee();                  //!< quick melee key: the punch starts (cooldown permitting)
     void DoMeleeHit();                  //!< at the punch's apex: the wrench's hit, scaled
     bool SupportHandOffWeapon() const;  //!< the support hand is animated out of view (one-handed weapon, no weapon): come up from the hidden spot

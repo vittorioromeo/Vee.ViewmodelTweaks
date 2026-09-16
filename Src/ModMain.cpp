@@ -114,6 +114,8 @@ namespace PreyInternals
     constexpr size_t VT_ISkeletonPose_GetAbsJointByID = 0xC0 / 8;    // const QuatT& (int jointId)   [ArkPlayer::GetBoneTransform]
     constexpr size_t VT_IAnimationOperatorQueue_PushPosition = 0x40 / 8;    // (int joint, int op, const Vec3&)
     constexpr size_t VT_IAnimationOperatorQueue_PushOrientation = 0x48 / 8; // (int joint, int op, const Quat&)
+    // CArkWeapon's own vtable (slots read off the game's CanStartAttack / ContinueAttack / StartReloadAmmo).
+    constexpr size_t VT_CArkWeapon_StopReloadAmmo = 0xD0 / 8;   // (bool bInterrupted)
     constexpr int OP_OVERRIDE = 0;      // IAnimationOperatorQueue::eOp_Override (model space)
     constexpr int OP_ADDITIVE = 3;      // eOp_Additive (what the game uses)
 
@@ -448,6 +450,46 @@ static bool CArkWeaponShotgun_ContinueAttack_Hook(CArkWeaponShotgun* const _this
     return r;
 }
 
+// Cancelling a reload. The game has the machinery and keeps it switched off: CanStartAttack, when the trigger
+// is pulled during a reload, sets m_bShouldFinishReloading from "!m_bAllowInterruptReloading || the magazine is
+// empty" and then calls StopReloadAmmo(interrupted) - whose whole body is skipped while that flag is set. Only
+// two archetypes in the game set bAllowInterruptReloading, so for every weapon the player carries the flag is
+// always true and the reload always runs to the end; the shot is merely remembered (m_bWantsToAttack) and goes
+// off when the reload finishes. Clearing the flag at that exact moment hands the job back to the game: it
+// plays its own reload-out fragment ("Wpn_Reload_Out"), tells the weapon UI ("reloadEnd") and its listeners,
+// and puts the weapon back to ready - no state of ours to keep. The shot then waits out vm_reload_cancel_time
+// (see the CanStartAttack hook) so the abort is visible instead of the gun firing mid-animation.
+static bool s_reloadCancelBySwitch = false;
+static_assert(offsetof(CArkWeapon, m_bShouldFinishReloading) == 0x489, "CArkWeapon layout mismatch");
+static_assert(offsetof(CArkWeapon, m_bIsReloading) == 0x48C, "CArkWeapon layout mismatch");
+static auto s_hookStopReloadAmmo = CArkWeapon::FStopReloadAmmo.MakeHook();
+static void CArkWeapon_StopReloadAmmo_Hook(CArkWeapon* const _this, const bool _bInterrupted)
+{
+    if (_bInterrupted && _this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, s_reloadCancelBySwitch))
+    {
+        _this->m_bShouldFinishReloading = false; // ... and the original does the rest
+        gMod->OnReloadCancelled(s_reloadCancelBySwitch);
+    }
+    s_hookStopReloadAmmo.InvokeOrig(_this, _bInterrupted);
+}
+
+// Switching weapons: both paths into a weapon change (ArkPlayerWeaponComponent::Equip from the input and the
+// inventory, EquipWeapon from everything else) end in OnUnequip on the weapon being put away, which clears
+// m_bIsReloading behind the reload's back - the reload action is never told, so it is still playing when the
+// holster animation starts. Aborting it properly first leaves the weapon in the state the game expects.
+static auto s_hookOnUnequip = CArkWeapon::FOnUnequip.MakeHook();
+static void CArkWeapon_OnUnequip_Hook(CArkWeapon* const _this, const bool _bUnselect)
+{
+    if (_this && _this->m_bIsReloading && gMod && gMod->AllowReloadCancel(_this, true))
+    {
+        s_reloadCancelBySwitch = true;
+        _this->m_bShouldFinishReloading = false;
+        VCall<void>(_this, PreyInternals::VT_CArkWeapon_StopReloadAmmo, true); // through the vtable: the Q-beam and grenade override it
+        s_reloadCancelBySwitch = false;
+    }
+    s_hookOnUnequip.InvokeOrig(_this, _bUnselect);
+}
+
 // The Q-beam refuses to reload while its "stopping attack" flag is set, and that flag is raised when the fire
 // button is RELEASED (CArkWeaponInstalaser::OnActionAttackPrimary) - normally cleared again by OnAttackStopped
 // when the beam's attack action ends. Run the magazine dry while firing and the beam has already been stopped
@@ -476,6 +518,10 @@ static bool s_fakeEmptyBackpack = false;
 static auto s_hookCanStartAttack = CArkWeapon::FCanStartAttack.MakeHook();
 static bool CArkWeapon_CanStartAttack_Hook(CArkWeapon* const _this)
 {
+    // Just aborted a reload: the shot that did it waits for the reload-out to play. The game keeps asking
+    // (m_bWantsToAttack stays set, so Update retries every frame) and fires as soon as this stops saying no.
+    if (_this && !_this->m_bIsReloading && gMod && gMod->HoldShotAfterReloadCancel(_this))
+        return false;
     const bool prev = s_fakeEmptyBackpack;
     s_fakeEmptyBackpack = gMod && gMod->FakeEmptyBackpack(_this);
     const bool r = s_hookCanStartAttack.InvokeOrig(_this);
@@ -1751,6 +1797,26 @@ bool ModMain::BlockAutoReload(const CArkWeapon* pWeapon, bool holdFire)
         return false;
     m_autoReloadsBlocked++;
     return true;
+}
+
+bool ModMain::AllowReloadCancel(const CArkWeapon* pWeapon, bool bySwitch)
+{
+    const ViewmodelSettings& s = m_settings;
+    if (!(bySwitch ? s.reloadCancelSwitch : s.reloadCancelFire))
+        return false;
+    return ManualReloadWeapon(s, pWeapon);
+}
+
+void ModMain::OnReloadCancelled(bool bySwitch)
+{
+    m_reloadsCancelled++;
+    if (!bySwitch) // the holster animation is the settle for a switch; only the shot needs holding back
+        m_reloadCancelTimer = clamp_tpl(m_settings.reloadCancelTime, 0.0f, 2.0f);
+}
+
+bool ModMain::HoldShotAfterReloadCancel(const CArkWeapon* pWeapon)
+{
+    return m_reloadCancelTimer > 0.0f && m_settings.reloadCancelFire && ManualReloadWeapon(m_settings, pWeapon);
 }
 
 bool ModMain::ClearStaleStoppingAttack(const CArkWeaponInstalaser* pWeapon)
@@ -3895,6 +3961,7 @@ void ModMain::SanitizeSettings()
     fixF(s.meleeImpulseScale, def.meleeImpulseScale); fixF(s.meleeLowerTime, def.meleeLowerTime);
     fixF(s.meleeShakeAmp, def.meleeShakeAmp); fixF(s.meleeShakeTime, def.meleeShakeTime); fixF(s.meleeShakeFreq, def.meleeShakeFreq); fixF(s.meleeShakeEnemy, def.meleeShakeEnemy);
     fixF(s.meleeDamage, def.meleeDamage); fixF(s.meleeCooldown, def.meleeCooldown); fixF(s.meleeCamKick, def.meleeCamKick); fixF(s.meleeCamKickYaw, def.meleeCamKickYaw); fixF(s.meleeCamKickTime, def.meleeCamKickTime);
+    fixF(s.reloadCancelTime, def.reloadCancelTime);
     fixF(s.meleeSwingRight, def.meleeSwingRight); fixF(s.meleeSwingUp, def.meleeSwingUp); fixF(s.meleeSwingRoll, def.meleeSwingRoll);
     fixF(s.meleeSwingTime, def.meleeSwingTime); fixF(s.meleeSwingDelay, def.meleeSwingDelay); fixF(s.meleeSwingRise, def.meleeSwingRise); fixF(s.meleeSwingCounter, def.meleeSwingCounter);
     fixF(s.interactCarryHoldTime, def.interactCarryHoldTime); fixF(s.interactStartX, def.interactStartX); fixF(s.interactStartY, def.interactStartY); fixF(s.interactStartZ, def.interactStartZ);
@@ -4800,6 +4867,8 @@ void ModMain::InitHooks()
     s_hookCanStartAttack.SetHookFunc(&CArkWeapon_CanStartAttack_Hook);
     s_hookInventoryAmmo.SetHookFunc(&CArkWeapon_GetInventoryAmmoCount_Hook);
     s_hookInstalaserStartReload.SetHookFunc(&CArkWeaponInstalaser_StartReloadAmmo_Hook);
+    s_hookStopReloadAmmo.SetHookFunc(&CArkWeapon_StopReloadAmmo_Hook);
+    s_hookOnUnequip.SetHookFunc(&CArkWeapon_OnUnequip_Hook);
 }
 
 static void RegisterPoseCVars(PoseOffset& p, const char* prefix, const char* what)
@@ -5044,6 +5113,9 @@ void ModMain::RegisterCVars()
     REGISTER_CVAR2("vm_reload_manual", &s.reloadManual, s.reloadManual, VF_DUMPTOCHAIR, "Viewmodel Tweaks: no automatic reloading - only the reload key refills the magazine, firing an empty weapon does nothing (0/1)");
     REGISTER_CVAR2("vm_reload_manual_hold_fire", &s.reloadManualHoldFire, s.reloadManualHoldFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also when the magazine runs dry with the trigger held (0/1)");
     REGISTER_CVAR2("vm_reload_manual_thrown", &s.reloadManualThrown, s.reloadManualThrown, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading also for grenades and the nullwave transmitter, whose reload is pulling out the next one (0/1)");
+    REGISTER_CVAR2("vm_reload_cancel_fire", &s.reloadCancelFire, s.reloadCancelFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - pulling the trigger aborts a reload in progress instead of queueing the shot (0/1)");
+    REGISTER_CVAR2("vm_reload_cancel_switch", &s.reloadCancelSwitch, s.reloadCancelSwitch, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - switching weapons aborts a reload in progress cleanly (0/1)");
+    REGISTER_CVAR2("vm_reload_cancel_time", &s.reloadCancelTime, s.reloadCancelTime, VF_DUMPTOCHAIR, "Viewmodel Tweaks: seconds between aborting a reload and the shot that aborted it");
     REGISTER_CVAR2("vm_reload_dry_fire", &s.reloadDryFire, s.reloadDryFire, VF_DUMPTOCHAIR, "Viewmodel Tweaks: manual reloading - play the game's empty click (dry-fire animation and sound) on an empty magazine, not only when the backpack is empty too (0/1)");
     REGISTER_CVAR2("vm_melee_lower_ease", &s.meleeLowerEase, s.meleeLowerEase, VF_DUMPTOCHAIR, "Viewmodel Tweaks: easing of the weapon lowering for the punch (0 linear, 1 smooth, 2 ease out, 3 ease in, 4 in-out)");
 
@@ -5419,6 +5491,8 @@ void ModMain::MainUpdate(unsigned updateFlags)
         m_lastAsyncTicks = nowTicks;
     }
     m_dtUsed = dt;
+    if (m_reloadCancelTimer > 0.0f)
+        m_reloadCancelTimer = max(m_reloadCancelTimer - dt, 0.0f);
     UpdateBlendStates(dt);
     UpdateFeel(dt, ArkPlayer::GetInstancePtr());
     SanitizeFeel();
@@ -6794,11 +6868,23 @@ void ModMain::DrawWindow()
                         "Holding the trigger until the last round: the weapon simply stops firing instead of reloading.\nOff = only the empty-trigger reload is blocked.");
                     CheckboxInt("... also for grenades and the nullwave transmitter", s.reloadManualThrown,
                         "These have a magazine of one, so their \"reload\" is taking the next one out of the inventory:\nwith this on you have to press reload after every throw. Off (default) leaves them automatic.");
+                    CheckboxInt("A reload can be cancelled by firing", s.reloadCancelFire,
+                        "Stock Prey remembers the shot and fires it when the reload finishes. With this on the reload is aborted\ninstead: the weapon plays its reload-out, keeps whatever it had loaded, and the shot follows.");
+                    ImGui::Indent();
+                    ImGui::BeginDisabled(!s.reloadCancelFire);
+                    ImGui::SliderFloat("... settle before the shot", &s.reloadCancelTime, 0.0f, 1.0f, "%.2f s");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("How long the abort is given before the shot goes off, so it does not fire mid-animation. 0 = at once.");
+                    ImGui::EndDisabled();
+                    ImGui::Unindent();
+                    CheckboxInt("... or by switching weapons", s.reloadCancelSwitch,
+                        "The reload is ended properly when the weapon is put away, instead of the holster animation starting\nwhile the reload action is still running.");
                     CheckboxInt("Empty click on an empty magazine", s.reloadDryFire,
                         "The game's own dry-fire animation and sound - which it normally only plays when you are out of ammo entirely -\nalso when the magazine is empty but the backpack is not. Nothing else about the shot changes.");
                     ImGui::Unindent();
                     ImGui::EndDisabled();
-                    ImGui::TextDisabled("Blocked %d automatic reload(s) this session.", m_autoReloadsBlocked);
+                    ImGui::TextDisabled("Blocked %d automatic reload(s), cancelled %d this session.%s", m_autoReloadsBlocked, m_reloadsCancelled,
+                        m_reloadCancelTimer > 0.0f ? "  [settling]" : "");
                     ImGui::Spacing();
                 }
                 ImGui::BeginDisabled(!s.enabled);

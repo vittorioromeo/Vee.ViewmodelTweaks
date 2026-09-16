@@ -43,7 +43,9 @@ lets you reposition, rotate and re-FOV the first-person weapon - all live, from 
   stops the firing - Prey's "shoot to reload" and reload-after-the-last-shot both go away. The game's own
   empty click (dry-fire animation and sound), which vanilla only plays when you have no rounds left anywhere,
   then plays whenever the magazine is empty. Off by default; grenades keep reloading themselves unless you say
-  otherwise (`vm_reload_*`, *Weapon* tab).
+  otherwise. A reload in progress can be cancelled by firing or by switching weapons - stock Prey commits you to
+  it and remembers the shot for afterwards - with a short settle so the abort is visible before the shot
+  (`vm_reload_*`, *Weapon* tab).
 * **Reticle.** Centred / custom position, weapon reticle / dot / hidden, hide while aiming. A hidden reticle
   still comes back as the cursor while you use an in-world screen.
 
